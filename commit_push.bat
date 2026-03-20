@@ -1,6 +1,5 @@
 @echo off
-REM UTF-8 BOM required for Chinese echo below under chcp 65001
-chcp 65001 >nul
+REM Use ASCII only: UTF-8 with Chinese breaks cmd.exe unless file is GBK and matches system ANSI.
 setlocal
 
 cd /d "%~dp0"
@@ -46,7 +45,7 @@ echo [OK] Pushed to origin main.
 :END
 echo.
 echo ========================================
-echo   Done. Press any key to close.
+echo   Done. Press any key to close this window.
 echo ========================================
 pause
 endlocal
