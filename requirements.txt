@@ -1,0 +1,10 @@
+# 批量打印工具依赖
+# Windows 上需安装 Microsoft Word/Excel 以使用 COM 打印
+pywin32>=306
+# 用于解析文档类型、路径等
+python-docx>=1.1.0
+openpyxl>=3.1.0
+# PDF 仅用于检测与可选校验（实际打印可用系统默认程序）
+PyPDF2>=3.0.0
+# Web 界面
+flask>=3.0.0

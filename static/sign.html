@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>在线签名 - Word / Excel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f5f5f5;
+      --surface: #ffffff;
+      --surface2: #fafafa;
+      --border: #e0e0e0;
+      --text: #000000;
+      --text-muted: #666666;
+      --accent: #1a73e8;
+      --accent-hover: #1557b0;
+      --error: #c62828;
+      --radius: 6px;
+      --shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Noto Sans SC', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 8px; }
+    .subtitle { color: var(--text-muted); font-size: 0.95rem; margin-bottom: 16px; }
+    .nav-top { margin-bottom: 24px; }
+    .nav-top a { color: var(--accent); text-decoration: none; font-size: 0.95rem; }
+    .nav-top a:hover { text-decoration: underline; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 20px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 { font-size: 1rem; font-weight: 600; margin: 0 0 16px; }
+    label { display: block; font-size: 0.9rem; margin-bottom: 6px; }
+    input[type="file"] {
+      width: 100%;
+      padding: 12px;
+      background: var(--surface2);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      font-size: 0.9rem;
+    }
+    .role-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+    .role-row input { width: 18px; height: 18px; accent-color: var(--accent); }
+    .role-panel {
+      display: none;
+      margin-top: 12px;
+      padding: 16px;
+      background: var(--surface2);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .role-panel.visible { display: block; }
+    .canvas-wrap { margin-bottom: 14px; }
+    .canvas-wrap label { font-weight: 500; }
+    canvas.sign-pad {
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      height: 120px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      touch-action: none;
+      cursor: crosshair;
+    }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 14px;
+      font-size: 0.9rem;
+      font-family: inherit;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      padding: 12px 24px;
+      font-size: 1rem;
+    }
+    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    .hint { font-size: 0.85rem; color: var(--text-muted); margin-top: 6px; }
+    .err { color: var(--error); font-size: 0.9rem; margin-top: 8px; }
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(0,0,0,0.2);
+      border-top-color: #000;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      display: inline-block;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="nav-top">
+      <a href="/">返回批量打印</a>
+    </div>
+    <h1>在线签名</h1>
+    <p class="subtitle">上传 Word（.docx）或 Excel（.xlsx），按角色手写签名与日期，生成已签字文档下载。不影响批量打印功能。</p>
+
+    <div class="card">
+      <h2>选择文件</h2>
+      <input type="file" id="fileInput" accept=".docx,.xlsx">
+      <p class="hint" id="fileHint">未选择文件</p>
+    </div>
+
+    <div class="card">
+      <h2>签字角色（可多选）</h2>
+      <p class="hint">每个角色需分别手写「签名」和「日期」；模板中需有对应关键词空白位。</p>
+      <div id="roleChecks"></div>
+      <div id="rolePanels"></div>
+    </div>
+
+    <div class="card">
+      <button type="button" class="btn btn-primary" id="submitBtn" disabled>生成已签名文档</button>
+      <p class="err" id="errMsg" style="display:none;"></p>
+    </div>
+  </div>
+
+  <script>
+    const ROLES = [
+      { id: 'author', label: '作者' },
+      { id: 'reviewer', label: '审核' },
+      { id: 'approver', label: '批准' },
+      { id: 'executor', label: '执行人员' },
+      { id: 'reviewer_tail', label: '审核人员（文末等）' },
+    ];
+
+    const fileInput = document.getElementById('fileInput');
+    const fileHint = document.getElementById('fileHint');
+    const roleChecks = document.getElementById('roleChecks');
+    const rolePanels = document.getElementById('rolePanels');
+    const submitBtn = document.getElementById('submitBtn');
+    const errMsg = document.getElementById('errMsg');
+
+    const canvases = {};
+
+    function setupCanvas(canvas) {
+      const ctx = canvas.getContext('2d');
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      function resize() {
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = Math.floor(rect.width * dpr);
+        canvas.height = Math.floor(rect.height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 2;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+      }
+      resize();
+      window.addEventListener('resize', resize);
+      let drawing = false;
+      function pos(e) {
+        const r = canvas.getBoundingClientRect();
+        const t = e.touches ? e.touches[0] : e;
+        return { x: t.clientX - r.left, y: t.clientY - r.top };
+      }
+      function start(e) {
+        e.preventDefault();
+        drawing = true;
+        const p = pos(e);
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+      }
+      function move(e) {
+        if (!drawing) return;
+        e.preventDefault();
+        const p = pos(e);
+        ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+      }
+      function end(e) {
+        if (e) e.preventDefault();
+        drawing = false;
+      }
+      canvas.addEventListener('mousedown', start);
+      canvas.addEventListener('mousemove', move);
+      canvas.addEventListener('mouseup', end);
+      canvas.addEventListener('mouseleave', end);
+      canvas.addEventListener('touchstart', start, { passive: false });
+      canvas.addEventListener('touchmove', move, { passive: false });
+      canvas.addEventListener('touchend', end);
+      return { clear: () => { ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,canvas.width,canvas.height); ctx.restore(); resize(); } };
+    }
+
+    function buildUI() {
+      ROLES.forEach(r => {
+        const row = document.createElement('div');
+        row.className = 'role-row';
+        row.innerHTML = `<input type="checkbox" id="chk_${r.id}" data-id="${r.id}"><label for="chk_${r.id}" style="margin:0;cursor:pointer">${r.label}</label>`;
+        roleChecks.appendChild(row);
+
+        const panel = document.createElement('div');
+        panel.className = 'role-panel';
+        panel.id = `panel_${r.id}`;
+        panel.innerHTML = `
+          <div class="canvas-wrap">
+            <label>签名（${r.label}）</label>
+            <canvas class="sign-pad" id="sig_${r.id}"></canvas>
+            <div class="btn-row"><button type="button" class="btn btn-secondary" data-clear="sig_${r.id}">清除签名</button></div>
+          </div>
+          <div class="canvas-wrap">
+            <label>日期（${r.label}）</label>
+            <canvas class="sign-pad" id="date_${r.id}"></canvas>
+            <div class="btn-row"><button type="button" class="btn btn-secondary" data-clear="date_${r.id}">清除日期</button></div>
+          </div>
+        `;
+        rolePanels.appendChild(panel);
+
+        document.getElementById(`chk_${r.id}`).addEventListener('change', () => {
+          panel.classList.toggle('visible', document.getElementById(`chk_${r.id}`).checked);
+          updateSubmitState();
+        });
+      });
+
+      rolePanels.querySelectorAll('[data-clear]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-clear');
+          if (canvases[id]) canvases[id].clear();
+        });
+      });
+
+      ROLES.forEach(r => {
+        canvases[`sig_${r.id}`] = setupCanvas(document.getElementById(`sig_${r.id}`));
+        canvases[`date_${r.id}`] = setupCanvas(document.getElementById(`date_${r.id}`));
+      });
+    }
+
+    function selectedRoleIds() {
+      return ROLES.map(r => r.id).filter(id => document.getElementById(`chk_${id}`).checked);
+    }
+
+    function updateSubmitState() {
+      const f = fileInput.files && fileInput.files[0];
+      const ok = f && selectedRoleIds().length > 0;
+      submitBtn.disabled = !ok;
+      const ext = f ? (f.name.slice(f.name.lastIndexOf('.')) || '').toLowerCase() : '';
+      if (f && ext !== '.docx' && ext !== '.xlsx') {
+        submitBtn.disabled = true;
+      }
+    }
+
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files && fileInput.files[0];
+      fileHint.textContent = f ? '已选：' + f.name : '未选择文件';
+      updateSubmitState();
+    });
+
+    function showErr(s) {
+      errMsg.style.display = s ? 'block' : 'none';
+      errMsg.textContent = s || '';
+    }
+
+    function isCanvasBlank(canvas) {
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width, h = canvas.height;
+      if (!w || !h) return true;
+      const data = ctx.getImageData(0, 0, w, h).data;
+      for (let i = 3; i < data.length; i += 4) {
+        if (data[i] > 10) return false;
+      }
+      return true;
+    }
+
+    submitBtn.addEventListener('click', async () => {
+      showErr('');
+      const f = fileInput.files[0];
+      if (!f) return;
+      const roles = selectedRoleIds();
+      if (!roles.length) {
+        showErr('请至少勾选一个角色');
+        return;
+      }
+      for (const id of roles) {
+        const sigC = document.getElementById('sig_' + id);
+        const dateC = document.getElementById('date_' + id);
+        if (isCanvasBlank(sigC) || isCanvasBlank(dateC)) {
+          const label = ROLES.find(x => x.id === id).label;
+          showErr('请为「' + label + '」完成签名与日期手写');
+          return;
+        }
+      }
+
+      const form = new FormData();
+      form.append('file', f);
+      form.append('roles', JSON.stringify(roles));
+      roles.forEach(id => {
+        form.append('sig_' + id, document.getElementById('sig_' + id).toDataURL('image/png'));
+        form.append('date_' + id, document.getElementById('date_' + id).toDataURL('image/png'));
+      });
+
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span class="spinner"></span> 处理中…';
+      try {
+        const res = await fetch('/api/sign', { method: 'POST', body: form });
+        const ct = res.headers.get('Content-Type') || '';
+        if (!res.ok) {
+          if (ct.includes('application/json')) {
+            const j = await res.json();
+            showErr(j.error || res.statusText);
+          } else {
+            showErr(res.statusText || '请求失败');
+          }
+          return;
+        }
+        if (ct.includes('application/json')) {
+          const j = await res.json();
+          showErr(j.error || '失败');
+          return;
+        }
+        const blob = await res.blob();
+        const dispo = res.headers.get('Content-Disposition') || '';
+        let name = f.name.replace(/\.[^.]+$/, '') + '_signed' + (f.name.match(/\.[^.]+$/) || [''])[0];
+        const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(dispo);
+        if (m) try { name = decodeURIComponent(m[1].replace(/['"]/g, '')); } catch (_) {}
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (e) {
+        showErr(e.message || String(e));
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = '生成已签名文档';
+        updateSubmitState();
+      }
+    });
+
+    buildUI();
+    updateSubmitState();
+  </script>
+</body>
+</html>

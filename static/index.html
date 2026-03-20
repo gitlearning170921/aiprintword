@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>批量打印 - Word / Excel / PDF</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f5f5f5;
+      --surface: #ffffff;
+      --surface2: #fafafa;
+      --border: #e0e0e0;
+      --text: #000000;
+      --text-muted: #666666;
+      --accent: #1a73e8;
+      --accent-hover: #1557b0;
+      --success: #2e7d32;
+      --error: #c62828;
+      --radius: 6px;
+      --shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Noto Sans SC', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      margin: 0 0 8px;
+      letter-spacing: -0.02em;
+    }
+    .subtitle {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      margin-bottom: 32px;
+    }
+    h1 { color: var(--text); }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 20px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 0 0 16px;
+      color: var(--text);
+    }
+    label {
+      display: block;
+      font-size: 0.9rem;
+      margin-bottom: 6px;
+      color: var(--text);
+    }
+    input[type="file"] {
+      width: 100%;
+      padding: 12px;
+      background: var(--surface2);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    input[type="file"]:hover {
+      border-color: var(--accent);
+      background: rgba(26, 115, 232, 0.04);
+    }
+    input[type="number"], input[type="text"], select {
+      width: 100%;
+      max-width: 280px;
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.95rem;
+    }
+    select { cursor: pointer; }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 24px;
+      align-items: flex-start;
+    }
+    .field { margin-bottom: 16px; }
+    .checkbox-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+      cursor: pointer;
+    }
+    .checkbox-wrap input { width: 18px; height: 18px; cursor: pointer; accent-color: var(--accent); }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 24px;
+      font-size: 1rem;
+      font-weight: 600;
+      font-family: inherit;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.05s;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn-primary {
+      background: var(--accent);
+      color: #ffffff;
+    }
+    .btn-primary:hover {
+      background: var(--accent-hover);
+    }
+    .btn-primary:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .btn-secondary {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover {
+      background: var(--border);
+    }
+    .result-summary {
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-weight: 500;
+    }
+    .result-summary.success { background: rgba(46, 125, 50, 0.12); color: var(--success); }
+    .result-summary.partial { background: rgba(102, 102, 102, 0.12); color: var(--text-muted); }
+    .result-summary.fail { background: rgba(198, 40, 40, 0.12); color: var(--error); }
+    .result-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    .result-table th, .result-table td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .result-table th {
+      color: var(--text);
+      font-weight: 500;
+    }
+    .result-table tr:last-child td { border-bottom: none; }
+    .result-table td { color: var(--text); }
+    .status-ok { color: var(--success); }
+    .status-fail { color: var(--error); }
+    .filename { word-break: break-all; color: var(--text); }
+    .message { color: var(--text-muted); font-size: 0.85rem; }
+    #resultArea { display: none; }
+    #resultArea.visible { display: block; }
+    .spinner {
+      width: 20px;
+      height: 20px;
+      border: 2px solid rgba(0,0,0,0.2);
+      border-top-color: #000;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .hint { font-size: 0.85rem; color: var(--text-muted); margin-top: 4px; }
+    .progress-bar-wrap { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
+    .progress-bar { height: 100%; background: var(--accent); transition: width 0.2s; }
+    .progress-text { font-weight: 600; margin: 0 0 4px; color: var(--text); }
+    .progress-detail { font-size: 0.9rem; color: var(--text-muted); margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>批量打印</h1>
+    <p class="subtitle">上传 Word、Excel、PDF，自动检查封面签字与修订后打印</p>
+    <p class="subtitle" style="margin-top:-12px;"><a href="/sign" style="color:var(--accent);text-decoration:none;font-weight:600;">在线签名（Word / Excel）</a></p>
+
+    <div class="card">
+      <h2>选择文件</h2>
+      <div class="field">
+        <label for="files">支持 .doc / .docx / .xls / .xlsx / .pdf（可多选）</label>
+        <input type="file" id="files" name="files" multiple accept=".doc,.docx,.docm,.xls,.xlsx,.xlsm,.pdf">
+        <p class="hint" id="fileHint">未选择文件</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>打印选项</h2>
+      <div class="field">
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="checkFormal" checked>
+          <label for="checkFormal" style="margin:0">第一步：正式性检查（无标黄、修订、批注、非黑字体等）</label>
+        </div>
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="checkSignature" checked>
+          <label for="checkSignature" style="margin:0">第二步：封面签字与日期（作者、审核、批准、日期非空）</label>
+        </div>
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="acceptRevisions" checked>
+          <label for="acceptRevisions" style="margin:0">自动接受所有修订后再打印</label>
+        </div>
+        <div class="checkbox-wrap">
+          <input type="checkbox" id="dryRun">
+          <label for="dryRun" style="margin:0">仅预检（不实际打印）</label>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="printer">打印机</label>
+          <select id="printer">
+            <option value="">使用默认打印机</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="copies">份数</label>
+          <input type="number" id="copies" value="1" min="1" max="99">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <button type="button" class="btn btn-primary" id="submitBtn" disabled>
+        开始检查并打印
+      </button>
+    </div>
+
+    <div class="card" id="progressArea" style="display:none;">
+      <h2>处理进度</h2>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progressBar" style="width:0%"></div>
+      </div>
+      <p class="progress-text" id="progressText">准备中…</p>
+      <p class="progress-detail" id="progressDetail"></p>
+    </div>
+
+    <div class="card" id="resultArea">
+      <h2>执行结果</h2>
+      <div id="resultSummary" class="result-summary"></div>
+      <table class="result-table" id="resultTable">
+        <thead>
+          <tr>
+            <th>文件名</th>
+            <th>状态</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody id="resultBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const filesInput = document.getElementById('files');
+    const fileHint = document.getElementById('fileHint');
+    const checkFormal = document.getElementById('checkFormal');
+    const checkSignature = document.getElementById('checkSignature');
+    const acceptRevisions = document.getElementById('acceptRevisions');
+    const dryRun = document.getElementById('dryRun');
+    const printerSelect = document.getElementById('printer');
+    const copiesInput = document.getElementById('copies');
+    const submitBtn = document.getElementById('submitBtn');
+    const resultArea = document.getElementById('resultArea');
+    const resultSummary = document.getElementById('resultSummary');
+    const resultBody = document.getElementById('resultBody');
+    const progressArea = document.getElementById('progressArea');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    const progressDetail = document.getElementById('progressDetail');
+
+    const ALLOWED_EXT = ['.doc', '.docx', '.docm', '.xls', '.xlsx', '.xlsm', '.pdf'];
+
+    function updateFileHint() {
+      const list = filesInput.files;
+      if (!list.length) {
+        fileHint.textContent = '未选择文件';
+        submitBtn.disabled = true;
+        return;
+      }
+      const names = Array.from(list).map(f => f.name).filter(n => {
+        const ext = n.slice(n.lastIndexOf('.')).toLowerCase();
+        return ALLOWED_EXT.includes(ext);
+      });
+      if (names.length === 0) {
+        fileHint.textContent = '请选择支持的文档类型';
+        submitBtn.disabled = true;
+        return;
+      }
+      fileHint.textContent = '已选 ' + names.length + ' 个文件：' + names.join('、').slice(0, 80) + (names.join('').length > 80 ? '…' : '');
+      submitBtn.disabled = false;
+    }
+
+    filesInput.addEventListener('change', updateFileHint);
+
+    function loadPrinters() {
+      fetch('/api/printers')
+        .then(r => r.json())
+        .then(data => {
+          const list = data.printers || [];
+          printerSelect.innerHTML = '<option value="">使用默认打印机</option>';
+          list.forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            printerSelect.appendChild(opt);
+          });
+        })
+        .catch(() => {});
+    }
+    loadPrinters();
+
+    function setLoading(loading) {
+      submitBtn.disabled = loading;
+      submitBtn.innerHTML = loading
+        ? '<span class="spinner"></span> 处理中…'
+        : '开始检查并打印';
+    }
+
+    function showProgress(percent, text, detail) {
+      progressArea.style.display = 'block';
+      progressBar.style.width = (percent || 0) + '%';
+      progressText.textContent = text || '处理中…';
+      progressDetail.textContent = detail || '';
+    }
+
+    function showResult(data) {
+      progressArea.style.display = 'none';
+      resultArea.classList.add('visible');
+      if (!data.ok) {
+        resultSummary.className = 'result-summary fail';
+        resultSummary.textContent = data.error || '处理失败';
+        resultBody.innerHTML = '';
+        return;
+      }
+      const r = data.result || {};
+      const total = r.total || 0;
+      const ok = r.ok || 0;
+      const failed = r.failed || 0;
+      const dry = r.dry_run === true;
+      if (failed === 0) {
+        resultSummary.className = 'result-summary success';
+        resultSummary.textContent = dry
+          ? '预检全部通过（共 ' + total + ' 个文件，未实际打印）。'
+          : '已全部提交至系统打印队列（共 ' + total + ' 个文件）。任务已排队，不代表已出纸，请到打印机查看。';
+      } else if (ok === 0) {
+        resultSummary.className = 'result-summary fail';
+        resultSummary.textContent = '全部失败：共 ' + total + ' 个文件。';
+      } else {
+        resultSummary.className = 'result-summary partial';
+        resultSummary.textContent = dry
+          ? '预检通过 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。'
+          : '已提交打印队列 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
+      }
+      const statusLabel = (d) => {
+        if (!d.success) return '失败';
+        return dry ? '通过' : '已提交';
+      };
+      resultBody.innerHTML = (r.details || []).map(d => `
+        <tr>
+          <td class="filename">${escapeHtml(d.filename || d.path || '')}</td>
+          <td class="${d.success ? 'status-ok' : 'status-fail'}">${statusLabel(d)}</td>
+          <td class="message">${escapeHtml(d.message || '')}</td>
+        </tr>
+      `).join('');
+    }
+
+    submitBtn.addEventListener('click', async () => {
+      const list = filesInput.files;
+      if (!list.length) return;
+      const form = new FormData();
+      for (let i = 0; i < list.length; i++) {
+        const f = list[i];
+        const ext = (f.name.slice(f.name.lastIndexOf('.')) || '').toLowerCase();
+        if (ALLOWED_EXT.includes(ext)) form.append('files', f);
+      }
+      if (!form.has('files')) {
+        alert('请选择支持的文档（.doc/.docx/.xls/.xlsx/.pdf）');
+        return;
+      }
+      form.append('check_formal', checkFormal.checked ? 'true' : 'false');
+      form.append('check_signature', checkSignature.checked ? 'true' : 'false');
+      form.append('accept_revisions', acceptRevisions.checked ? 'true' : 'false');
+      form.append('dry_run', dryRun.checked ? 'true' : 'false');
+      form.append('printer_name', printerSelect.value || '');
+      form.append('copies', copiesInput.value || '1');
+
+      setLoading(true);
+      resultArea.classList.remove('visible');
+      showProgress(0, '正在连接…', '');
+
+      function parseSSEChunks(text) {
+        const normalized = text.replace(/\r\n/g, '\n');
+        const parts = normalized.split('\n\n');
+        const complete = parts.slice(0, -1);
+        const remainder = parts[parts.length - 1] || '';
+        const events = [];
+        for (const block of complete) {
+          if (!block.trim()) continue;
+          let ev = '';
+          let payload = '';
+          for (const line of block.split('\n')) {
+            if (line.startsWith('event: ')) ev = line.slice(7).trim();
+            if (line.startsWith('data: ')) payload = line.slice(6);
+          }
+          if (ev && payload) {
+            try {
+              events.push({ event: ev, data: JSON.parse(payload) });
+            } catch (_) {}
+          }
+        }
+        return { events, remainder };
+      }
+
+      try {
+        const res = await fetch('/api/batch-print-stream', { method: 'POST', body: form });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showResult({ ok: false, error: err.error || res.statusText });
+          setLoading(false);
+          return;
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let gotResult = false;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (value) {
+            buf += decoder.decode(value, { stream: true });
+          }
+          const { events, remainder } = parseSSEChunks(buf);
+          buf = remainder;
+          for (const { event, data } of events) {
+            if (event === 'progress') {
+              const total = data.fileTotal || 1;
+              const idx = data.fileIndex || 1;
+              let pct = 0;
+              if (typeof data.percent === 'number' && !isNaN(data.percent)) {
+                pct = Math.min(99, Math.max(0, data.percent));
+              } else {
+                pct = total
+                  ? Math.min(99, Math.round(((idx - 1) / total) * 100 + 50 / total))
+                  : 0;
+              }
+              showProgress(
+                pct,
+                '第 ' + idx + '/' + total + ' 个文件',
+                (data.step || '') + (data.fileName ? ' · ' + data.fileName : '')
+              );
+            } else if (event === 'result') {
+              showResult(data);
+              gotResult = true;
+            }
+          }
+          if (gotResult) break;
+          if (done) break;
+        }
+        if (!gotResult && buf.trim()) {
+          const { events: tailEvents } = parseSSEChunks(buf + '\n\n');
+          for (const { event, data } of tailEvents) {
+            if (event === 'result') {
+              showResult(data);
+              gotResult = true;
+            }
+          }
+        }
+        if (!gotResult && buf.includes('data: ')) {
+          const i = buf.indexOf('data: ');
+          try {
+            const line = buf.slice(i + 6).split(/\r?\n/)[0];
+            const data = JSON.parse(line);
+            if (data.result !== undefined || data.error !== undefined) showResult(data);
+          } catch (_) {}
+        }
+      } catch (e) {
+        showResult({ ok: false, error: e.message });
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+  </script>
+</body>
+</html>
