@@ -62,6 +62,12 @@ python batch_print.py file1.docx file2.xlsx --no-signature-check --no-accept-rev
 python batch_print.py . -p "Microsoft Print to PDF" -n 2
 ```
 
+### 一键提交并推送（Windows）
+
+根目录 **`commit_push.bat`**：执行 `git add -A` → `commit`（默认说明 `chore: update`）→ `push origin main`。可传参作为提交说明，例如：`commit_push.bat fix: 进度条`。
+
+**说明**：脚本内提示为英文，避免在 UTF-8 编码下 `cmd.exe` 误解析中文导致 `'IT_MSG'` 等乱报错；结束时仍会 `pause` 方便查看日志。
+
 ### 参数说明
 
 | 参数 | 说明 |
