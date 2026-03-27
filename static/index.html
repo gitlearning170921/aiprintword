@@ -170,6 +170,19 @@
     .status-fail { color: var(--error); }
     .filename { word-break: break-all; color: var(--text); }
     .message { color: var(--text-muted); font-size: 0.85rem; }
+    .manual-list {
+      margin-top: 14px;
+      padding: 10px 12px;
+      border: 1px solid #f3d3a1;
+      border-radius: 8px;
+      background: #fff7eb;
+      color: #7a4b00;
+      font-size: 0.9rem;
+      display: none;
+    }
+    .manual-list h3 { margin: 0 0 8px; font-size: 0.95rem; }
+    .manual-list ul { margin: 0; padding-left: 18px; }
+    .manual-list li { margin: 4px 0; word-break: break-all; }
     #resultArea { display: none; }
     #resultArea.visible { display: block; }
     .spinner {
@@ -186,12 +199,39 @@
     .progress-bar { height: 100%; background: var(--accent); transition: width 0.2s; }
     .progress-text { font-weight: 600; margin: 0 0 4px; color: var(--text); }
     .progress-detail { font-size: 0.9rem; color: var(--text-muted); margin: 0; }
+    .run-log {
+      margin-top: 10px;
+      max-height: 220px;
+      overflow: auto;
+      background: #f8f9fb;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    .action-block { margin-bottom: 20px; }
+    .action-block:last-child { margin-bottom: 0; }
+    .action-block .hint-inline {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin: 6px 0 0;
+      max-width: 52rem;
+    }
+    .standard-options {
+      margin-top: 12px;
+      padding: 12px 0 0 14px;
+      border-left: 3px solid var(--border);
+    }
+    #downloadWrap { margin-top: 14px; }
+    #downloadWrap a { text-decoration: none; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>批量打印</h1>
-    <p class="subtitle">上传 Word、Excel、PDF，自动检查封面签字与修订后打印</p>
+    <p class="subtitle">上传 Word、Excel、PDF，按所选方式仅保存或打印</p>
     <p class="subtitle" style="margin-top:-12px;"><a href="/sign" style="color:var(--accent);text-decoration:none;font-weight:600;">在线签名（Word / Excel）</a></p>
 
     <div class="card">
@@ -199,30 +239,68 @@
       <div class="field">
         <label for="files">支持 .doc / .docx / .xls / .xlsx / .pdf（可多选）</label>
         <input type="file" id="files" name="files" multiple accept=".doc,.docx,.docm,.xls,.xlsx,.xlsm,.pdf">
+        <div class="field" style="margin-top:10px;margin-bottom:0;">
+          <input type="file" id="dirInput" webkitdirectory directory style="display:none">
+          <label for="dirInput" class="btn btn-secondary" style="cursor:pointer;display:inline-flex;margin:0;">选择文件夹（含子文件夹）</label>
+        </div>
         <p class="hint" id="fileHint">未选择文件</p>
       </div>
     </div>
 
     <div class="card">
-      <h2>打印选项</h2>
-      <div class="field">
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="checkFormal" checked>
-          <label for="checkFormal" style="margin:0">第一步：正式性检查（无标黄、修订、批注、非黑字体等）</label>
-        </div>
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="checkSignature" checked>
-          <label for="checkSignature" style="margin:0">第二步：封面签字与日期（作者、审核、批准、日期非空）</label>
-        </div>
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="acceptRevisions" checked>
-          <label for="acceptRevisions" style="margin:0">自动接受所有修订后再打印</label>
-        </div>
-        <div class="checkbox-wrap">
-          <input type="checkbox" id="dryRun">
-          <label for="dryRun" style="margin:0">仅预检（不实际打印）</label>
+      <h2>执行方式</h2>
+      <p class="hint" style="margin-top:0;">三种流程由按钮区分；模式 ①、② 的文档规范化参数共享。PDF 在模式 ① 中仅原样打包。</p>
+      <div class="field" style="margin:8px 0 12px;">
+        <label for="wordFontProfile">全局文档统一字体策略（Word / Excel，模式 ① 与 ② 生效）</label>
+        <select id="wordFontProfile" style="width:100%;max-width:520px;">
+          <option value="mixed" selected>中英混排（西文 Times New Roman，中文宋体）— 默认</option>
+          <option value="chinese">全文宋体</option>
+          <option value="english">全文 Times New Roman</option>
+        </select>
+      </div>
+
+      <div class="action-block">
+        <button type="button" class="btn btn-secondary" id="btnFormalSave" disabled>① 仅正式检查并修复，保存 Word/Excel 为本地文件并下载 ZIP（不打印）</button>
+        <p class="hint-inline">与模式 ② 相同的处理链；本模式强制完整清理（删删除线文本、去标黄与高亮、草稿水印图形、批注等），不启用 Word 总页数保护。删除线、水印等每一处修改会写入 ZIP 根目录「修改明细.txt」（UTF-8），页面仅显示摘要。PDF 随包原样附带。</p>
+      </div>
+
+      <div class="action-block">
+        <button type="button" class="btn btn-primary" id="btnStandardPrint" disabled>② 正式检查 + 封面签字 + 接受修订后打印</button>
+        <p class="hint-inline">含标黄/修订/批注/非黑字体等检查；未通过时先自动修复再打印（与同目录资源一并上传时更稳妥）。</p>
+        <div class="standard-options">
+          <div class="checkbox-wrap">
+            <input type="checkbox" id="acceptRevisions" checked>
+            <label for="acceptRevisions" style="margin:0">自动接受所有修订后再打印</label>
+          </div>
+          <div class="checkbox-wrap">
+            <input type="checkbox" id="dryRun">
+            <label for="dryRun" style="margin:0">仅预检（不实际打印）</label>
+          </div>
+          <p class="hint" style="margin:8px 0 6px;">Word 专属高级选项（模式 ① 与 ② 均生效）</p>
+          <div class="checkbox-wrap">
+            <input type="checkbox" id="wordContentPreserve" checked>
+            <label for="wordContentPreserve" style="margin:0">Word 内容保真优先（减少对象删改）</label>
+          </div>
+          <div class="checkbox-wrap">
+            <input type="checkbox" id="wordPreservePageCount" checked>
+            <label for="wordPreservePageCount" style="margin:0">Word 总页数保护（处理后页数变化则回退）</label>
+          </div>
+          <div class="checkbox-wrap">
+            <input type="checkbox" id="wordImageRiskGuard" checked>
+            <label for="wordImageRiskGuard" style="margin:0">启用图片风险检测</label>
+          </div>
         </div>
       </div>
+
+      <div class="action-block">
+        <button type="button" class="btn btn-secondary" id="btnRawPrint" disabled>③ 不做处理，直接打印</button>
+        <p class="hint-inline">不检查、不修订、不规范化；上传文件原样送打印队列。</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>打印机与份数</h2>
+      <p class="hint" style="margin-top:0;">模式 ① 不使用打印机；模式 ②、③ 需要。</p>
       <div class="row">
         <div class="field">
           <label for="printer">打印机</label>
@@ -237,12 +315,6 @@
       </div>
     </div>
 
-    <div class="card">
-      <button type="button" class="btn btn-primary" id="submitBtn" disabled>
-        开始检查并打印
-      </button>
-    </div>
-
     <div class="card" id="progressArea" style="display:none;">
       <h2>处理进度</h2>
       <div class="progress-bar-wrap">
@@ -250,11 +322,15 @@
       </div>
       <p class="progress-text" id="progressText">准备中…</p>
       <p class="progress-detail" id="progressDetail"></p>
+      <div class="run-log" id="runLog"></div>
     </div>
 
     <div class="card" id="resultArea">
       <h2>执行结果</h2>
       <div id="resultSummary" class="result-summary"></div>
+      <div id="downloadWrap" style="display:none;">
+        <a id="downloadLink" class="btn btn-primary" href="#" download>下载处理后的文件（ZIP）</a>
+      </div>
       <table class="result-table" id="resultTable">
         <thead>
           <tr>
@@ -265,50 +341,109 @@
         </thead>
         <tbody id="resultBody"></tbody>
       </table>
+      <div class="manual-list" id="manualListWrap">
+        <h3>需手动打印清单</h3>
+        <ul id="manualList"></ul>
+      </div>
     </div>
   </div>
 
   <script>
     const filesInput = document.getElementById('files');
+    const dirInput = document.getElementById('dirInput');
     const fileHint = document.getElementById('fileHint');
-    const checkFormal = document.getElementById('checkFormal');
-    const checkSignature = document.getElementById('checkSignature');
+    const btnFormalSave = document.getElementById('btnFormalSave');
+    const btnStandardPrint = document.getElementById('btnStandardPrint');
+    const btnRawPrint = document.getElementById('btnRawPrint');
+    const actionButtons = [btnFormalSave, btnStandardPrint, btnRawPrint];
     const acceptRevisions = document.getElementById('acceptRevisions');
     const dryRun = document.getElementById('dryRun');
+    const wordContentPreserve = document.getElementById('wordContentPreserve');
+    const wordPreservePageCount = document.getElementById('wordPreservePageCount');
+    const wordImageRiskGuard = document.getElementById('wordImageRiskGuard');
+    const wordFontProfile = document.getElementById('wordFontProfile');
     const printerSelect = document.getElementById('printer');
     const copiesInput = document.getElementById('copies');
-    const submitBtn = document.getElementById('submitBtn');
+    const downloadWrap = document.getElementById('downloadWrap');
+    const downloadLink = document.getElementById('downloadLink');
     const resultArea = document.getElementById('resultArea');
     const resultSummary = document.getElementById('resultSummary');
     const resultBody = document.getElementById('resultBody');
+    const manualListWrap = document.getElementById('manualListWrap');
+    const manualList = document.getElementById('manualList');
     const progressArea = document.getElementById('progressArea');
     const progressBar = document.getElementById('progressBar');
     const progressText = document.getElementById('progressText');
     const progressDetail = document.getElementById('progressDetail');
+    const runLog = document.getElementById('runLog');
 
     const ALLOWED_EXT = ['.doc', '.docx', '.docm', '.xls', '.xlsx', '.xlsm', '.pdf'];
 
-    function updateFileHint() {
-      const list = filesInput.files;
-      if (!list.length) {
-        fileHint.textContent = '未选择文件';
-        submitBtn.disabled = true;
-        return;
-      }
-      const names = Array.from(list).map(f => f.name).filter(n => {
-        const ext = n.slice(n.lastIndexOf('.')).toLowerCase();
-        return ALLOWED_EXT.includes(ext);
-      });
-      if (names.length === 0) {
-        fileHint.textContent = '请选择支持的文档类型';
-        submitBtn.disabled = true;
-        return;
-      }
-      fileHint.textContent = '已选 ' + names.length + ' 个文件：' + names.join('、').slice(0, 80) + (names.join('').length > 80 ? '…' : '');
-      submitBtn.disabled = false;
+    /** 当前待上传文件（目录模式下包含文档依赖资源） */
+    let pendingUploadFiles = [];
+
+    function fileKey(f) {
+      const rel = (f && f.webkitRelativePath) ? String(f.webkitRelativePath) : (f && f.name) || '';
+      return [rel, f && f.size, f && f.lastModified].join('|');
     }
 
-    filesInput.addEventListener('change', updateFileHint);
+    function isAllowedDoc(f) {
+      const n = (f && f.name) || '';
+      const i = n.lastIndexOf('.');
+      const ext = i < 0 ? '' : n.slice(i).toLowerCase();
+      return ALLOWED_EXT.includes(ext);
+    }
+
+    function displayNameForFile(f) {
+      if (f.webkitRelativePath && String(f.webkitRelativePath).length) {
+        return f.webkitRelativePath;
+      }
+      return f.name || '';
+    }
+
+    function updateFileHint() {
+      if (!pendingUploadFiles.length) {
+        fileHint.textContent = '未选择文件（可分多次选择并累加，或使用「选择文件夹」上传整目录；其他类型会自动忽略）';
+        actionButtons.forEach(b => { b.disabled = true; });
+        return;
+      }
+      const docs = pendingUploadFiles.filter(isAllowedDoc);
+      const names = docs.map(displayNameForFile);
+      const extra = pendingUploadFiles.length - docs.length;
+      fileHint.textContent =
+        '已选文档 ' + docs.length + ' 个' +
+        (extra > 0 ? ('（附带资源 ' + extra + ' 个）') : '') +
+        '：' + names.join('、').slice(0, 80) + (names.join('').length > 80 ? '…' : '');
+      const dis = docs.length === 0;
+      actionButtons.forEach(b => { b.disabled = dis; });
+    }
+
+    function mergePendingFiles(newFiles) {
+      const merged = pendingUploadFiles.slice();
+      const seen = new Set(merged.map(fileKey));
+      newFiles.forEach(f => {
+        const k = fileKey(f);
+        if (!seen.has(k)) {
+          seen.add(k);
+          merged.push(f);
+        }
+      });
+      pendingUploadFiles = merged;
+    }
+
+    filesInput.addEventListener('change', () => {
+      mergePendingFiles(Array.from(filesInput.files || []));
+      filesInput.value = '';
+      updateFileHint();
+    });
+
+    if (dirInput) {
+      dirInput.addEventListener('change', () => {
+        mergePendingFiles(Array.from(dirInput.files || []));
+        dirInput.value = '';
+        updateFileHint();
+      });
+    }
 
     function loadPrinters() {
       fetch('/api/printers')
@@ -327,11 +462,9 @@
     }
     loadPrinters();
 
-    function setLoading(loading) {
-      submitBtn.disabled = loading;
-      submitBtn.innerHTML = loading
-        ? '<span class="spinner"></span> 处理中…'
-        : '开始检查并打印';
+    function setActionLoading(loading) {
+      const noDocs = pendingUploadFiles.filter(isAllowedDoc).length === 0;
+      actionButtons.forEach(b => { b.disabled = !!loading || noDocs; });
     }
 
     function showProgress(percent, text, detail) {
@@ -341,9 +474,19 @@
       progressDetail.textContent = detail || '';
     }
 
+    function appendRunLog(msg) {
+      const now = new Date();
+      const ts = now.toLocaleTimeString('zh-CN', { hour12: false });
+      runLog.textContent += '[' + ts + '] ' + msg + '\n';
+      runLog.scrollTop = runLog.scrollHeight;
+    }
+
     function showResult(data) {
       progressArea.style.display = 'none';
       resultArea.classList.add('visible');
+      manualListWrap.style.display = 'none';
+      manualList.innerHTML = '';
+      downloadWrap.style.display = 'none';
       if (!data.ok) {
         resultSummary.className = 'result-summary fail';
         resultSummary.textContent = data.error || '处理失败';
@@ -355,24 +498,47 @@
       const ok = r.ok || 0;
       const failed = r.failed || 0;
       const dry = r.dry_run === true;
+      const skipPrint = r.skip_print === true;
+      if (r.download_token) {
+        downloadWrap.style.display = 'block';
+        downloadLink.href = '/api/batch-export/' + encodeURIComponent(r.download_token);
+        downloadLink.setAttribute('download', r.download_filename || 'processed_documents.zip');
+      }
       if (failed === 0) {
         resultSummary.className = 'result-summary success';
-        resultSummary.textContent = dry
-          ? '预检全部通过（共 ' + total + ' 个文件，未实际打印）。'
-          : '已全部提交至系统打印队列（共 ' + total + ' 个文件）。任务已排队，不代表已出纸，请到打印机查看。';
+        if (skipPrint && r.download_token) {
+          resultSummary.textContent = '全部处理完成（共 ' + total + ' 个文件）。请下载 ZIP：内含处理后的文档；删除线/水印等逐条修改见根目录「修改明细.txt」（未送打印机）。';
+        } else if (skipPrint) {
+          resultSummary.textContent = '处理完成（共 ' + total + ' 个文件），但未生成下载包，请查看下方说明。';
+        } else if (dry) {
+          resultSummary.textContent = '预检全部通过（共 ' + total + ' 个文件，未实际打印）。';
+        } else {
+          resultSummary.textContent = '已全部提交至系统打印队列（共 ' + total + ' 个文件）。任务已排队，不代表已出纸，请到打印机查看。';
+        }
       } else if (ok === 0) {
         resultSummary.className = 'result-summary fail';
         resultSummary.textContent = '全部失败：共 ' + total + ' 个文件。';
       } else {
         resultSummary.className = 'result-summary partial';
-        resultSummary.textContent = dry
-          ? '预检通过 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。'
-          : '已提交打印队列 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
+        if (skipPrint && r.download_token) {
+          resultSummary.textContent = '部分失败：成功 ' + ok + ' 个，失败 ' + failed + ' 个。ZIP 中为当前处理结果（含失败项的原始或中间状态）；逐条修改见「修改明细.txt」，请逐项核对。';
+        } else if (dry) {
+          resultSummary.textContent = '预检通过 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
+        } else {
+          resultSummary.textContent = '已提交打印队列 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
+        }
       }
       const statusLabel = (d) => {
         if (!d.success) return '失败';
+        if (skipPrint) return '已保存';
         return dry ? '通过' : '已提交';
       };
+      const manualItems = (r.details || []).filter(d => {
+        const m = String(d.message || '');
+        return m.indexOf('请手动打印原文') >= 0
+          || m.indexOf('自动打印失败') >= 0
+          || m.indexOf('手动打印') >= 0;
+      });
       resultBody.innerHTML = (r.details || []).map(d => `
         <tr>
           <td class="filename">${escapeHtml(d.filename || d.path || '')}</td>
@@ -380,31 +546,46 @@
           <td class="message">${escapeHtml(d.message || '')}</td>
         </tr>
       `).join('');
+      if (manualItems.length) {
+        manualListWrap.style.display = 'block';
+        manualList.innerHTML = manualItems.map(d =>
+          `<li><strong>${escapeHtml(d.filename || d.path || '')}</strong>：${escapeHtml(d.message || '请手动打印原文')}</li>`
+        ).join('');
+      }
     }
 
-    submitBtn.addEventListener('click', async () => {
-      const list = filesInput.files;
-      if (!list.length) return;
+    async function runBatch(runMode) {
+      if (!pendingUploadFiles.length) return;
+      const docCount = pendingUploadFiles.filter(isAllowedDoc).length;
+      if (docCount === 0) {
+        alert('未找到可打印文档（.doc/.docx/.xls/.xlsx/.pdf）');
+        return;
+      }
       const form = new FormData();
-      for (let i = 0; i < list.length; i++) {
-        const f = list[i];
-        const ext = (f.name.slice(f.name.lastIndexOf('.')) || '').toLowerCase();
-        if (ALLOWED_EXT.includes(ext)) form.append('files', f);
+      for (let i = 0; i < pendingUploadFiles.length; i++) {
+        const f = pendingUploadFiles[i];
+        const name = displayNameForFile(f);
+        form.append('files', f, name);
       }
       if (!form.has('files')) {
         alert('请选择支持的文档（.doc/.docx/.xls/.xlsx/.pdf）');
         return;
       }
-      form.append('check_formal', checkFormal.checked ? 'true' : 'false');
-      form.append('check_signature', checkSignature.checked ? 'true' : 'false');
+      form.append('run_mode', runMode);
       form.append('accept_revisions', acceptRevisions.checked ? 'true' : 'false');
       form.append('dry_run', dryRun.checked ? 'true' : 'false');
+      form.append('word_content_preserve', wordContentPreserve.checked ? 'true' : 'false');
+      form.append('word_preserve_page_count', wordPreservePageCount.checked ? 'true' : 'false');
+      form.append('word_image_risk_guard', wordImageRiskGuard.checked ? 'true' : 'false');
+      form.append('doc_font_profile', wordFontProfile ? wordFontProfile.value : 'mixed');
       form.append('printer_name', printerSelect.value || '');
       form.append('copies', copiesInput.value || '1');
 
-      setLoading(true);
+      setActionLoading(true);
       resultArea.classList.remove('visible');
       showProgress(0, '正在连接…', '');
+      runLog.textContent = '';
+      appendRunLog('开始提交任务，文档 ' + docCount + ' 个，上传总文件 ' + pendingUploadFiles.length + ' 个');
 
       function parseSSEChunks(text) {
         const normalized = text.replace(/\r\n/g, '\n');
@@ -434,7 +615,7 @@
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           showResult({ ok: false, error: err.error || res.statusText });
-          setLoading(false);
+          setActionLoading(false);
           return;
         }
         const reader = res.body.getReader();
@@ -465,8 +646,12 @@
                 '第 ' + idx + '/' + total + ' 个文件',
                 (data.step || '') + (data.fileName ? ' · ' + data.fileName : '')
               );
+              appendRunLog('进度 ' + pct + '%：' + (data.step || '处理中') + (data.fileName ? ' | ' + data.fileName : ''));
+            } else if (event === 'heartbeat') {
+              appendRunLog(data.message || '仍在处理中...');
             } else if (event === 'result') {
               showResult(data);
+              appendRunLog('任务完成');
               gotResult = true;
             }
           }
@@ -493,9 +678,13 @@
       } catch (e) {
         showResult({ ok: false, error: e.message });
       } finally {
-        setLoading(false);
+        setActionLoading(false);
       }
-    });
+    }
+
+    btnFormalSave.addEventListener('click', () => runBatch('formal_save'));
+    btnStandardPrint.addEventListener('click', () => runBatch('standard_print'));
+    btnRawPrint.addEventListener('click', () => runBatch('raw_print'));
 
     function escapeHtml(s) {
       const div = document.createElement('div');

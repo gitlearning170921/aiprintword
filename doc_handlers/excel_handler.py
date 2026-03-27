@@ -47,6 +47,22 @@ def _reraise_with_step(step: str, e: BaseException) -> None:
     raise RuntimeError(f"【{step}】{e}") from e
 
 
+def _is_pdf_printer(printer_name):
+    if not printer_name:
+        return False
+    return "pdf" in str(printer_name).strip().lower()
+
+
+def _desktop_pdf_path(src_path):
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    stem = os.path.splitext(os.path.basename(src_path))[0]
+    out = os.path.join(desktop, f"{stem}_printed.pdf")
+    if not os.path.exists(out):
+        return out
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(desktop, f"{stem}_printed_{ts}.pdf")
+
+
 def _get_excel_app(visible=False):
     if win32com is None:
         raise RuntimeError("请安装 pywin32: pip install pywin32")
@@ -79,6 +95,8 @@ def _save_wb(wb, original_path, save_path):
 YELLOW_HIGHLIGHT_INDICES = (6, 36, 43, 19)
 # 工作表类型：仅处理普通工作表，跳过图表表等
 XL_WORKSHEET = -4167
+# 外部链接类型（LinkSources/BreakLink）
+xlLinkTypeExcelLinks = 1
 # 单表最多逐格处理单元格数，避免超大表卡死 COM
 _MAX_CELLS_PER_SHEET = 80000
 
@@ -102,6 +120,146 @@ def _iter_used_cells(ws, ur):
                 continue
 
 
+def _is_excel_error_text(v):
+    try:
+        s = str(v or "").strip()
+    except Exception:
+        return False
+    return s.startswith("#") and len(s) <= 32
+
+
+def _has_external_links(wb):
+    """检查工作簿是否存在外部链接（LinkSources）。WPS/Excel 兼容性不稳定，失败则视为无。"""
+    try:
+        links = wb.LinkSources(xlLinkTypeExcelLinks)
+        if links is None:
+            return False
+        try:
+            return len(list(links)) > 0
+        except Exception:
+            return bool(links)
+    except Exception:
+        return False
+
+
+def _count_formula_error_cells(wb, max_scan_cells=20000, max_errors=50):
+    """
+    粗略统计 UsedRange 内“公式单元格”的错误值（#N/A/#VALUE!/…）数量。
+    做了上限扫描，避免超大表卡死。
+    """
+    err = 0
+    scanned = 0
+    for ws in wb.Worksheets:
+        try:
+            if ws.Type != XL_WORKSHEET:
+                continue
+        except Exception:
+            continue
+        try:
+            ur = ws.UsedRange
+        except Exception:
+            continue
+        if ur is None:
+            continue
+        for c in _iter_used_cells(ws, ur):
+            scanned += 1
+            if scanned > max_scan_cells:
+                return err
+            try:
+                if not bool(getattr(c, "HasFormula", False)):
+                    continue
+                v = None
+                try:
+                    v = c.Text
+                except Exception:
+                    try:
+                        v = c.Value
+                    except Exception:
+                        v = None
+                if _is_excel_error_text(v):
+                    err += 1
+                    if err >= max_errors:
+                        return err
+            except Exception:
+                pass
+    return err
+
+
+def _auto_fix_excel_formula_errors_and_links(wb, max_scan_cells=30000, max_fix_errors=50):
+    """
+    自动修复（保守）：
+    - 尝试断开外部链接（BreakLink）
+    - 对报错的公式：若未包 IFERROR/IFNA，则改为 IFERROR(原公式,\"\")，避免打印出 #N/A 等
+    """
+    # 1) 断开外部链接
+    try:
+        links = wb.LinkSources(xlLinkTypeExcelLinks)
+        if links:
+            try:
+                links_list = list(links)
+            except Exception:
+                links_list = links if isinstance(links, (list, tuple)) else [links]
+            for ln in links_list:
+                try:
+                    wb.BreakLink(Name=ln, Type=xlLinkTypeExcelLinks)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 2) 把报错公式包 IFERROR
+    fixed = 0
+    scanned = 0
+    for ws in wb.Worksheets:
+        try:
+            if ws.Type != XL_WORKSHEET:
+                continue
+        except Exception:
+            continue
+        try:
+            ur = ws.UsedRange
+        except Exception:
+            continue
+        if ur is None:
+            continue
+        for c in _iter_used_cells(ws, ur):
+            scanned += 1
+            if scanned > max_scan_cells:
+                return
+            if fixed >= max_fix_errors:
+                return
+            try:
+                if not bool(getattr(c, "HasFormula", False)):
+                    continue
+                v = None
+                try:
+                    v = c.Text
+                except Exception:
+                    try:
+                        v = c.Value
+                    except Exception:
+                        v = None
+                if not _is_excel_error_text(v):
+                    continue
+                f = ""
+                try:
+                    f = str(c.Formula or "")
+                except Exception:
+                    f = ""
+                up = f.upper()
+                if "IFERROR(" in up or "IFNA(" in up:
+                    continue
+                if not f.startswith("="):
+                    continue
+                try:
+                    c.Formula = f'=IFERROR({f[1:]},"")'
+                    fixed += 1
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+
 def _apply_font_black_sheet(ws):
     """
     将工作表已用区域字体设为黑色。合并单元格下整块 UsedRange.Font 常会报 COM 错，故分级降级。
@@ -114,6 +272,7 @@ def _apply_font_black_sheet(ws):
         return
     try:
         ur.Font.Color = 0
+        _apply_font_profile_to_excel_font(ur.Font)
         return
     except Exception:
         pass
@@ -121,16 +280,19 @@ def _apply_font_black_sheet(ws):
         for area in ur.Areas:
             try:
                 area.Font.Color = 0
+                _apply_font_profile_to_excel_font(area.Font)
             except Exception:
                 for cell in _iter_used_cells(ws, area):
                     try:
                         cell.Font.Color = 0
+                        _apply_font_profile_to_excel_font(cell.Font)
                     except Exception:
                         pass
     except Exception:
         for cell in _iter_used_cells(ws, ur):
             try:
                 cell.Font.Color = 0
+                _apply_font_profile_to_excel_font(cell.Font)
             except Exception:
                 pass
 
@@ -142,6 +304,10 @@ _FILL_CLEAR_COLORINDEX = frozenset(
 )
 _MAX_ROW_AUTOFIT = 8000
 _MAX_COL_AUTOFIT = 256
+# 统一字体策略：chinese=全文宋体 | english=全文 Times New Roman | mixed=西文 TNR + 中文宋体（Excel 近似）
+EXCEL_FONT_PROFILE = "mixed"
+FONT_NAME_SONG = "SimSun"
+FONT_NAME_LATIN = "Times New Roman"
 # Excel Borders 索引：外框 + 内部网格
 _XL_BORDER_LEFT = 7
 _XL_BORDER_TOP = 8
@@ -229,6 +395,38 @@ def _copy_border_style_from_sample(dst_border, sample_border):
             dst_border.Weight = _XL_BORDER_THIN
         except Exception:
             pass
+
+
+def set_runtime_options(*, excel_font_profile=None):
+    """按请求级别动态设置 Excel 运行开关（本进程内生效）。"""
+    global EXCEL_FONT_PROFILE
+    if excel_font_profile is not None:
+        p = str(excel_font_profile).strip().lower()
+        if p in ("chinese", "english", "mixed"):
+            EXCEL_FONT_PROFILE = p
+
+
+def _apply_font_profile_to_excel_font(font_obj):
+    """按 EXCEL_FONT_PROFILE 设置 Excel 字体（mixed 为近似策略）。"""
+    try:
+        pr = (EXCEL_FONT_PROFILE or "mixed").strip().lower()
+        if pr not in ("chinese", "english", "mixed"):
+            pr = "mixed"
+        if pr == "chinese":
+            font_obj.Name = FONT_NAME_SONG
+        elif pr == "english":
+            font_obj.Name = FONT_NAME_LATIN
+        else:
+            try:
+                font_obj.Name = FONT_NAME_LATIN
+            except Exception:
+                pass
+            try:
+                font_obj.NameLocal = "宋体"
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _cell_has_value_for_border(cell):
@@ -446,6 +644,121 @@ def _excel_row_min_height_by_max_font(ws, row, left, nc):
     if mx_fs <= 0:
         return 13.0
     return min(409.0, max(13.5, mx_fs * 1.18 + 4.0))
+
+
+def _excel_shape_is_embedded_picture(sh):
+    """是否为嵌入图片（含链接图），用于与图表/OLE 等区分。"""
+    try:
+        st = int(sh.Type)
+        # msoLinkedPicture=11, msoPicture=13
+        if st in (11, 13):
+            return True
+    except Exception:
+        pass
+    try:
+        if getattr(sh, "PictureFormat", None) is not None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _excel_scale_cell_pictures_to_fit_merge_area(wb):
+    """
+    矩阵外：图片锚定在单元格上且大于合并区域可视范围时，等比例缩小（宽与高同比例）。
+    纯文字行高仍由 _excel_autofit_rows_outside_matrix 处理（只拉高行高）。
+    """
+    for ws in wb.Worksheets:
+        try:
+            if ws.Type != XL_WORKSHEET:
+                continue
+        except Exception:
+            continue
+        try:
+            n = int(ws.Shapes.Count)
+        except Exception:
+            continue
+        for i in range(1, n + 1):
+            try:
+                sh = ws.Shapes(i)
+                if not _excel_shape_is_embedded_picture(sh):
+                    continue
+                try:
+                    anchor = sh.TopLeftCell
+                except Exception:
+                    continue
+                if anchor is None:
+                    continue
+                try:
+                    tl = anchor.MergeArea.Cells(1, 1) if anchor.MergeCells else anchor
+                except Exception:
+                    tl = anchor
+                if _cell_is_risk_matrix_cell(tl):
+                    continue
+                try:
+                    ma = anchor.MergeArea
+                except Exception:
+                    ma = anchor
+                try:
+                    max_w = float(ma.Width)
+                    max_h = float(ma.Height)
+                except Exception:
+                    continue
+                if max_w < 1.0 or max_h < 1.0:
+                    continue
+                try:
+                    sw = float(sh.Width)
+                    shh = float(sh.Height)
+                except Exception:
+                    continue
+                if sw <= 0 or shh <= 0:
+                    continue
+                # 目标：尽量贴近单元格可视区域（保留少量边距）
+                fit_scale = min(max_w / sw, max_h / shh) * 0.98
+                # 大图缩小；小图放大（放大上限避免过度放大导致失真）
+                if fit_scale > 1.0:
+                    scale = min(fit_scale, 2.5)
+                else:
+                    scale = fit_scale
+                if abs(scale - 1.0) < 0.03:
+                    continue
+                try:
+                    sh.LockAspectRatio = True
+                except Exception:
+                    pass
+                sh.Width = sw * scale
+                sh.Height = shh * scale
+                # 放大后若仍明显偏小，适度拉大单元格（先行高，再列宽）
+                try:
+                    nw = float(sh.Width)
+                    nh = float(sh.Height)
+                    if nw < max_w * 0.78 or nh < max_h * 0.78:
+                        need_w = max_w
+                        need_h = max_h
+                        target_w = max(nw / 0.85, need_w)
+                        target_h = max(nh / 0.85, need_h)
+                        grow_h = min(1.35, max(1.0, target_h / max(need_h, 1.0)))
+                        grow_w = min(1.20, max(1.0, target_w / max(need_w, 1.0)))
+                        try:
+                            r0 = int(ma.Row)
+                            rn = int(ma.Rows.Count)
+                            for rr in range(r0, r0 + rn):
+                                cur_h = float(ws.Rows(rr).RowHeight)
+                                ws.Rows(rr).RowHeight = min(409.0, cur_h * grow_h)
+                        except Exception:
+                            pass
+                        try:
+                            c0 = int(ma.Column)
+                            cn = int(ma.Columns.Count)
+                            for cc in range(c0, c0 + cn):
+                                cur_w = float(ws.Columns(cc).ColumnWidth)
+                                ws.Columns(cc).ColumnWidth = min(255.0, cur_w * grow_w)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
 
 def _excel_autofit_rows_outside_matrix(wb):
@@ -839,6 +1152,18 @@ def check_formal_document(xl_path, check_highlight=True, check_comments=True, ch
                     break
             if has_non_black:
                 issues.append("存在非黑色字体")
+        # Excel 公式风险：外部链接 + 公式错误值
+        try:
+            if _has_external_links(wb):
+                issues.append("存在外部链接（LinkSources）")
+        except Exception:
+            pass
+        try:
+            n_err = _count_formula_error_cells(wb)
+            if n_err > 0:
+                issues.append(f"存在 {n_err} 个公式错误值（如 #N/A/#VALUE!）")
+        except Exception:
+            pass
         passed = len(issues) == 0
         return passed, issues
     except Exception as e:
@@ -903,9 +1228,11 @@ def auto_fix_formal_excel(xl_path, save_path=None):
         try:
             _excel_clear_fill_outside_matrix(wb)
             _unify_header_fill_gray(wb)
+            _excel_scale_cell_pictures_to_fit_merge_area(wb)
             _excel_autofit_rows_outside_matrix(wb)
             _excel_unify_row_borders_inconsistent_only(wb)
             _ensure_print_area_covers_used_range(wb)
+            _auto_fix_excel_formula_errors_and_links(wb)
         except Exception:
             pass
         try:
@@ -1220,10 +1547,42 @@ def _printer_line_for_excel_com(printer_name):
     return None
 
 
+def _refresh_excel_pagination_before_print(wb):
+    """
+    PrintOut 前轻触分页引擎（不改纸张方向等）。
+
+    **禁止**在此调用 ``Application.CalculateFull()``：会对所有的公式做全量重算与依赖重建，
+    大工作簿或复杂模型下可能卡住数十分钟甚至更久。
+    ``_ensure_print_area_covers_used_range`` 里已执行 ``Calculate()``，此处不再全表重算，
+    仅对 PageSetup 做「读回写」以刷新分页布局。
+    """
+    try:
+        for ws in wb.Worksheets:
+            try:
+                if ws.Type != XL_WORKSHEET:
+                    continue
+                ps = ws.PageSetup
+                try:
+                    o = ps.Orientation
+                    ps.Orientation = o
+                except Exception:
+                    pass
+                try:
+                    pa = str(ps.PrintArea or "").strip()
+                    if pa:
+                        ps.PrintArea = pa
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def print_excel_workbook(xl_path, printer_name=None, copies=1):
     """
     打印前（仅内存，不写回文件）：矩阵外行高、表头底色、框线；打印布局仅居中与一页宽适配，**不改纸张方向**；
-    安全修正页码标记（仅 Page:数字 片段）。
+    安全修正页码标记（仅 Page:数字 片段）；**PrintOut 前**轻触 PageSetup 刷新分页（不做 CalculateFull）。
     若 PrintArea 未覆盖已用区域，会扩展到 UsedRange，保证记录打全。
     指定打印机：先 ActivePrinter，失败则临时改系统默认打印机。
     """
@@ -1245,6 +1604,7 @@ def print_excel_workbook(xl_path, printer_name=None, copies=1):
         except Exception as e:
             _reraise_with_step("打开工作簿（打印）", e)
         try:
+            _excel_scale_cell_pictures_to_fit_merge_area(wb)
             _excel_autofit_rows_outside_matrix(wb)
         except Exception:
             pass
@@ -1286,6 +1646,17 @@ def print_excel_workbook(xl_path, printer_name=None, copies=1):
                     win32print.SetDefaultPrinter(printer_name)
                 except Exception as e:
                     _reraise_with_step("设置打印机（COM 与系统默认均失败）", e)
+        try:
+            _refresh_excel_pagination_before_print(wb)
+        except Exception:
+            pass
+        if _is_pdf_printer(printer_name):
+            out_pdf = _desktop_pdf_path(path)
+            try:
+                wb.ExportAsFixedFormat(0, out_pdf)  # 0 = xlTypePDF
+                return out_pdf
+            except Exception as e:
+                _reraise_with_step("导出 PDF", e)
         try:
             wb.PrintOut(
                 From=1,

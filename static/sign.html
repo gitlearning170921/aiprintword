@@ -122,6 +122,22 @@
       vertical-align: middle;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .file-list { list-style: none; margin: 0; padding: 0; }
+    .file-list li {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      background: var(--surface2);
+    }
+    .file-list li.selected { border-color: var(--accent); background: rgba(26,115,232,0.06); }
+    .file-list li label { margin: 0; cursor: pointer; flex: 1; min-width: 0; word-break: break-all; }
+    .file-list .del-btn { flex-shrink: 0; }
+    .signed-meta { font-size: 0.85rem; color: var(--text-muted); margin-top: 4px; width: 100%; }
   </style>
 </head>
 <body>
@@ -130,16 +146,32 @@
       <a href="/">返回批量打印</a>
     </div>
     <h1>在线签名</h1>
-    <p class="subtitle">上传 Word（.docx）或 Excel（.xlsx），按角色手写签名与日期，生成已签字文档下载。不影响批量打印功能。</p>
-
-    <div class="card">
-      <h2>选择文件</h2>
-      <input type="file" id="fileInput" accept=".docx,.xlsx">
-      <p class="hint" id="fileHint">未选择文件</p>
+    <p class="subtitle">先上传并保存到列表，再从列表选择要签名的文件；按角色手写签名与日期后生成下载。不影响批量打印。</p>
+    <div id="fileProtoWarn" class="card" style="display:none;background:#fff8e1;border-color:#ffc107;">
+      <strong>请勿用本地文件打开本页。</strong> 请在本机运行 <code>python app.py</code> 后，用浏览器打开 <strong>http://127.0.0.1:5050/sign</strong>（或本机局域网 IP 同端口），否则「保存到列表」会失败。
     </div>
 
     <div class="card">
-      <h2>签字角色（可多选）</h2>
+      <h2>1. 上传并保存到列表</h2>
+      <input type="file" id="fileInput" multiple accept=".docx,.xlsx">
+      <div class="btn-row" style="margin-top:10px;">
+        <input type="file" id="dirInput" webkitdirectory directory style="display:none">
+        <label for="dirInput" class="btn btn-secondary" style="cursor:pointer;margin:0;">选择文件夹（含子文件夹）</label>
+      </div>
+      <p class="hint" id="fileHint">可多选 .docx / .xlsx，或使用「选择文件夹」上传整目录</p>
+      <div class="btn-row" style="margin-top:12px;">
+        <button type="button" class="btn btn-secondary" id="saveBtn" disabled>保存到列表</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>2. 选择要签名的文件</h2>
+      <p class="hint" id="listHint">暂无已保存文件，请先上传保存。</p>
+      <ul class="file-list" id="fileList"></ul>
+    </div>
+
+    <div class="card">
+      <h2>3. 签字角色（可多选）</h2>
       <p class="hint">每个角色需分别手写「签名」和「日期」；模板中需有对应关键词空白位。</p>
       <div id="roleChecks"></div>
       <div id="rolePanels"></div>
@@ -149,221 +181,34 @@
       <button type="button" class="btn btn-primary" id="submitBtn" disabled>生成已签名文档</button>
       <p class="err" id="errMsg" style="display:none;"></p>
     </div>
+
+    <div class="card" id="signedSection">
+      <h2>已签名文档（数据库共享）</h2>
+      <p class="hint" id="signedHint" style="display:none;"></p>
+      <ul class="file-list" id="signedList"></ul>
+    </div>
   </div>
 
   <script>
-    const ROLES = [
-      { id: 'author', label: '作者' },
-      { id: 'reviewer', label: '审核' },
-      { id: 'approver', label: '批准' },
-      { id: 'executor', label: '执行人员' },
-      { id: 'reviewer_tail', label: '审核人员（文末等）' },
-    ];
-
-    const fileInput = document.getElementById('fileInput');
-    const fileHint = document.getElementById('fileHint');
-    const roleChecks = document.getElementById('roleChecks');
-    const rolePanels = document.getElementById('rolePanels');
-    const submitBtn = document.getElementById('submitBtn');
-    const errMsg = document.getElementById('errMsg');
-
-    const canvases = {};
-
-    function setupCanvas(canvas) {
-      const ctx = canvas.getContext('2d');
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      function resize() {
-        const rect = canvas.getBoundingClientRect();
-        canvas.width = Math.floor(rect.width * dpr);
-        canvas.height = Math.floor(rect.height * dpr);
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.strokeStyle = '#000';
-        ctx.lineWidth = 2;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
+    (function () {
+      if (typeof window !== 'undefined' && window.location.protocol === 'file:') {
+        var warn = document.getElementById('fileProtoWarn');
+        if (warn) warn.style.display = 'block';
       }
-      resize();
-      window.addEventListener('resize', resize);
-      let drawing = false;
-      function pos(e) {
-        const r = canvas.getBoundingClientRect();
-        const t = e.touches ? e.touches[0] : e;
-        return { x: t.clientX - r.left, y: t.clientY - r.top };
-      }
-      function start(e) {
-        e.preventDefault();
-        drawing = true;
-        const p = pos(e);
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y);
-      }
-      function move(e) {
-        if (!drawing) return;
-        e.preventDefault();
-        const p = pos(e);
-        ctx.lineTo(p.x, p.y);
-        ctx.stroke();
-      }
-      function end(e) {
-        if (e) e.preventDefault();
-        drawing = false;
-      }
-      canvas.addEventListener('mousedown', start);
-      canvas.addEventListener('mousemove', move);
-      canvas.addEventListener('mouseup', end);
-      canvas.addEventListener('mouseleave', end);
-      canvas.addEventListener('touchstart', start, { passive: false });
-      canvas.addEventListener('touchmove', move, { passive: false });
-      canvas.addEventListener('touchend', end);
-      return { clear: () => { ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,canvas.width,canvas.height); ctx.restore(); resize(); } };
-    }
-
-    function buildUI() {
-      ROLES.forEach(r => {
-        const row = document.createElement('div');
-        row.className = 'role-row';
-        row.innerHTML = `<input type="checkbox" id="chk_${r.id}" data-id="${r.id}"><label for="chk_${r.id}" style="margin:0;cursor:pointer">${r.label}</label>`;
-        roleChecks.appendChild(row);
-
-        const panel = document.createElement('div');
-        panel.className = 'role-panel';
-        panel.id = `panel_${r.id}`;
-        panel.innerHTML = `
-          <div class="canvas-wrap">
-            <label>签名（${r.label}）</label>
-            <canvas class="sign-pad" id="sig_${r.id}"></canvas>
-            <div class="btn-row"><button type="button" class="btn btn-secondary" data-clear="sig_${r.id}">清除签名</button></div>
-          </div>
-          <div class="canvas-wrap">
-            <label>日期（${r.label}）</label>
-            <canvas class="sign-pad" id="date_${r.id}"></canvas>
-            <div class="btn-row"><button type="button" class="btn btn-secondary" data-clear="date_${r.id}">清除日期</button></div>
-          </div>
-        `;
-        rolePanels.appendChild(panel);
-
-        document.getElementById(`chk_${r.id}`).addEventListener('change', () => {
-          panel.classList.toggle('visible', document.getElementById(`chk_${r.id}`).checked);
-          updateSubmitState();
-        });
-      });
-
-      rolePanels.querySelectorAll('[data-clear]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const id = btn.getAttribute('data-clear');
-          if (canvases[id]) canvases[id].clear();
-        });
-      });
-
-      ROLES.forEach(r => {
-        canvases[`sig_${r.id}`] = setupCanvas(document.getElementById(`sig_${r.id}`));
-        canvases[`date_${r.id}`] = setupCanvas(document.getElementById(`date_${r.id}`));
-      });
-    }
-
-    function selectedRoleIds() {
-      return ROLES.map(r => r.id).filter(id => document.getElementById(`chk_${id}`).checked);
-    }
-
-    function updateSubmitState() {
-      const f = fileInput.files && fileInput.files[0];
-      const ok = f && selectedRoleIds().length > 0;
-      submitBtn.disabled = !ok;
-      const ext = f ? (f.name.slice(f.name.lastIndexOf('.')) || '').toLowerCase() : '';
-      if (f && ext !== '.docx' && ext !== '.xlsx') {
-        submitBtn.disabled = true;
-      }
-    }
-
-    fileInput.addEventListener('change', () => {
-      const f = fileInput.files && fileInput.files[0];
-      fileHint.textContent = f ? '已选：' + f.name : '未选择文件';
-      updateSubmitState();
-    });
-
-    function showErr(s) {
-      errMsg.style.display = s ? 'block' : 'none';
-      errMsg.textContent = s || '';
-    }
-
-    function isCanvasBlank(canvas) {
-      const ctx = canvas.getContext('2d');
-      const w = canvas.width, h = canvas.height;
-      if (!w || !h) return true;
-      const data = ctx.getImageData(0, 0, w, h).data;
-      for (let i = 3; i < data.length; i += 4) {
-        if (data[i] > 10) return false;
-      }
-      return true;
-    }
-
-    submitBtn.addEventListener('click', async () => {
-      showErr('');
-      const f = fileInput.files[0];
-      if (!f) return;
-      const roles = selectedRoleIds();
-      if (!roles.length) {
-        showErr('请至少勾选一个角色');
-        return;
-      }
-      for (const id of roles) {
-        const sigC = document.getElementById('sig_' + id);
-        const dateC = document.getElementById('date_' + id);
-        if (isCanvasBlank(sigC) || isCanvasBlank(dateC)) {
-          const label = ROLES.find(x => x.id === id).label;
-          showErr('请为「' + label + '」完成签名与日期手写');
-          return;
+      var p = (window.__APP_ROOT__ || '').replace(/\/+$/, '');
+      var s = document.createElement('script');
+      s.defer = true;
+      s.src = p + '/js/sign-page.js';
+      s.onerror = function () {
+        var e = document.getElementById('errMsg');
+        if (e) {
+          e.style.display = 'block';
+          e.textContent =
+            '无法加载 js/sign-page.js。请用 http://127.0.0.1:5050/sign 打开，并确认已保存 static/js/sign-page.js 后重启 python app.py。';
         }
-      }
-
-      const form = new FormData();
-      form.append('file', f);
-      form.append('roles', JSON.stringify(roles));
-      roles.forEach(id => {
-        form.append('sig_' + id, document.getElementById('sig_' + id).toDataURL('image/png'));
-        form.append('date_' + id, document.getElementById('date_' + id).toDataURL('image/png'));
-      });
-
-      submitBtn.disabled = true;
-      submitBtn.innerHTML = '<span class="spinner"></span> 处理中…';
-      try {
-        const res = await fetch('/api/sign', { method: 'POST', body: form });
-        const ct = res.headers.get('Content-Type') || '';
-        if (!res.ok) {
-          if (ct.includes('application/json')) {
-            const j = await res.json();
-            showErr(j.error || res.statusText);
-          } else {
-            showErr(res.statusText || '请求失败');
-          }
-          return;
-        }
-        if (ct.includes('application/json')) {
-          const j = await res.json();
-          showErr(j.error || '失败');
-          return;
-        }
-        const blob = await res.blob();
-        const dispo = res.headers.get('Content-Disposition') || '';
-        let name = f.name.replace(/\.[^.]+$/, '') + '_signed' + (f.name.match(/\.[^.]+$/) || [''])[0];
-        const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(dispo);
-        if (m) try { name = decodeURIComponent(m[1].replace(/['"]/g, '')); } catch (_) {}
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = name;
-        a.click();
-        URL.revokeObjectURL(a.href);
-      } catch (e) {
-        showErr(e.message || String(e));
-      } finally {
-        submitBtn.disabled = false;
-        submitBtn.textContent = '生成已签名文档';
-        updateSubmitState();
-      }
-    });
-
-    buildUI();
-    updateSubmitState();
+      };
+      document.body.appendChild(s);
+    })();
   </script>
 </body>
 </html>

@@ -16,7 +16,8 @@ from docx.shared import Cm
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from sign_handlers.config import ROLE_ID_TO_KEYWORD
+from sign_handlers.config import ROLE_ID_TO_KEYWORD, role_keywords
+from sign_handlers.label_match import cell_text_matches_keyword, paragraph_text_keyword_end_offset
 
 # 可见占位字符（作者：____ 等）
 _PLACEHOLDER_CHARS = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·]+$")
@@ -63,16 +64,7 @@ def _run_has_underline_or_border(r) -> bool:
 
 
 def _find_keyword_in_paragraph(p: Paragraph, keyword: str) -> int:
-    t = _paragraph_full_text(p)
-    # 优先「关键词：」
-    for pat in (f"{keyword}：", f"{keyword}:", keyword):
-        idx = t.find(pat)
-        if idx >= 0:
-            return idx + len(pat)
-    idx = t.find(keyword)
-    if idx >= 0:
-        return idx + len(keyword)
-    return -1
+    return paragraph_text_keyword_end_offset(_paragraph_full_text(p), keyword)
 
 
 def _clear_runs_after_offset(p: Paragraph, start_char_offset: int) -> None:
@@ -137,11 +129,9 @@ def _try_paragraph_inline(
         rt = r.text or ""
         seg = acc + len(rt)
         if not found_kw_end:
-            chunk = full[max(0, acc) : min(len(full), seg)]
-            # 简化：整段已含关键词则标记
-            if keyword in full and acc <= full.find(keyword) < seg:
+            # off 为关键词匹配结束位置（见 paragraph_text_keyword_end_offset）
+            if acc < off <= seg:
                 found_kw_end = True
-                # 关键词结束位置之后的第一个下划线 run
         if found_kw_end and acc >= off and _run_has_underline_or_border(r):
             insert_after_run_idx = i
             break
@@ -160,17 +150,6 @@ def _try_paragraph_inline(
     return True
 
 
-def _cell_is_keyword_label(text: str, keyword: str) -> bool:
-    t = text.strip()
-    if not t:
-        return False
-    if t in (keyword, f"{keyword}：", f"{keyword}:"):
-        return True
-    if t.startswith(keyword) and len(t) <= len(keyword) + 2:
-        return True
-    return False
-
-
 def _try_table_role(
     table: Table,
     keyword: str,
@@ -181,7 +160,7 @@ def _try_table_role(
     for ri, row in enumerate(rows_list):
         cells = row.cells
         for ci, cell in enumerate(cells):
-            if not _cell_is_keyword_label(_cell_text(cell), keyword):
+            if not cell_text_matches_keyword(_cell_text(cell), keyword):
                 continue
             if ci + 1 >= len(cells):
                 continue
@@ -252,29 +231,34 @@ def sign_docx(
         out_path = f"{base}_signed{ext}"
     doc = Document(path)
 
-    for role_id, kw in ROLE_ID_TO_KEYWORD.items():
+    for role_id in ROLE_ID_TO_KEYWORD:
         sig = role_to_signature_png.get(role_id)
         dt = role_to_date_png.get(role_id)
         if not sig or not dt:
             continue
         done = False
-        for table in _iter_tables(doc):
-            if _try_table_role(table, kw, sig, dt):
-                done = True
+        for kw in role_keywords(role_id):
+            if done:
                 break
-        if done:
-            continue
-        for p in _iter_body_paragraphs(doc):
-            if kw not in _paragraph_full_text(p):
-                continue
-            if _try_paragraph_inline(p, kw, sig, dt):
+            for table in _iter_tables(doc):
+                if _try_table_role(table, kw, sig, dt):
+                    done = True
+                    break
+            if done:
                 break
-        else:
+            for p in _iter_body_paragraphs(doc):
+                if _find_keyword_in_paragraph(p, kw) < 0:
+                    continue
+                if _try_paragraph_inline(p, kw, sig, dt):
+                    done = True
+                    break
+            if done:
+                break
             for table in _iter_tables(doc):
                 for row in table.rows:
                     for cell in row.cells:
                         for p in cell.paragraphs:
-                            if kw not in _paragraph_full_text(p):
+                            if _find_keyword_in_paragraph(p, kw) < 0:
                                 continue
                             if _try_paragraph_inline(p, kw, sig, dt):
                                 done = True

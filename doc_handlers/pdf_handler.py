@@ -3,8 +3,10 @@
 PDF 文档打印：通过 Windows 默认关联程序打印（如 Adobe / Edge）
 """
 import os
+import shutil
 import subprocess
 import sys
+import time
 
 try:
     import win32api
@@ -28,6 +30,15 @@ def print_pdf(pdf_path, printer_name=None):
     if win32api is None:
         raise RuntimeError("请安装 pywin32: pip install pywin32")
     try:
+        if printer_name and "pdf" in str(printer_name).strip().lower():
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            stem = os.path.splitext(os.path.basename(path))[0]
+            out = os.path.join(desktop, f"{stem}_printed.pdf")
+            if os.path.exists(out):
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                out = os.path.join(desktop, f"{stem}_printed_{ts}.pdf")
+            shutil.copyfile(path, out)
+            return out
         if printer_name and win32print:
             old_default = win32print.GetDefaultPrinter()
             try:

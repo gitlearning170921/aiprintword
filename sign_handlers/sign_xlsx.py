@@ -10,9 +10,26 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
 from openpyxl import load_workbook
 
-from sign_handlers.config import ROLE_ID_TO_KEYWORD
+from sign_handlers.config import ROLE_ID_TO_KEYWORD, role_keywords
+from sign_handlers.label_match import cell_text_matches_keyword
 
 _MAX_IMG_WIDTH_PX = 220
+_DATE_LABEL_KEYWORDS = ("日期", "Date")
+
+
+def _find_date_cell_same_row(ws, r: int, author_col: int):
+    """同行在「Date / 日期」标签右侧空白格放日期（如 Author 与 Date 分列的封面表）。"""
+    max_col = min(ws.max_column or 0, 64)
+    if max_col < author_col + 2:
+        return None
+    for col in range(author_col + 2, max_col + 1):
+        cl = ws.cell(row=r, column=col)
+        for dkw in _DATE_LABEL_KEYWORDS:
+            if cell_text_matches_keyword(cl.value, dkw):
+                dc = ws.cell(row=r, column=col + 1)
+                if _is_emptyish(dc.value):
+                    return dc
+    return None
 
 
 def _is_emptyish(v) -> bool:
@@ -24,17 +41,6 @@ def _is_emptyish(v) -> bool:
     if all(c in " _-—–\u2014\u2015\u2500\u3000.·" for c in s):
         return True
     return len(s) < 2
-
-
-def _cell_contains_keyword(cell_value, keyword: str) -> bool:
-    if cell_value is None:
-        return False
-    s = str(cell_value).strip()
-    if s == keyword or s == f"{keyword}：" or s == f"{keyword}:":
-        return True
-    if s.startswith(keyword) and len(s) <= len(keyword) + 2:
-        return True
-    return False
 
 
 def _add_png(ws, png_bytes: bytes, anchor: str, max_w: int = _MAX_IMG_WIDTH_PX) -> None:
@@ -57,46 +63,50 @@ def sign_xlsx(
         out_path = f"{base}_signed{ext}"
 
     wb = load_workbook(path)
-    for role_id, kw in ROLE_ID_TO_KEYWORD.items():
+    for role_id in ROLE_ID_TO_KEYWORD:
         sig = role_to_signature_png.get(role_id)
         dt = role_to_date_png.get(role_id)
         if not sig or not dt:
             continue
         placed = False
-        for ws in wb.worksheets:
+        for kw in role_keywords(role_id):
             if placed:
                 break
-            for row in ws.iter_rows():
+            for ws in wb.worksheets:
                 if placed:
                     break
-                for cell in row:
-                    if not _cell_contains_keyword(cell.value, kw):
-                        continue
-                    r, c = cell.row, cell.column
-                    sig_cell = ws.cell(row=r, column=c + 1)
-                    if not _is_emptyish(sig_cell.value):
-                        continue
-                    date_cell = None
-                    c2 = ws.cell(row=r, column=c + 2)
-                    if _is_emptyish(c2.value):
-                        date_cell = c2
-                    else:
-                        d1 = ws.cell(row=r + 1, column=c + 1)
-                        if _is_emptyish(d1.value):
-                            date_cell = d1
+                for row in ws.iter_rows():
+                    if placed:
+                        break
+                    for cell in row:
+                        if not cell_text_matches_keyword(cell.value, kw):
+                            continue
+                        r, c = cell.row, cell.column
+                        sig_cell = ws.cell(row=r, column=c + 1)
+                        if not _is_emptyish(sig_cell.value):
+                            continue
+                        date_cell = _find_date_cell_same_row(ws, r, c)
+                        if date_cell is None:
+                            c2 = ws.cell(row=r, column=c + 2)
+                            if _is_emptyish(c2.value):
+                                date_cell = c2
+                            else:
+                                d1 = ws.cell(row=r + 1, column=c + 1)
+                                if _is_emptyish(d1.value):
+                                    date_cell = d1
+                                else:
+                                    d0 = ws.cell(row=r + 1, column=c)
+                                    if _is_emptyish(d0.value):
+                                        date_cell = d0
+                        sig_cell.value = None
+                        _add_png(ws, sig, sig_cell.coordinate)
+                        if date_cell is not None:
+                            date_cell.value = None
+                            _add_png(ws, dt, date_cell.coordinate, max_w=180)
                         else:
-                            d0 = ws.cell(row=r + 1, column=c)
-                            if _is_emptyish(d0.value):
-                                date_cell = d0
-                    sig_cell.value = None
-                    _add_png(ws, sig, sig_cell.coordinate)
-                    if date_cell is not None:
-                        date_cell.value = None
-                        _add_png(ws, dt, date_cell.coordinate, max_w=180)
-                    else:
-                        below = f"{get_column_letter(c + 1)}{r + 1}"
-                        _add_png(ws, dt, below, max_w=180)
-                    placed = True
-                    break
+                            below = f"{get_column_letter(c + 1)}{r + 1}"
+                            _add_png(ws, dt, below, max_w=180)
+                        placed = True
+                        break
     wb.save(out_path)
     return out_path

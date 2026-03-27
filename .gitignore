@@ -24,3 +24,7 @@ docs/*.docx
 *.log
 *.tmp
 aiprintword_*/
+
+# 在线签名页会话暂存（不上传仓库）
+data/sign_inbox/
+data/batch_exports/
