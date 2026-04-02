@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>系统设置 - aiprintword</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f5f5f5;
+      --surface: #fff;
+      --border: #e0e0e0;
+      --text: #111;
+      --muted: #666;
+      --accent: #1a73e8;
+      --err: #c62828;
+      --radius: 6px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Noto Sans SC', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .wrap { max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; margin: 0 0 8px; }
+    .muted { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card h2 {
+      font-size: 0.95rem;
+      margin: 0 0 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    label {
+      display: block;
+      font-size: 0.88rem;
+      font-weight: 500;
+      margin-top: 12px;
+    }
+    .hint { font-size: 0.8rem; color: var(--muted); font-weight: 400; margin-top: 2px; }
+    input[type=text], input[type=password], input[type=number], select {
+      width: 100%;
+      max-width: 420px;
+      margin-top: 4px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 0.95rem;
+    }
+    .row { margin-bottom: 4px; }
+    .src { font-size: 0.75rem; color: var(--muted); }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 10px 18px;
+      border-radius: var(--radius);
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(0.95); }
+    button.secondary { background: #5f6368; }
+    .msg { margin-top: 12px; padding: 10px; border-radius: var(--radius); font-size: 0.9rem; }
+    .msg.ok { background: #e8f5e9; color: #1b5e20; }
+    .msg.err { background: #ffebee; color: var(--err); }
+    .token-row { margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>系统设置</h1>
+    <p class="muted">配置保存在 MySQL 表 <code>app_runtime_settings</code>（与 <code>MYSQL_DATABASE</code> 同库，连接参数仅读 .env 中的 <code>MYSQL_*</code>），优先级高于 .env 中的业务项（未入库项仍读环境变量）。需同时配置 <code>MYSQL_HOST</code> 与 <code>AIPRINTWORD_ADMIN_TOKEN</code> 后方可保存。若通过局域网 IP 访问，口令必须在<strong>运行 Flask 的那台电脑</strong>的 <code>.env</code> 或 <code>data/admin_token.txt</code> 中配置，仅在你自己电脑的 .env 里改是无效的。</p>
+    <p class="muted"><a href="/">← 返回批量打印</a></p>
+
+    <div class="token-row">
+      <label>管理口令（X-Admin-Token）</label>
+      <input type="password" id="adminToken" placeholder="须与服务器 .env 中 AIPRINTWORD_ADMIN_TOKEN 一致" autocomplete="off" style="max-width:360px;">
+      <p class="hint">须与运行服务那台机器上 .env 里的口令<strong>逐字相同</strong>后再点「加载」。仅保存在浏览器 localStorage；请求时会放入请求头，不会出现在 URL。</p>
+    </div>
+
+    <div class="toolbar">
+      <button type="button" id="btnLoad">加载当前配置</button>
+      <button type="button" id="btnSave">保存到数据库</button>
+      <button type="button" class="secondary" id="btnClearToken">清除本地口令</button>
+    </div>
+    <div id="msg"></div>
+    <div id="formRoot"></div>
+  </div>
+
+  <script>
+    const LS = 'aiprintword_admin_token';
+    const tokenEl = document.getElementById('adminToken');
+    const msgEl = document.getElementById('msg');
+    tokenEl.value = localStorage.getItem(LS) || '';
+
+    document.getElementById('btnClearToken').addEventListener('click', () => {
+      localStorage.removeItem(LS);
+      tokenEl.value = '';
+    });
+
+    function headers() {
+      const t = (tokenEl.value || '').trim();
+      if (t) localStorage.setItem(LS, t);
+      return { 'X-Admin-Token': t, 'Content-Type': 'application/json' };
+    }
+
+    function showMsg(text, ok) {
+      msgEl.innerHTML = '';
+      if (!text) return;
+      const d = document.createElement('div');
+      d.className = 'msg ' + (ok ? 'ok' : 'err');
+      d.textContent = text;
+      msgEl.appendChild(d);
+    }
+
+    let items = [];
+
+    function renderForm() {
+      const root = document.getElementById('formRoot');
+      root.innerHTML = '';
+      const groups = {};
+      for (const it of items) {
+        if (!groups[it.group]) groups[it.group] = [];
+        groups[it.group].push(it);
+      }
+      const order = ['word', 'office', 'app', 'mysql', 'sign'];
+      for (const g of order) {
+        if (!groups[g]) continue;
+        const card = document.createElement('div');
+        card.className = 'card';
+        const h = document.createElement('h2');
+        h.textContent = g;
+        card.appendChild(h);
+        for (const it of groups[g]) {
+          const wrap = document.createElement('div');
+          wrap.className = 'row';
+          const lab = document.createElement('label');
+          lab.textContent = it.label + ' (' + it.key + ')';
+          wrap.appendChild(lab);
+          if (it.description) {
+            const hi = document.createElement('div');
+            hi.className = 'hint';
+            hi.textContent = it.description;
+            wrap.appendChild(hi);
+          }
+          const src = document.createElement('div');
+          src.className = 'src';
+          src.textContent = '来源: ' + it.source;
+          wrap.appendChild(src);
+
+          let input;
+          const fid = 'cfg_' + it.key;
+          if (it.value_type === 'bool') {
+            input = document.createElement('select');
+            input.id = fid;
+            [['1', '开启'], ['0', '关闭']].forEach(([v, t]) => {
+              const o = document.createElement('option');
+              o.value = v;
+              o.textContent = t;
+              input.appendChild(o);
+            });
+            const r = String(it.raw || '').toLowerCase();
+            const on = r !== '0' && r !== 'false' && r !== 'no' && r !== 'off' && r !== '';
+            input.value = on ? '1' : '0';
+          } else if (it.is_secret) {
+            input = document.createElement('input');
+            input.type = 'password';
+            input.id = fid;
+            input.placeholder = it.has_secret_value ? '已设置，留空表示不修改' : '可选';
+            input.value = '';
+            input.autocomplete = 'new-password';
+          } else {
+            input = document.createElement('input');
+            input.type = it.value_type === 'int' || it.value_type === 'float' ? 'number' : 'text';
+            input.id = fid;
+            input.value = it.raw === '********' ? '' : it.raw;
+          }
+          wrap.appendChild(input);
+          card.appendChild(wrap);
+        }
+        root.appendChild(card);
+      }
+    }
+
+    document.getElementById('btnLoad').addEventListener('click', async () => {
+      showMsg('', true);
+      try {
+        const r = await fetch('/api/admin/settings', { headers: headers() });
+        let j;
+        try {
+          j = await r.json();
+        } catch (e) {
+          showMsg('HTTP ' + r.status + '：响应不是 JSON，可能未连到本应用或中间层替换了错误页。', false);
+          return;
+        }
+        if (!j.ok) {
+          let t = j.error || r.statusText;
+          if (j.diag) {
+            t += ' 【诊断】auth_api_build=' + (j.diag.auth_api_build || '?')
+              + ' app_root=' + (j.diag.app_root || '')
+              + ' dotenv_path=' + (j.diag.dotenv_path || '')
+              + ' dotenv_exists=' + (j.diag.dotenv_exists ? 'true' : 'false')
+              + ' cwd=' + (j.diag.cwd || '');
+          }
+          showMsg(t, false);
+          return;
+        }
+        items = j.items || [];
+        renderForm();
+        showMsg('已加载 ' + items.length + ' 项', true);
+      } catch (e) {
+        showMsg(String(e), false);
+      }
+    });
+
+    document.getElementById('btnSave').addEventListener('click', async () => {
+      showMsg('', true);
+      const body = {};
+      for (const it of items) {
+        const el = document.getElementById('cfg_' + it.key);
+        if (!el) continue;
+        let v = el.value;
+        if (it.is_secret && (!v || !String(v).trim())) continue;
+        if (it.value_type === 'bool') v = el.value;
+        body[it.key] = String(v);
+      }
+      try {
+        const r = await fetch('/api/admin/settings', {
+          method: 'PUT',
+          headers: headers(),
+          body: JSON.stringify(body),
+        });
+        let j;
+        try {
+          j = await r.json();
+        } catch (e) {
+          showMsg('HTTP ' + r.status + '：响应不是 JSON。', false);
+          return;
+        }
+        if (!j.ok) {
+          let t = j.error || r.statusText;
+          if (j.diag) {
+            t += ' 【诊断】dotenv_path=' + (j.diag.dotenv_path || '') + ' exists=' + (j.diag.dotenv_exists ? 'true' : 'false');
+          }
+          showMsg(t, false);
+          return;
+        }
+        showMsg('已保存：' + (j.updated || []).join(', '), true);
+        document.getElementById('btnLoad').click();
+      } catch (e) {
+        showMsg(String(e), false);
+      }
+    });
+  </script>
+</body>
+</html>

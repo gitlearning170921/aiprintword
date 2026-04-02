@@ -12,12 +12,16 @@
   MYSQL_DATABASE 库名，默认 aiprintword_sign（不存在则自动创建）
 
 表 sign_signed_output：每次「生成已签名文档」成功时由 app 写入（需配置 MYSQL_HOST），供多机下载。
+表 sign_signer / sign_signer_stroke：签署人及可复用的签名、日期笔迹（PNG）。
+表 sign_file_role_signer：每个待签文件各签字角色对应的签署人（批量签与映射持久化）。
+表 app_batch_history：批量打印任务历史（列表与详情 JSON）；暂存目录仍在服务端 data/batch_history/<id>/stash。
 """
 from __future__ import annotations
 
 import os
 import re
 import threading
+import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
@@ -31,26 +35,51 @@ _mysql_inited = False
 
 
 def mysql_sign_enabled() -> bool:
-    return bool(os.environ.get("MYSQL_HOST", "").strip())
+    try:
+        from runtime_settings.resolve import get_setting
+
+        return bool(str(get_setting("MYSQL_HOST") or "").strip())
+    except Exception:
+        return bool(os.environ.get("MYSQL_HOST", "").strip())
 
 
 def _config() -> Dict[str, Any]:
-    port = os.environ.get("MYSQL_PORT", "3306").strip() or "3306"
     try:
-        port_i = int(port)
-    except ValueError:
-        port_i = 3306
-    db = (os.environ.get("MYSQL_DATABASE") or "aiprintword_sign").strip()
-    if not _DB_NAME_RE.match(db):
-        db = "aiprintword_sign"
-    return {
-        "host": os.environ.get("MYSQL_HOST", "").strip(),
-        "port": port_i,
-        "user": (os.environ.get("MYSQL_USER") or "root").strip(),
-        "password": os.environ.get("MYSQL_PASSWORD") or "",
-        "charset": (os.environ.get("MYSQL_CHARSET") or "utf8mb4").strip(),
-        "database": db,
-    }
+        from runtime_settings.resolve import get_setting
+
+        port = str(get_setting("MYSQL_PORT") or "3306").strip() or "3306"
+        try:
+            port_i = int(port)
+        except ValueError:
+            port_i = 3306
+        db = str(get_setting("MYSQL_DATABASE") or "aiprintword_sign").strip()
+        if not _DB_NAME_RE.match(db):
+            db = "aiprintword_sign"
+        return {
+            "host": str(get_setting("MYSQL_HOST") or "").strip(),
+            "port": port_i,
+            "user": str(get_setting("MYSQL_USER") or "root").strip(),
+            "password": str(get_setting("MYSQL_PASSWORD") or ""),
+            "charset": str(get_setting("MYSQL_CHARSET") or "utf8mb4").strip(),
+            "database": db,
+        }
+    except Exception:
+        port = os.environ.get("MYSQL_PORT", "3306").strip() or "3306"
+        try:
+            port_i = int(port)
+        except ValueError:
+            port_i = 3306
+        db = (os.environ.get("MYSQL_DATABASE") or "aiprintword_sign").strip()
+        if not _DB_NAME_RE.match(db):
+            db = "aiprintword_sign"
+        return {
+            "host": os.environ.get("MYSQL_HOST", "").strip(),
+            "port": port_i,
+            "user": (os.environ.get("MYSQL_USER") or "root").strip(),
+            "password": os.environ.get("MYSQL_PASSWORD") or "",
+            "charset": (os.environ.get("MYSQL_CHARSET") or "utf8mb4").strip(),
+            "database": db,
+        }
 
 
 def _connect_server():
@@ -117,6 +146,53 @@ def init_schema() -> None:
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     KEY idx_signed_created (created_at),
                     KEY idx_signed_source (source_file_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_batch_history (
+                    id CHAR(32) NOT NULL PRIMARY KEY,
+                    created_at VARCHAR(32) NOT NULL,
+                    record_json LONGTEXT NOT NULL,
+                    KEY idx_batch_hist_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sign_signer (
+                    id VARCHAR(32) NOT NULL PRIMARY KEY,
+                    display_name VARCHAR(128) NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_signer_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sign_signer_stroke (
+                    signer_id VARCHAR(32) NOT NULL PRIMARY KEY,
+                    sig_png LONGBLOB NULL,
+                    date_png LONGBLOB NULL,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    CONSTRAINT fk_stroke_signer FOREIGN KEY (signer_id)
+                        REFERENCES sign_signer (id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sign_file_role_signer (
+                    file_id VARCHAR(32) NOT NULL,
+                    role_id VARCHAR(64) NOT NULL,
+                    signer_id VARCHAR(32) NOT NULL,
+                    PRIMARY KEY (file_id, role_id),
+                    KEY idx_frs_file (file_id),
+                    CONSTRAINT fk_frs_file FOREIGN KEY (file_id)
+                        REFERENCES sign_uploaded_file (id) ON DELETE CASCADE,
+                    CONSTRAINT fk_frs_signer FOREIGN KEY (signer_id)
+                        REFERENCES sign_signer (id) ON DELETE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
@@ -322,3 +398,156 @@ def delete_signed_output(signed_id: str) -> int:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sign_signed_output WHERE id=%s", (signed_id,))
             return cur.rowcount
+
+
+def _ensure_signer_tables(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sign_signer (
+                id VARCHAR(32) NOT NULL PRIMARY KEY,
+                display_name VARCHAR(128) NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_signer_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sign_signer_stroke (
+                signer_id VARCHAR(32) NOT NULL PRIMARY KEY,
+                sig_png LONGBLOB NULL,
+                date_png LONGBLOB NULL,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sign_file_role_signer (
+                file_id VARCHAR(32) NOT NULL,
+                role_id VARCHAR(64) NOT NULL,
+                signer_id VARCHAR(32) NOT NULL,
+                PRIMARY KEY (file_id, role_id),
+                KEY idx_frs_file (file_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+
+
+def list_signers() -> List[dict]:
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.id, s.display_name AS name, s.created_at,
+                    st.sig_png IS NOT NULL AND LENGTH(st.sig_png) > 0 AS has_sig,
+                    st.date_png IS NOT NULL AND LENGTH(st.date_png) > 0 AS has_date
+                FROM sign_signer s
+                LEFT JOIN sign_signer_stroke st ON s.id = st.signer_id
+                ORDER BY s.created_at DESC
+                """
+            )
+            rows = cur.fetchall()
+    out: List[dict] = []
+    for r in rows:
+        ts = r.get("created_at")
+        out.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "has_sig": bool(r.get("has_sig")),
+                "has_date": bool(r.get("has_date")),
+                "created_at": ts.isoformat(sep=" ") if ts is not None else None,
+            }
+        )
+    return out
+
+
+def insert_signer(display_name: str) -> str:
+    ensure_sign_mysql()
+    sid = uuid.uuid4().hex
+    nm = (display_name or "").strip()[:128] or "未命名"
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sign_signer (id, display_name) VALUES (%s, %s)",
+                (sid, nm),
+            )
+    return sid
+
+
+def delete_signer(signer_id: str) -> int:
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sign_signer WHERE id=%s", (signer_id,))
+            return cur.rowcount
+
+
+def get_signer_strokes_row(signer_id: str) -> Optional[dict]:
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT signer_id, sig_png, date_png FROM sign_signer_stroke WHERE signer_id=%s",
+                (signer_id,),
+            )
+            return cur.fetchone()
+
+
+def upsert_signer_strokes(signer_id: str, sig_png: Optional[bytes], date_png: Optional[bytes]) -> None:
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM sign_signer WHERE id=%s", (signer_id,))
+            if not cur.fetchone():
+                raise ValueError("签署人不存在")
+            cur.execute(
+                "SELECT sig_png, date_png FROM sign_signer_stroke WHERE signer_id=%s",
+                (signer_id,),
+            )
+            old = cur.fetchone()
+        sig_b = sig_png if sig_png is not None else (old.get("sig_png") if old else None)
+        date_b = date_png if date_png is not None else (old.get("date_png") if old else None)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sign_signer_stroke (signer_id, sig_png, date_png) VALUES (%s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE sig_png=VALUES(sig_png), date_png=VALUES(date_png)",
+                (signer_id, sig_b, date_b),
+            )
+
+
+def get_file_role_signer_map(file_id: str) -> Dict[str, str]:
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT role_id, signer_id FROM sign_file_role_signer WHERE file_id=%s",
+                (file_id,),
+            )
+            rows = cur.fetchall()
+    return {r["role_id"]: r["signer_id"] for r in rows}
+
+
+def set_file_role_signer_map(file_id: str, mapping: Dict[str, str]) -> None:
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sign_file_role_signer WHERE file_id=%s", (file_id,))
+            for role_id, signer_id in mapping.items():
+                if not role_id or not signer_id:
+                    continue
+                cur.execute(
+                    "INSERT INTO sign_file_role_signer (file_id, role_id, signer_id) "
+                    "VALUES (%s, %s, %s)",
+                    (file_id, str(role_id)[:64], signer_id),
+                )

@@ -1,15 +1,35 @@
 # -*- coding: utf-8 -*-
 """
 选择文档处理后端：WPS 或 Microsoft Office。
-默认使用 WPS（避免 Office RPC 不可用）；设置环境变量 USE_OFFICE=1 可改回 Office。
+默认使用 WPS；USE_OFFICE=1（或页面配置）可改回 Office。
+运行时以 get_word_progid() / use_wps_runtime() 为准，便于读取库内配置。
 """
 import os
 
-# True = 使用 WPS 文字/表格（KWPS.Application, KET.Application）
-# False = 使用 Microsoft Word/Excel
-USE_WPS = os.environ.get("USE_OFFICE", "").strip().lower() not in ("1", "true", "yes")
 
-# WPS 文字 / Microsoft Word 的 COM ProgID
-WORD_PROGID = "KWPS.Application" if USE_WPS else "Word.Application"
-# WPS 表格 / Microsoft Excel 的 COM ProgID
-EXCEL_PROGID = "KET.Application" if USE_WPS else "Excel.Application"
+def use_wps_runtime() -> bool:
+    try:
+        from runtime_settings.resolve import get_setting
+
+        v = get_setting("USE_OFFICE")
+        return str(v).strip().lower() not in ("1", "true", "yes", "on")
+    except Exception:
+        return os.environ.get("USE_OFFICE", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+
+def get_word_progid() -> str:
+    return "KWPS.Application" if use_wps_runtime() else "Word.Application"
+
+
+def get_excel_progid() -> str:
+    return "KET.Application" if use_wps_runtime() else "Excel.Application"
+
+
+USE_WPS = use_wps_runtime()
+WORD_PROGID = get_word_progid()
+EXCEL_PROGID = get_excel_progid()

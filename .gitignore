@@ -28,3 +28,6 @@ aiprintword_*/
 # 在线签名页会话暂存（不上传仓库）
 data/sign_inbox/
 data/batch_exports/
+data/batch_history/
+# 管理页口令（可选，与 .env 二选一）
+data/admin_token.txt

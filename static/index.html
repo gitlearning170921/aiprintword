@@ -33,9 +33,14 @@
       line-height: 1.5;
     }
     .container {
-      max-width: 720px;
+      max-width: 1280px;
       margin: 0 auto;
     }
+    .app-layout {
+      display: block;
+      max-width: 100%;
+    }
+    .main-column { min-width: 0; }
     h1 {
       font-size: 1.75rem;
       font-weight: 700;
@@ -92,6 +97,8 @@
       color: var(--text);
       font-size: 0.95rem;
     }
+    input.input-wide, select.input-wide { max-width: 100%; width: 100%; }
+    .saved-to { word-break: break-all; font-size: 0.85rem; color: var(--text-muted); }
     select { cursor: pointer; }
     .row {
       display: flex;
@@ -141,6 +148,163 @@
     .btn-secondary:hover {
       background: var(--border);
     }
+    .btn-ghost {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid rgba(26, 115, 232, 0.45);
+      padding: 8px 14px;
+      font-size: 0.875rem;
+    }
+    .btn-ghost:hover {
+      background: rgba(26, 115, 232, 0.08);
+    }
+    .exec-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+    @media (max-width: 960px) {
+      .exec-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .exec-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      min-height: 100%;
+    }
+    .exec-card .btn {
+      width: 100%;
+      justify-content: center;
+      margin-top: auto;
+    }
+    .exec-card .hint-inline {
+      margin-top: 10px;
+      flex: 1;
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+    .exec-card h3 {
+      margin: 0 0 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .batch-table-wrap {
+      margin-top: 12px;
+      overflow: auto;
+      max-height: min(78vh, 800px);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .batch-master-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+    .batch-master-table thead th {
+      text-align: left;
+      padding: 10px 8px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      font-weight: 600;
+    }
+    .batch-master-table tbody td {
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .batch-detail-row td {
+      padding: 0 !important;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface2);
+    }
+    .batch-expand-inner { padding: 12px 14px 16px; }
+    .batch-detail-table {
+      width: 100%;
+      font-size: 0.84rem;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+    .batch-detail-table th,
+    .batch-detail-table td {
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      text-align: left;
+    }
+    .batch-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .badge-local {
+      display: inline-block;
+      font-size: 0.72rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(26, 115, 232, 0.12);
+      color: var(--accent);
+      font-weight: 600;
+      margin-right: 6px;
+    }
+    .history-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .history-badge.ok { background: rgba(46, 125, 50, 0.15); color: var(--success); }
+    .history-badge.fail { background: rgba(198, 40, 40, 0.12); color: var(--error); }
+    .history-badge.partial { background: rgba(102, 102, 102, 0.12); color: var(--text-muted); }
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .modal-backdrop.visible { display: flex; }
+    .modal-box {
+      background: var(--surface);
+      border-radius: 10px;
+      max-width: 720px;
+      width: 100%;
+      max-height: 85vh;
+      overflow: auto;
+      padding: 20px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+    }
+    .modal-box h3 { margin: 0 0 12px; }
+    .modal-close {
+      float: right;
+      border: none;
+      background: transparent;
+      font-size: 1.25rem;
+      cursor: pointer;
+      color: var(--text-muted);
+      line-height: 1;
+    }
+    .detail-pre {
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      background: #f8f9fb;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      max-height: 400px;
+      overflow: auto;
+    }
     .result-summary {
       padding: 12px 16px;
       border-radius: 8px;
@@ -169,6 +333,60 @@
     .status-ok { color: var(--success); }
     .status-fail { color: var(--error); }
     .filename { word-break: break-all; color: var(--text); }
+    .mod-mode { max-width: 16em; word-break: break-word; color: var(--text-muted); font-size: 0.92em; }
+    .pending-file-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .pending-file-toolbar .hint { margin-top: 0; flex: 1; min-width: 140px; }
+    .pending-file-list {
+      list-style: none;
+      margin: 10px 0 0;
+      padding: 0;
+      max-height: 280px;
+      overflow: auto;
+    }
+    .pending-file-list li {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      font-size: 0.88rem;
+      background: var(--surface2);
+    }
+    .pending-file-list .pending-name {
+      flex: 1;
+      min-width: 0;
+      word-break: break-all;
+      color: var(--text);
+    }
+    .pending-file-list .pending-badge {
+      flex-shrink: 0;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    .pending-file-list .btn-remove-pending {
+      flex-shrink: 0;
+      padding: 4px 10px;
+      font-size: 0.8rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .pending-file-list .btn-remove-pending:hover {
+      border-color: var(--error);
+      color: var(--error);
+    }
     .message { color: var(--text-muted); font-size: 0.85rem; }
     .manual-list {
       margin-top: 14px;
@@ -183,8 +401,6 @@
     .manual-list h3 { margin: 0 0 8px; font-size: 0.95rem; }
     .manual-list ul { margin: 0; padding-left: 18px; }
     .manual-list li { margin: 4px 0; word-break: break-all; }
-    #resultArea { display: none; }
-    #resultArea.visible { display: block; }
     .spinner {
       width: 20px;
       height: 20px;
@@ -232,18 +448,29 @@
   <div class="container">
     <h1>批量打印</h1>
     <p class="subtitle">上传 Word、Excel、PDF，按所选方式仅保存或打印</p>
-    <p class="subtitle" style="margin-top:-12px;"><a href="/sign" style="color:var(--accent);text-decoration:none;font-weight:600;">在线签名（Word / Excel）</a></p>
+    <p class="subtitle" style="margin-top:-12px;">
+      <a href="/sign" style="color:var(--accent);text-decoration:none;font-weight:600;">在线签名（Word / Excel）</a>
+      <span style="color:var(--text-muted);margin:0 8px;">·</span>
+      <a href="/settings" style="color:var(--accent);text-decoration:none;font-weight:600;">系统设置</a>
+    </p>
+
+    <div class="app-layout">
+    <div class="main-column">
 
     <div class="card">
       <h2>选择文件</h2>
       <div class="field">
-        <label for="files">支持 .doc / .docx / .xls / .xlsx / .pdf（可多选）</label>
-        <input type="file" id="files" name="files" multiple accept=".doc,.docx,.docm,.xls,.xlsx,.xlsm,.pdf">
+        <label for="files">支持文档与 .zip / .7z / .rar（可多选；压缩包在服务端解压后加入批处理）</label>
+        <input type="file" id="files" name="files" multiple accept=".doc,.docx,.docm,.xls,.xlsx,.xlsm,.pdf,.zip,.7z,.rar">
         <div class="field" style="margin-top:10px;margin-bottom:0;">
           <input type="file" id="dirInput" webkitdirectory directory style="display:none">
           <label for="dirInput" class="btn btn-secondary" style="cursor:pointer;display:inline-flex;margin:0;">选择文件夹（含子文件夹）</label>
         </div>
-        <p class="hint" id="fileHint">未选择文件</p>
+        <div class="pending-file-toolbar">
+          <p class="hint" id="fileHint">未选择文件</p>
+          <button type="button" class="btn btn-secondary" id="btnClearPendingFiles" style="display:none;flex-shrink:0;">清空全部</button>
+        </div>
+        <ul class="pending-file-list" id="pendingFileList" aria-label="已选文件列表"></ul>
       </div>
     </div>
 
@@ -259,15 +486,67 @@
         </select>
       </div>
 
-      <div class="action-block">
-        <button type="button" class="btn btn-secondary" id="btnFormalSave" disabled>① 仅正式检查并修复，保存 Word/Excel 为本地文件并下载 ZIP（不打印）</button>
-        <p class="hint-inline">与模式 ② 相同的处理链；本模式强制完整清理（删删除线文本、去标黄与高亮、草稿水印图形、批注等），不启用 Word 总页数保护。删除线、水印等每一处修改会写入 ZIP 根目录「修改明细.txt」（UTF-8），页面仅显示摘要。PDF 随包原样附带。</p>
+      <div class="standard-options" style="margin-top:10px;">
+        <p class="hint" style="margin:0 0 6px;">全局高级设置（模式 ①/② 生效）</p>
+        <div class="row">
+          <div class="field">
+            <label for="fileTimeoutMin">单文件总超时（分钟）</label>
+            <input type="number" id="fileTimeoutMin" value="45" min="0" max="1440" step="1">
+            <p class="hint" style="margin:4px 0 0;font-size:0.85rem;">填 <strong>0</strong> 表示<strong>不启用</strong>整文件看门狗。非 0 时到点会 <code>taskkill</code> 当前 Word/Excel 进程（已增强 WPS 下进程识别）；若仍无法跳过，请看服务端日志是否出现「no PID」。</p>
+          </div>
+          <div class="field">
+            <label for="wordStepTimeoutMin">单步超时（分钟，默认 60）</label>
+            <input type="number" id="wordStepTimeoutMin" value="60" min="0" max="1440" step="1">
+            <p class="hint" style="margin:4px 0 0;font-size:0.85rem;">填 <strong>0</strong> 表示<strong>关闭</strong> Word 内各分段循环的单步计时（长时间卡在某一次 COM 调用里时仍不会在中途触发）。与「单文件总超时」不同。</p>
+          </div>
+        </div>
+        <div class="checkbox-wrap" style="margin-top:6px;">
+          <input type="checkbox" id="wordSkipOnTimeout" checked>
+          <label for="wordSkipOnTimeout" style="margin:0">超时则跳过该文件并标记“需人工”</label>
+        </div>
+        <div class="field" style="margin-top:12px;">
+          <label for="sseHeartbeatSec">进度 SSE 心跳间隔（秒）</label>
+          <input type="number" id="sseHeartbeatSec" value="120" min="10" max="600" step="1" style="max-width:120px;">
+          <p class="hint" style="margin:4px 0 0;font-size:0.85rem;">长时间处理时，若超过此时间没有新的进度推送，浏览器会收到一次心跳（默认 120）。过短会增加日志与网络流量；过长不利于判断是否断连。范围 10–600。</p>
+        </div>
       </div>
 
-      <div class="action-block">
-        <button type="button" class="btn btn-primary" id="btnStandardPrint" disabled>② 正式检查 + 封面签字 + 接受修订后打印</button>
-        <p class="hint-inline">含标黄/修订/批注/非黑字体等检查；未通过时先自动修复再打印（与同目录资源一并上传时更稳妥）。</p>
-        <div class="standard-options">
+      <div class="field" style="margin-top:14px;">
+        <label for="incrementalOutputDir">即时保存目录（可选）</label>
+        <input type="text" id="incrementalOutputDir" class="input-wide" placeholder="例如 D:\exports（运行本服务的电脑上的绝对路径）" autocomplete="off">
+        <div class="field" style="margin-top:10px;">
+          <label for="incrementalExistsAction">即时保存目录里已有同名文件时</label>
+          <select id="incrementalExistsAction" class="input-wide" style="max-width:100%;">
+            <option value="overwrite" selected>覆盖（先删后写，仍打开 Word/Excel 做完整处理）</option>
+            <option value="skip">跳过本文件（不打开处理，直接记为已跳过）</option>
+          </select>
+        </div>
+        <p class="hint" style="margin:6px 0 0;">每成功处理完一个文件会立即复制到此目录（保留上传时的相对路径）。选「跳过」时，在<strong>本批开始处理任何文档之前</strong>会一次性扫描即时保存目录下对应目标路径；已存在则该文件整份跳过、不打开 Word/Excel。留空即时保存目录时本项无效。预检模式不写入即时目录。</p>
+      </div>
+
+      <div class="exec-grid">
+        <div class="exec-card">
+          <h3>① 仅保存 + ZIP</h3>
+          <p class="hint" style="margin:0;font-size:0.82rem;">不送打印机；规范化后打包下载（含「修改明细」）。</p>
+          <button type="button" class="btn btn-primary" id="btnFormalSave" disabled>运行模式 ①</button>
+          <p class="hint-inline">与模式 ② 相同的规范化与保存效果；每个 Word 一次打开内完成修复与保存。本模式强制完整清理（删除线、标黄、水印、批注等），不启用总页数保护。超时跳过项在 ZIP 内为「原名_【超时原文】」副本。PDF 原样入包。</p>
+        </div>
+        <div class="exec-card">
+          <h3>② 检查 + 打印</h3>
+          <p class="hint" style="margin:0;font-size:0.82rem;">正式检查、可选预检，接受修订后送打印队列。</p>
+          <button type="button" class="btn btn-primary" id="btnStandardPrint" disabled>运行模式 ②</button>
+          <p class="hint-inline">含标黄/修订/批注/非黑字体等检查；未通过时先自动修复再打印（与同目录资源一并上传更稳妥）。下方「标准选项」中的勾选项对 ①② 均生效。</p>
+        </div>
+        <div class="exec-card">
+          <h3>③ 原样打印</h3>
+          <p class="hint" style="margin:0;font-size:0.82rem;">不做检查与修订，直接打印。</p>
+          <button type="button" class="btn btn-primary" id="btnRawPrint" disabled>运行模式 ③</button>
+          <p class="hint-inline">不检查、不修订、不规范化；上传文件原样送打印队列。</p>
+        </div>
+      </div>
+
+      <div class="standard-options" style="margin-top:18px;border-left-color: var(--accent);">
+          <p class="hint" style="margin:0 0 8px;font-weight:600;">模式 ② 专用 · 与①共享的 Word 选项</p>
           <div class="checkbox-wrap">
             <input type="checkbox" id="acceptRevisions" checked>
             <label for="acceptRevisions" style="margin:0">自动接受所有修订后再打印</label>
@@ -289,12 +568,6 @@
             <input type="checkbox" id="wordImageRiskGuard" checked>
             <label for="wordImageRiskGuard" style="margin:0">启用图片风险检测</label>
           </div>
-        </div>
-      </div>
-
-      <div class="action-block">
-        <button type="button" class="btn btn-secondary" id="btnRawPrint" disabled>③ 不做处理，直接打印</button>
-        <p class="hint-inline">不检查、不修订、不规范化；上传文件原样送打印队列。</p>
       </div>
     </div>
 
@@ -317,6 +590,13 @@
 
     <div class="card" id="progressArea" style="display:none;">
       <h2>处理进度</h2>
+      <div class="row" id="jobControls" style="margin:10px 0 2px;display:none;gap:10px;flex-wrap:wrap;">
+        <button type="button" class="btn btn-secondary" id="btnPause">暂停</button>
+        <button type="button" class="btn btn-secondary" id="btnResume" style="display:none;">继续</button>
+        <button type="button" class="btn btn-secondary" id="btnSkipCurrent">跳过当前文件</button>
+        <button type="button" class="btn btn-secondary" id="btnCancel">取消并下载已处理文件</button>
+      </div>
+      <p class="hint" id="skipCurrentHint" style="display:none;margin:0 0 8px;font-size:0.85rem;">「跳过当前文件」会尝试结束正在处理的 Word/Excel 进程并进入下一文件；PDF 单文件通常无法从网页端打断，请等该文件结束或使用取消整批。</p>
       <div class="progress-bar-wrap">
         <div class="progress-bar" id="progressBar" style="width:0%"></div>
       </div>
@@ -325,25 +605,52 @@
       <div class="run-log" id="runLog"></div>
     </div>
 
-    <div class="card" id="resultArea">
-      <h2>执行结果</h2>
-      <div id="resultSummary" class="result-summary"></div>
-      <div id="downloadWrap" style="display:none;">
-        <a id="downloadLink" class="btn btn-primary" href="#" download>下载处理后的文件（ZIP）</a>
+    <div class="card" id="batchRecordsCard" style="display:block;">
+      <h2>批处理记录</h2>
+      <p class="hint" style="margin-top:0;">每次任务为一行；点击「展开」查看单文件明细，可按「全量 / 轻量 / 目录已有跳过 / 跳过·需人工」筛选。含 ZIP 的可直接下载；服务端保留暂存时可「重试」。修改明细见 ZIP 根目录「修改明细.txt」。</p>
+      <div id="batchErrorBanner" class="result-summary fail" style="display:none;margin-bottom:12px;"></div>
+      <div id="batchSummaryBanner" class="result-summary" style="display:none;margin-bottom:12px;"></div>
+      <p id="batchTimingLine" class="hint" style="display:none;margin:0 0 10px;color:var(--text-muted);"></p>
+      <div id="downloadWrap" style="display:none;margin-bottom:12px;">
+        <a id="downloadLink" class="btn btn-primary" href="#" download>下载本轮 ZIP</a>
       </div>
-      <table class="result-table" id="resultTable">
-        <thead>
-          <tr>
-            <th>文件名</th>
-            <th>状态</th>
-            <th>说明</th>
-          </tr>
-        </thead>
-        <tbody id="resultBody"></tbody>
-      </table>
-      <div class="manual-list" id="manualListWrap">
-        <h3>需手动打印清单</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px;">
+        <button type="button" class="btn btn-secondary" id="btnRefreshHistory">刷新列表</button>
+      </div>
+      <div class="batch-table-wrap">
+        <table class="batch-master-table" id="batchMasterTable">
+          <thead>
+            <tr>
+              <th style="width:9.5em;">时间</th>
+              <th>摘要</th>
+              <th style="width:7.5em;">运行模式</th>
+              <th style="width:9em;">统计</th>
+              <th style="width:6.5em;">结果</th>
+              <th style="min-width:14rem;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="batchRecordsBody"></tbody>
+        </table>
+      </div>
+      <div id="batchPagerBar" class="hint" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:10px;">
+        <span id="batchPagerInfo"></span>
+        <button type="button" class="btn btn-secondary" id="batchPagerPrev">上一页</button>
+        <button type="button" class="btn btn-secondary" id="batchPagerNext">下一页</button>
+      </div>
+      <div class="manual-list" id="manualListWrap" style="margin-top:14px;">
+        <h3>需人工处理清单</h3>
         <ul id="manualList"></ul>
+      </div>
+    </div>
+
+    </div>
+    </div>
+
+    <div class="modal-backdrop" id="historyDetailModal" aria-hidden="true">
+      <div class="modal-box">
+        <button type="button" class="modal-close" id="historyDetailClose" title="关闭">×</button>
+        <h3>原始 JSON（调试）</h3>
+        <div id="historyDetailBody" class="detail-pre"></div>
       </div>
     </div>
   </div>
@@ -361,14 +668,20 @@
     const wordContentPreserve = document.getElementById('wordContentPreserve');
     const wordPreservePageCount = document.getElementById('wordPreservePageCount');
     const wordImageRiskGuard = document.getElementById('wordImageRiskGuard');
+    const fileTimeoutMin = document.getElementById('fileTimeoutMin');
+    const wordStepTimeoutMin = document.getElementById('wordStepTimeoutMin');
+    const wordSkipOnTimeout = document.getElementById('wordSkipOnTimeout');
     const wordFontProfile = document.getElementById('wordFontProfile');
     const printerSelect = document.getElementById('printer');
     const copiesInput = document.getElementById('copies');
+    const incrementalOutputDir = document.getElementById('incrementalOutputDir');
     const downloadWrap = document.getElementById('downloadWrap');
     const downloadLink = document.getElementById('downloadLink');
-    const resultArea = document.getElementById('resultArea');
-    const resultSummary = document.getElementById('resultSummary');
-    const resultBody = document.getElementById('resultBody');
+    const batchRecordsCard = document.getElementById('batchRecordsCard');
+    const batchErrorBanner = document.getElementById('batchErrorBanner');
+    const batchSummaryBanner = document.getElementById('batchSummaryBanner');
+    const batchTimingLine = document.getElementById('batchTimingLine');
+    const batchRecordsBody = document.getElementById('batchRecordsBody');
     const manualListWrap = document.getElementById('manualListWrap');
     const manualList = document.getElementById('manualList');
     const progressArea = document.getElementById('progressArea');
@@ -376,11 +689,96 @@
     const progressText = document.getElementById('progressText');
     const progressDetail = document.getElementById('progressDetail');
     const runLog = document.getElementById('runLog');
+    const jobControls = document.getElementById('jobControls');
+    const btnPause = document.getElementById('btnPause');
+    const btnResume = document.getElementById('btnResume');
+    const btnSkipCurrent = document.getElementById('btnSkipCurrent');
+    const btnCancel = document.getElementById('btnCancel');
+    const skipCurrentHint = document.getElementById('skipCurrentHint');
+    const incrementalExistsAction = document.getElementById('incrementalExistsAction');
+    const sseHeartbeatSec = document.getElementById('sseHeartbeatSec');
+    const btnRefreshHistory = document.getElementById('btnRefreshHistory');
+    const batchPagerInfo = document.getElementById('batchPagerInfo');
+    const batchPagerPrev = document.getElementById('batchPagerPrev');
+    const batchPagerNext = document.getElementById('batchPagerNext');
+
+    let lastApiHistoryEntries = [];
+    let pendingLocalBatch = null;
+    let lastRunMode = 'standard_print';
+    let batchListPage = 1;
+    const BATCH_HISTORY_PAGE_SIZE = 10;
+    const batchDetailCache = {};
+    const batchExpandedKeys = new Set();
+    const historyDetailModal = document.getElementById('historyDetailModal');
+    const historyDetailBody = document.getElementById('historyDetailBody');
+    const historyDetailClose = document.getElementById('historyDetailClose');
+    const pendingFileList = document.getElementById('pendingFileList');
+    const btnClearPendingFiles = document.getElementById('btnClearPendingFiles');
 
     const ALLOWED_EXT = ['.doc', '.docx', '.docm', '.xls', '.xlsx', '.xlsm', '.pdf'];
+    const ARCHIVE_EXT = ['.zip', '.7z', '.rar'];
+
+    function isArchiveFile(f) {
+      const n = (f && f.name) || '';
+      const i = n.lastIndexOf('.');
+      const ext = i < 0 ? '' : n.slice(i).toLowerCase();
+      return ARCHIVE_EXT.includes(ext);
+    }
+
+    function archiveBadgeLabel(f) {
+      const n = ((f && f.name) || '').toLowerCase();
+      if (n.endsWith('.zip')) return 'ZIP';
+      if (n.endsWith('.7z')) return '7Z';
+      if (n.endsWith('.rar')) return 'RAR';
+      return '压缩包';
+    }
+
+    /** 可提交批处理：单个文档或压缩包 */
+    function isBatchUploadable(f) {
+      return isAllowedDoc(f) || isArchiveFile(f);
+    }
 
     /** 当前待上传文件（目录模式下包含文档依赖资源） */
     let pendingUploadFiles = [];
+    let currentJobId = null;
+    let currentJobState = 'idle';
+
+    async function sendJobAction(action) {
+      if (!currentJobId) return;
+      const form = new FormData();
+      form.append('action', action);
+      try {
+        const r = await fetch('/api/batch-control/' + encodeURIComponent(currentJobId), { method: 'POST', body: form });
+        const data = await r.json().catch(() => ({}));
+        if (!data.ok) throw new Error(data.error || '操作失败');
+        currentJobState = data.state || currentJobState;
+        appendRunLog('任务控制：' + action + ' -> ' + (data.state || 'ok'));
+      } catch (e) {
+        appendRunLog('任务控制失败：' + e.message);
+      }
+    }
+
+    if (btnPause) btnPause.addEventListener('click', async () => {
+      btnPause.disabled = true;
+      await sendJobAction('pause');
+      if (btnResume) btnResume.style.display = '';
+      btnPause.style.display = 'none';
+      btnPause.disabled = false;
+      showProgress(progressBar.style.width.replace('%','') || 0, '已暂停（可继续）', progressDetail.textContent || '');
+    });
+    if (btnSkipCurrent) btnSkipCurrent.addEventListener('click', () => sendJobAction('skip_current'));
+    if (btnResume) btnResume.addEventListener('click', async () => {
+      btnResume.disabled = true;
+      await sendJobAction('resume');
+      btnPause.style.display = '';
+      btnResume.style.display = 'none';
+      btnResume.disabled = false;
+    });
+    if (btnCancel) btnCancel.addEventListener('click', async () => {
+      btnCancel.disabled = true;
+      appendRunLog('已请求取消：将尽快结束并生成已处理文件 ZIP…');
+      await sendJobAction('cancel');
+    });
 
     function fileKey(f) {
       const rel = (f && f.webkitRelativePath) ? String(f.webkitRelativePath) : (f && f.name) || '';
@@ -401,21 +799,64 @@
       return f.name || '';
     }
 
+    function renderPendingFileList() {
+      if (!pendingFileList) return;
+      pendingFileList.innerHTML = '';
+      pendingUploadFiles.forEach((f, idx) => {
+        const li = document.createElement('li');
+        const nameEl = document.createElement('span');
+        nameEl.className = 'pending-name';
+        nameEl.textContent = displayNameForFile(f);
+        const badge = document.createElement('span');
+        badge.className = 'pending-badge';
+        if (isArchiveFile(f)) badge.textContent = archiveBadgeLabel(f);
+        else if (isAllowedDoc(f)) badge.textContent = '文档';
+        else badge.textContent = '资源';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn-remove-pending';
+        btn.textContent = '删除';
+        btn.setAttribute('aria-label', '从列表移除 ' + (f.name || ''));
+        btn.addEventListener('click', () => {
+          pendingUploadFiles.splice(idx, 1);
+          updateFileHint();
+        });
+        li.appendChild(nameEl);
+        li.appendChild(badge);
+        li.appendChild(btn);
+        pendingFileList.appendChild(li);
+      });
+      if (btnClearPendingFiles) {
+        btnClearPendingFiles.style.display = pendingUploadFiles.length ? '' : 'none';
+      }
+    }
+
     function updateFileHint() {
       if (!pendingUploadFiles.length) {
         fileHint.textContent = '未选择文件（可分多次选择并累加，或使用「选择文件夹」上传整目录；其他类型会自动忽略）';
         actionButtons.forEach(b => { b.disabled = true; });
+        renderPendingFileList();
         return;
       }
       const docs = pendingUploadFiles.filter(isAllowedDoc);
-      const names = docs.map(displayNameForFile);
-      const extra = pendingUploadFiles.length - docs.length;
+      const archives = pendingUploadFiles.filter(isArchiveFile);
+      const uploadable = pendingUploadFiles.filter(isBatchUploadable);
+      const names = uploadable.map(displayNameForFile);
+      const extra = pendingUploadFiles.length - uploadable.length;
       fileHint.textContent =
-        '已选文档 ' + docs.length + ' 个' +
-        (extra > 0 ? ('（附带资源 ' + extra + ' 个）') : '') +
+        '已选可处理项 ' + uploadable.length + ' 个（文档 ' + docs.length + '，压缩包 ' + archives.length + '）' +
+        (extra > 0 ? ('；附带资源 ' + extra + ' 个') : '') +
         '：' + names.join('、').slice(0, 80) + (names.join('').length > 80 ? '…' : '');
-      const dis = docs.length === 0;
+      const dis = uploadable.length === 0;
       actionButtons.forEach(b => { b.disabled = dis; });
+      renderPendingFileList();
+    }
+
+    if (btnClearPendingFiles) {
+      btnClearPendingFiles.addEventListener('click', () => {
+        pendingUploadFiles = [];
+        updateFileHint();
+      });
     }
 
     function mergePendingFiles(newFiles) {
@@ -462,9 +903,566 @@
     }
     loadPrinters();
 
-    function setActionLoading(loading) {
-      const noDocs = pendingUploadFiles.filter(isAllowedDoc).length === 0;
-      actionButtons.forEach(b => { b.disabled = !!loading || noDocs; });
+    function setActionLoading(loading, options) {
+      const requireDocs = !options || options.requireDocs !== false;
+      const noDocs = pendingUploadFiles.filter(isBatchUploadable).length === 0;
+      actionButtons.forEach(b => { b.disabled = !!loading || (requireDocs && noDocs); });
+    }
+
+    const RUN_MODE_LABEL = {
+      formal_save: '① 仅保存',
+      standard_print: '② 检查打印',
+      raw_print: '③ 原样打印',
+    };
+
+    function buildBatchOptionsFormData(runMode) {
+      const form = new FormData();
+      if (runMode) form.append('run_mode', runMode);
+      form.append('accept_revisions', acceptRevisions.checked ? 'true' : 'false');
+      form.append('dry_run', dryRun.checked ? 'true' : 'false');
+      form.append('word_content_preserve', wordContentPreserve.checked ? 'true' : 'false');
+      form.append('word_preserve_page_count', wordPreservePageCount.checked ? 'true' : 'false');
+      form.append('word_image_risk_guard', wordImageRiskGuard.checked ? 'true' : 'false');
+      form.append('file_timeout_min', fileTimeoutMin ? String(fileTimeoutMin.value || '0') : '0');
+      form.append('word_step_timeout_min', wordStepTimeoutMin ? String(wordStepTimeoutMin.value || '60') : '60');
+      form.append('word_skip_file_on_timeout', wordSkipOnTimeout && wordSkipOnTimeout.checked ? 'true' : 'false');
+      form.append('doc_font_profile', wordFontProfile ? wordFontProfile.value : 'mixed');
+      form.append('printer_name', printerSelect.value || '');
+      form.append('copies', copiesInput.value || '1');
+      form.append('incremental_output_dir', incrementalOutputDir ? String(incrementalOutputDir.value || '').trim() : '');
+      form.append('incremental_exists_action', incrementalExistsAction ? incrementalExistsAction.value : 'overwrite');
+      form.append('sse_heartbeat_sec', sseHeartbeatSec ? String(sseHeartbeatSec.value || '120') : '120');
+      return form;
+    }
+
+    function parseSSEChunks(text) {
+      const normalized = text.replace(/\r\n/g, '\n');
+      const parts = normalized.split('\n\n');
+      const complete = parts.slice(0, -1);
+      const remainder = parts[parts.length - 1] || '';
+      const events = [];
+      for (const block of complete) {
+        if (!block.trim()) continue;
+        let ev = '';
+        let payload = '';
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event: ')) ev = line.slice(7).trim();
+          if (line.startsWith('data: ')) payload = line.slice(6);
+        }
+        if (ev && payload) {
+          try {
+            events.push({ event: ev, data: JSON.parse(payload) });
+          } catch (_) {}
+        }
+      }
+      return { events, remainder };
+    }
+
+    async function consumeBatchStreamResponse(res, logLabel) {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showResult({ ok: false, error: err.error || res.statusText });
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let gotResult = false;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (value) {
+          buf += decoder.decode(value, { stream: true });
+        }
+        const { events, remainder } = parseSSEChunks(buf);
+        buf = remainder;
+        for (const { event, data } of events) {
+          if (event === 'job') {
+            currentJobId = data.jobId || null;
+            if (jobControls) jobControls.style.display = currentJobId ? 'flex' : 'none';
+            if (skipCurrentHint) skipCurrentHint.style.display = currentJobId ? 'block' : 'none';
+            appendRunLog('任务已创建：jobId=' + (currentJobId || '—'));
+          } else if (event === 'progress') {
+            const total = data.fileTotal || 1;
+            const idx = data.fileIndex || 1;
+            let pct = 0;
+            if (typeof data.percent === 'number' && !isNaN(data.percent)) {
+              pct = Math.min(99, Math.max(0, data.percent));
+            } else {
+              pct = total
+                ? Math.min(99, Math.round(((idx - 1) / total) * 100 + 50 / total))
+                : 0;
+            }
+            let det = '';
+            if (data.processingModeLabel) {
+              det += '[' + data.processingModeLabel + '] ';
+            }
+            det += (data.step || '') + (data.fileName ? ' · ' + data.fileName : '');
+            if (data.modificationPoints && data.modificationPoints.length) {
+              det += ' · ' + data.modificationPoints.slice(0, 4).join('；');
+            }
+            const et = data.eta;
+            if (et && typeof et.eta_remaining_sec === 'number') {
+              det += ' · 预计剩余 ' + formatEtaSeconds(et.eta_remaining_sec);
+              if (typeof et.avg_sec_per_file === 'number') {
+                det += '（近均 ' + formatEtaSeconds(Math.round(et.avg_sec_per_file)) + '/文件）';
+              }
+              if (typeof et.estimated_total_sec === 'number' && et.completed_for_eta >= 1) {
+                det += ' · 整批粗估 ' + formatEtaSeconds(et.estimated_total_sec);
+              }
+            }
+            showProgress(pct, '第 ' + idx + '/' + total + ' 个文件', det);
+            let logLine = '进度 ' + pct + '%：';
+            if (data.processingModeLabel) logLine += '[' + data.processingModeLabel + '] ';
+            logLine += (data.step || '处理中') + (data.fileName ? ' | ' + data.fileName : '');
+            if (et && typeof et.eta_remaining_sec === 'number') {
+              logLine += ' | 预计剩余 ' + formatEtaSeconds(et.eta_remaining_sec);
+            }
+            appendRunLog(logLine);
+          } else if (event === 'heartbeat') {
+            appendRunLog(data.message || '仍在处理中...');
+          } else if (event === 'result') {
+            showResult(data);
+            appendRunLog(logLabel || '任务完成');
+            gotResult = true;
+          }
+        }
+        if (gotResult) break;
+        if (done) break;
+      }
+      if (!gotResult && buf.trim()) {
+        const { events: tailEvents } = parseSSEChunks(buf + '\n\n');
+        for (const { event, data } of tailEvents) {
+          if (event === 'result') {
+            showResult(data);
+            gotResult = true;
+          }
+        }
+      }
+      if (!gotResult && buf.includes('data: ')) {
+        const i = buf.indexOf('data: ');
+        try {
+          const line = buf.slice(i + 6).split(/\r?\n/)[0];
+          const data = JSON.parse(line);
+          if (data.result !== undefined || data.error !== undefined) {
+            showResult(data);
+          }
+        } catch (_) {}
+      }
+    }
+
+    function computeBatchTitleFromResult(r) {
+      const details = r.details || [];
+      const first = details.length ? (details[0].filename || details[0].path || '') : '';
+      const total = r.total || details.length || 0;
+      const more = total > 1 ? ` 等 ${total} 项` : '';
+      return (String(first).trim() + more) || '批处理任务';
+    }
+
+    function maybeClearPendingAfterFetch(entries) {
+      if (!pendingLocalBatch || pendingLocalBatch.ts == null || !entries || !entries.length) return;
+      const r = pendingLocalBatch.fullData && pendingLocalBatch.fullData.result;
+      if (!r) return;
+      const e0 = entries[0];
+      const t0 = Date.parse(e0.created_at || '');
+      if (Number.isNaN(t0)) return;
+      if (
+        Math.abs(t0 - pendingLocalBatch.ts) < 180000
+        && Number(e0.total) === Number(r.total)
+        && Number(e0.ok) === Number(r.ok)
+        && Number(e0.failed) === Number(r.failed)
+      ) {
+        pendingLocalBatch = null;
+        batchExpandedKeys.delete('local');
+      }
+    }
+
+    function fileRowStatusLabel(d, skipPrint, dry) {
+      if (d.manual_skip) return '手动跳过';
+      if (d.timeout_skip || d.processing_mode === 'manual_timeout') return '超时跳过';
+      if (d.skipped_output_exists) return '已跳过(目录已有)';
+      if (d.manual_attention && !d.success) return '需人工';
+      if (!d.success) return '失败';
+      if (skipPrint) return '已保存';
+      return dry ? '通过' : '已提交';
+    }
+
+    /** 明细「处理模式」粗分类：全量 / 轻量 / 目录已有跳过 / 跳过·需人工（供展示与筛选） */
+    function detailCoarseBucket(d) {
+      const pm = String(d.processing_mode || '');
+      const label = String(d.processing_mode_label || '');
+      const msg = String(d.message || '');
+      if (d.skipped_output_exists || pm === 'skipped_output_exists') return 'output_exists';
+      if (d.manual_skip) return 'skip_manual';
+      if (d.timeout_skip || pm === 'manual_timeout') return 'skip_manual';
+      if (pm === 'manual_skipped' || pm.startsWith('manual_required')) return 'skip_manual';
+      if (d.manual_attention && !d.success) return 'skip_manual';
+      if (!d.success && (
+        msg.indexOf('请手动') >= 0 || msg.indexOf('自动打印失败') >= 0
+        || msg.indexOf('手动打印') >= 0 || msg.indexOf('需人工') >= 0
+      )) return 'skip_manual';
+      if (pm.indexOf('word_lite') >= 0 || label.indexOf('轻量') >= 0) return 'lite';
+      return 'full';
+    }
+
+    const DETAIL_COARSE_LABEL = {
+      full: '全量',
+      lite: '轻量',
+      output_exists: '目录已有跳过',
+      skip_manual: '跳过·需人工',
+    };
+
+    function buildDetailCoarseFilter(detailKey) {
+      return '<label class="hint" style="margin-right:8px;">明细筛选（处理模式）</label>'
+        + '<select class="input-wide batch-detail-filter" data-detail-key="' + escapeAttr(detailKey) + '" style="max-width:260px;display:inline-block;">'
+        + '<option value="">全部</option>'
+        + '<option value="full">' + escapeHtml(DETAIL_COARSE_LABEL.full) + '</option>'
+        + '<option value="lite">' + escapeHtml(DETAIL_COARSE_LABEL.lite) + '</option>'
+        + '<option value="output_exists">' + escapeHtml(DETAIL_COARSE_LABEL.output_exists) + '</option>'
+        + '<option value="skip_manual">' + escapeHtml(DETAIL_COARSE_LABEL.skip_manual) + '</option>'
+        + '</select>';
+    }
+
+    function buildDetailTableHtml(detailKey, resultPayload, incrementalLine) {
+      const r = resultPayload || {};
+      const details = r.details || [];
+      const skipPrint = r.skip_print === true;
+      const dry = r.dry_run === true;
+      const filter = buildDetailCoarseFilter(detailKey);
+      const rows = (details || []).map((d) => {
+        let saveCell = '—';
+        if (d.saved_to) saveCell = escapeHtml(d.saved_to);
+        else if (d.save_error) {
+          saveCell = '<span class="status-fail">失败：' + escapeHtml(d.save_error) + '</span>';
+        }
+        const coarse = detailCoarseBucket(d);
+        const coarseAttr = escapeAttr(coarse);
+        const modeCell = escapeHtml(DETAIL_COARSE_LABEL[coarse] || coarse);
+        return '<tr data-coarse="' + coarseAttr + '">'
+          + '<td class="filename">' + escapeHtml(d.filename || d.path || '') + '</td>'
+          + '<td class="' + (d.success ? 'status-ok' : 'status-fail') + '">' + escapeHtml(fileRowStatusLabel(d, skipPrint, dry)) + '</td>'
+          + '<td class="mod-mode">' + modeCell + '</td>'
+          + '<td class="message">' + escapeHtml(d.message || '') + '</td>'
+          + '<td class="saved-to">' + saveCell + '</td>'
+          + '</tr>';
+      }).join('');
+      const inc = incrementalLine ? '<p class="hint" style="margin:0 0 8px;">' + escapeHtml(incrementalLine) + '</p>' : '';
+      return '<div class="batch-expand-inner" data-detail-wrap="' + escapeAttr(detailKey) + '">'
+        + inc
+        + '<div style="margin-bottom:8px;">' + filter + '</div>'
+        + '<table class="result-table batch-detail-table"><thead><tr>'
+        + '<th>文件名</th><th>状态</th><th>处理模式</th><th>说明</th><th>即时保存路径</th>'
+        + '</tr></thead><tbody>' + rows + '</tbody></table>'
+        + '<p class="hint" style="margin:8px 0 0;">逐条修改说明见该次 ZIP 根目录「修改明细.txt」（若该次任务生成了 ZIP）。</p>'
+        + '</div>';
+    }
+
+    function mergeHistoryRows(entries) {
+      const rows = [];
+      if (pendingLocalBatch && pendingLocalBatch.fullData && pendingLocalBatch.fullData.ok) {
+        const r = pendingLocalBatch.fullData.result;
+        rows.push({
+          _local: true,
+          id: '',
+          detailKey: 'local',
+          created_at: new Date(pendingLocalBatch.ts).toLocaleString('zh-CN', { hour12: false }),
+          title: computeBatchTitleFromResult(r),
+          run_mode: pendingLocalBatch.runMode || 'standard_print',
+          total: r.total,
+          ok: r.ok,
+          failed: r.failed,
+          has_zip: !!r.download_token,
+          has_stash: false,
+          download_token: r.download_token,
+          _resultSnapshot: r,
+        });
+      }
+      (entries || []).forEach((e) => {
+        rows.push({
+          _local: false,
+          id: e.id,
+          detailKey: String(e.id),
+          created_at: e.created_at || '—',
+          title: (e.title && String(e.title).trim()) ? e.title : '—',
+          run_mode: e.run_mode,
+          total: e.total,
+          ok: e.ok,
+          failed: e.failed,
+          has_zip: !!e.has_zip,
+          has_stash: !!e.has_stash,
+        });
+      });
+      return rows;
+    }
+
+    function getMergedHistoryRows() {
+      return mergeHistoryRows(lastApiHistoryEntries);
+    }
+
+    function renderCurrentHistoryPage() {
+      const all = getMergedHistoryRows();
+      const n = all.length;
+      const totalPages = Math.max(1, Math.ceil(n / BATCH_HISTORY_PAGE_SIZE) || 1);
+      if (batchListPage > totalPages) batchListPage = totalPages;
+      if (batchListPage < 1) batchListPage = 1;
+      const p = batchListPage;
+      const start = (p - 1) * BATCH_HISTORY_PAGE_SIZE;
+      const slice = n ? all.slice(start, start + BATCH_HISTORY_PAGE_SIZE) : [];
+      if (batchPagerInfo) {
+        batchPagerInfo.textContent = n
+          ? ('共 ' + n + ' 条 · 第 ' + p + ' / ' + totalPages + ' 页')
+          : '共 0 条';
+      }
+      if (batchPagerPrev) batchPagerPrev.disabled = p <= 1 || n === 0;
+      if (batchPagerNext) batchPagerNext.disabled = p >= totalPages || n === 0;
+      renderBatchRecordsTable(slice);
+    }
+
+    function applyDetailFilter(detailKey, selectEl) {
+      const wrap = batchRecordsBody && batchRecordsBody.querySelector('[data-detail-wrap="' + String(detailKey).replace(/"/g, '') + '"]');
+      if (!wrap) return;
+      const v = (selectEl && selectEl.value) || '';
+      wrap.querySelectorAll('tbody tr[data-coarse]').forEach((tr) => {
+        if (!v || tr.getAttribute('data-coarse') === v) tr.style.display = '';
+        else tr.style.display = 'none';
+      });
+    }
+
+    async function fetchHistoryRecordToCache(hid) {
+      if (!hid) return null;
+      if (batchDetailCache[hid] !== undefined) return batchDetailCache[hid];
+      const r = await fetch('/api/batch-history/' + encodeURIComponent(hid));
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.ok || !data.record) {
+        batchDetailCache[hid] = { __failed: true };
+        return null;
+      }
+      batchDetailCache[hid] = data.record;
+      return data.record;
+    }
+
+    function renderBatchRecordsTable(rows) {
+      if (!batchRecordsBody) return;
+      if (!rows.length) {
+        batchRecordsBody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:14px 10px;">暂无记录。完成批处理后自动出现在此表；也可点击「刷新列表」从服务器加载。</td></tr>';
+        return;
+      }
+      const parts = [];
+      rows.forEach((row) => {
+        const expanded = batchExpandedKeys.has(row.detailKey);
+        const badgeClass = row.failed === 0 ? 'ok' : (row.ok === 0 ? 'fail' : 'partial');
+        const badgeText = row.failed === 0 ? '全部成功' : ('失败 ' + row.failed);
+        const modeLabel = RUN_MODE_LABEL[row.run_mode] || row.run_mode || '—';
+        const localBadge = row._local ? '<span class="badge-local">本轮</span>' : '';
+        const stats = '共 ' + (row.total || 0) + ' · 成 ' + (row.ok || 0) + ' · 败 ' + (row.failed || 0);
+        let dl;
+        if (row._local && row.has_zip && row.download_token) {
+          dl = '<a class="btn btn-ghost" href="/api/batch-export/' + encodeURIComponent(row.download_token) + '">下载 ZIP</a>';
+        } else if (!row._local && row.has_zip && row.id) {
+          dl = '<a class="btn btn-ghost" href="/api/batch-history/' + encodeURIComponent(row.id) + '/download">下载 ZIP</a>';
+        } else {
+          dl = '<span class="hint" style="margin:0;">无 ZIP</span>';
+        }
+        const noStashHint = (!row._local && !row.has_stash && row.failed > 0)
+          ? '<span class="hint" style="margin:0 4px;" title="该次任务未在服务端保留暂存目录，无法从历史重试">无暂存</span>'
+          : '';
+        const retryFail = (!row._local && row.has_stash && row.failed > 0)
+          ? '<button type="button" class="btn btn-ghost btn-hist-retry" data-id="' + escapeAttr(row.id) + '" data-mode="' + escapeAttr(row.run_mode || '') + '" data-only="1">重试失败项</button>'
+          : '';
+        const retryAll = (!row._local && row.has_stash)
+          ? '<button type="button" class="btn btn-ghost btn-hist-retry" data-id="' + escapeAttr(row.id) + '" data-mode="' + escapeAttr(row.run_mode || '') + '" data-only="0">整批重试</button>'
+          : '';
+        const jsonBtn = (!row._local && row.id)
+          ? '<button type="button" class="btn btn-ghost btn-hist-json" data-id="' + escapeAttr(row.id) + '">原始 JSON</button>'
+          : '';
+        const expandLabel = expanded ? '收起' : '展开';
+        parts.push(
+          '<tr class="batch-master-row">'
+          + '<td>' + localBadge + escapeHtml(row.created_at || '—') + '</td>'
+          + '<td class="filename">' + escapeHtml(row.title || '—') + '</td>'
+          + '<td>' + escapeHtml(modeLabel) + '</td>'
+          + '<td>' + escapeHtml(stats) + '</td>'
+          + '<td><span class="history-badge ' + badgeClass + '">' + escapeHtml(badgeText) + '</span></td>'
+          + '<td><div class="batch-actions">'
+          + '<button type="button" class="btn btn-secondary btn-batch-toggle" data-detail-key="' + escapeAttr(row.detailKey) + '" data-hid="' + escapeAttr(row.id) + '" data-local="' + (row._local ? '1' : '0') + '">' + expandLabel + '</button>'
+          + dl + retryFail + retryAll + noStashHint + jsonBtn
+          + '</div></td></tr>'
+        );
+        let inner = '';
+        if (expanded) {
+          if (row._local && row._resultSnapshot) {
+            inner = buildDetailTableHtml(row.detailKey, row._resultSnapshot, '');
+          } else if (!row._local && row.id) {
+            const rec = batchDetailCache[row.id];
+            const res = rec && (rec.result || {});
+            if (rec && rec.__failed) {
+              inner = '<div class="batch-expand-inner hint" data-detail-wrap="' + escapeAttr(row.detailKey) + '">无法加载明细（记录可能已删除或已过期）。</div>';
+            } else if (rec) {
+              const inc = (res && res.incremental_output_dir)
+                ? ('即时保存根目录：' + res.incremental_output_dir)
+                : '';
+              inner = buildDetailTableHtml(row.detailKey, res, inc);
+            } else {
+              inner = '<div class="batch-expand-inner hint" data-detail-wrap="' + escapeAttr(row.detailKey) + '">正在加载明细…</div>';
+              fetchHistoryRecordToCache(row.id).then(() => {
+                if (batchExpandedKeys.has(row.detailKey)) renderCurrentHistoryPage();
+              });
+            }
+          }
+        }
+        parts.push(
+          '<tr class="batch-detail-row" style="display:' + (expanded ? 'table-row' : 'none') + '">'
+          + '<td colspan="6">' + inner + '</td></tr>'
+        );
+      });
+      batchRecordsBody.innerHTML = parts.join('');
+    }
+
+    if (batchRecordsBody) {
+      batchRecordsBody.addEventListener('click', (ev) => {
+        const retry = ev.target.closest('.btn-hist-retry');
+        if (retry && batchRecordsBody.contains(retry)) {
+          const hid = retry.getAttribute('data-id');
+          if (hid) {
+            runHistoryRetry(hid, retry.getAttribute('data-mode') || 'standard_print', retry.getAttribute('data-only') === '1');
+          }
+          return;
+        }
+        const jsBtn = ev.target.closest('.btn-hist-json');
+        if (jsBtn && batchRecordsBody.contains(jsBtn)) {
+          const hid = jsBtn.getAttribute('data-id');
+          if (hid) showHistoryDetail(hid);
+          return;
+        }
+        const btn = ev.target.closest('.btn-batch-toggle');
+        if (!btn || !batchRecordsBody.contains(btn)) return;
+        const key = btn.getAttribute('data-detail-key');
+        if (!key) return;
+        if (batchExpandedKeys.has(key)) batchExpandedKeys.delete(key);
+        else batchExpandedKeys.add(key);
+        renderCurrentHistoryPage();
+      });
+      batchRecordsBody.addEventListener('change', (ev) => {
+        const sel = ev.target.closest('.batch-detail-filter');
+        if (!sel || !batchRecordsBody.contains(sel)) return;
+        const key = sel.getAttribute('data-detail-key');
+        if (key) applyDetailFilter(key, sel);
+      });
+    }
+
+    async function loadHistory() {
+      if (!batchRecordsBody) return;
+      try {
+        const r = await fetch('/api/batch-history');
+        const data = await r.json().catch(() => ({}));
+        if (!data.ok || !Array.isArray(data.entries)) {
+          lastApiHistoryEntries = [];
+          renderCurrentHistoryPage();
+          return;
+        }
+        lastApiHistoryEntries = data.entries;
+        maybeClearPendingAfterFetch(data.entries);
+        renderCurrentHistoryPage();
+      } catch (err) {
+        lastApiHistoryEntries = [];
+        renderCurrentHistoryPage();
+        if (batchErrorBanner) {
+          batchErrorBanner.style.display = 'block';
+          batchErrorBanner.textContent = '历史列表加载失败：' + (err.message || err);
+        }
+      }
+    }
+
+    async function showHistoryDetail(hid) {
+      if (!hid || !historyDetailBody || !historyDetailModal) return;
+      historyDetailBody.textContent = '加载中…';
+      historyDetailModal.classList.add('visible');
+      historyDetailModal.setAttribute('aria-hidden', 'false');
+      try {
+        const r = await fetch('/api/batch-history/' + encodeURIComponent(hid));
+        const raw = await r.text();
+        let data = {};
+        try {
+          data = JSON.parse(raw);
+        } catch (e) {
+          historyDetailBody.textContent = 'HTTP ' + r.status + '：响应不是 JSON\n' + raw.slice(0, 500);
+          return;
+        }
+        if (!r.ok) {
+          historyDetailBody.textContent = 'HTTP ' + r.status + '：' + (data.error || raw.slice(0, 300));
+          return;
+        }
+        if (!data.ok || !data.record) {
+          historyDetailBody.textContent = data.error || '加载失败（无 record）';
+          return;
+        }
+        historyDetailBody.textContent = JSON.stringify(data.record, null, 2);
+      } catch (e) {
+        historyDetailBody.textContent = String(e.message || e);
+      }
+    }
+
+    async function runHistoryRetry(hid, runMode, onlyFailed) {
+      if (!hid) return;
+      if (!confirm(onlyFailed ? '使用当前页面上的打印机、份数与选项，仅重试该次任务中失败的文档？' : '使用当前页面选项，重试该次任务中的全部文档（仍使用服务端暂存的目录结构）？')) return;
+      setActionLoading(true, { requireDocs: false });
+      lastRunMode = runMode || lastRunMode;
+      showProgress(0, '正在连接（历史重试）…', '');
+      runLog.textContent = '';
+      appendRunLog('历史重试：' + hid + ' · ' + (onlyFailed ? '仅失败项' : '整批'));
+      const form = buildBatchOptionsFormData(runMode);
+      form.append('only_failed', onlyFailed ? 'true' : 'false');
+      try {
+        const res = await fetch('/api/batch-history/' + encodeURIComponent(hid) + '/retry', { method: 'POST', body: form });
+        await consumeBatchStreamResponse(res, '历史重试完成');
+      } catch (e) {
+        showResult({ ok: false, error: e.message });
+      } finally {
+        setActionLoading(false, { requireDocs: false });
+      }
+    }
+
+    if (btnRefreshHistory) btnRefreshHistory.addEventListener('click', () => {
+      batchListPage = 1;
+      loadHistory();
+    });
+    if (batchPagerPrev) batchPagerPrev.addEventListener('click', () => {
+      if (batchListPage > 1) {
+        batchListPage--;
+        renderCurrentHistoryPage();
+      }
+    });
+    if (batchPagerNext) batchPagerNext.addEventListener('click', () => {
+      const all = getMergedHistoryRows();
+      const tp = Math.max(1, Math.ceil(all.length / BATCH_HISTORY_PAGE_SIZE) || 1);
+      if (batchListPage < tp) {
+        batchListPage++;
+        renderCurrentHistoryPage();
+      }
+    });
+    if (historyDetailClose) historyDetailClose.addEventListener('click', () => {
+      historyDetailModal.classList.remove('visible');
+      historyDetailModal.setAttribute('aria-hidden', 'true');
+    });
+    if (historyDetailModal) {
+      historyDetailModal.addEventListener('click', (ev) => {
+        if (ev.target === historyDetailModal) {
+          historyDetailModal.classList.remove('visible');
+          historyDetailModal.setAttribute('aria-hidden', 'true');
+        }
+      });
+    }
+    loadHistory();
+
+    function formatEtaSeconds(sec) {
+      if (sec == null || typeof sec !== 'number' || !isFinite(sec) || sec < 0) return '';
+      const s = Math.round(sec);
+      if (s < 60) return s + ' 秒';
+      const m = Math.floor(s / 60);
+      const rs = s % 60;
+      if (m < 60) return m + ' 分 ' + rs + ' 秒';
+      const h = Math.floor(m / 60);
+      const rm = m % 60;
+      return h + ' 小时 ' + rm + ' 分 ' + rs + ' 秒';
     }
 
     function showProgress(percent, text, detail) {
@@ -472,6 +1470,7 @@
       progressBar.style.width = (percent || 0) + '%';
       progressText.textContent = text || '处理中…';
       progressDetail.textContent = detail || '';
+      if (jobControls) jobControls.style.display = currentJobId ? 'flex' : 'none';
     }
 
     function appendRunLog(msg) {
@@ -483,198 +1482,147 @@
 
     function showResult(data) {
       progressArea.style.display = 'none';
-      resultArea.classList.add('visible');
-      manualListWrap.style.display = 'none';
-      manualList.innerHTML = '';
+      if (skipCurrentHint) skipCurrentHint.style.display = 'none';
+      if (batchRecordsCard) batchRecordsCard.style.display = 'block';
+      if (manualListWrap) manualListWrap.style.display = 'none';
+      if (manualList) manualList.innerHTML = '';
       downloadWrap.style.display = 'none';
+      if (batchErrorBanner) batchErrorBanner.style.display = 'none';
+      if (batchSummaryBanner) batchSummaryBanner.style.display = 'none';
+      if (batchTimingLine) {
+        batchTimingLine.style.display = 'none';
+        batchTimingLine.textContent = '';
+      }
       if (!data.ok) {
-        resultSummary.className = 'result-summary fail';
-        resultSummary.textContent = data.error || '处理失败';
-        resultBody.innerHTML = '';
+        if (batchErrorBanner) {
+          batchErrorBanner.style.display = 'block';
+          batchErrorBanner.textContent = data.error || '处理失败';
+        }
+        currentJobId = null;
+        currentJobState = 'idle';
+        if (jobControls) jobControls.style.display = 'none';
+        if (btnPause) btnPause.style.display = '';
+        if (btnResume) btnResume.style.display = 'none';
+        if (btnCancel) btnCancel.disabled = false;
+        renderCurrentHistoryPage();
         return;
       }
+      batchListPage = 1;
+      currentJobId = null;
+      currentJobState = 'idle';
+      if (jobControls) jobControls.style.display = 'none';
+      if (btnPause) btnPause.style.display = '';
+      if (btnResume) btnResume.style.display = 'none';
+      if (btnCancel) btnCancel.disabled = false;
       const r = data.result || {};
       const total = r.total || 0;
       const ok = r.ok || 0;
       const failed = r.failed || 0;
       const dry = r.dry_run === true;
       const skipPrint = r.skip_print === true;
+      pendingLocalBatch = { ts: Date.now(), fullData: data, runMode: lastRunMode };
+      batchExpandedKeys.add('local');
       if (r.download_token) {
         downloadWrap.style.display = 'block';
         downloadLink.href = '/api/batch-export/' + encodeURIComponent(r.download_token);
         downloadLink.setAttribute('download', r.download_filename || 'processed_documents.zip');
       }
+      let sumText = '';
+      let sumClass = 'result-summary success';
       if (failed === 0) {
-        resultSummary.className = 'result-summary success';
+        sumClass = 'result-summary success';
         if (skipPrint && r.download_token) {
-          resultSummary.textContent = '全部处理完成（共 ' + total + ' 个文件）。请下载 ZIP：内含处理后的文档；删除线/水印等逐条修改见根目录「修改明细.txt」（未送打印机）。';
+          sumText = '全部处理完成（共 ' + total + ' 个文件）。可下载 ZIP，单文件明细在下方表格中展开「本轮」行查看。';
         } else if (skipPrint) {
-          resultSummary.textContent = '处理完成（共 ' + total + ' 个文件），但未生成下载包，请查看下方说明。';
+          sumText = '处理完成（共 ' + total + ' 个文件），但未生成下载包，请展开下方「本轮」行查看说明。';
         } else if (dry) {
-          resultSummary.textContent = '预检全部通过（共 ' + total + ' 个文件，未实际打印）。';
+          sumText = '预检全部通过（共 ' + total + ' 个文件，未实际打印）。';
         } else {
-          resultSummary.textContent = '已全部提交至系统打印队列（共 ' + total + ' 个文件）。任务已排队，不代表已出纸，请到打印机查看。';
+          sumText = '已全部提交至系统打印队列（共 ' + total + ' 个文件）。任务已排队，请到打印机查看。';
         }
       } else if (ok === 0) {
-        resultSummary.className = 'result-summary fail';
-        resultSummary.textContent = '全部失败：共 ' + total + ' 个文件。';
+        sumClass = 'result-summary fail';
+        sumText = '全部失败：共 ' + total + ' 个文件。';
       } else {
-        resultSummary.className = 'result-summary partial';
+        sumClass = 'result-summary partial';
         if (skipPrint && r.download_token) {
-          resultSummary.textContent = '部分失败：成功 ' + ok + ' 个，失败 ' + failed + ' 个。ZIP 中为当前处理结果（含失败项的原始或中间状态）；逐条修改见「修改明细.txt」，请逐项核对。';
+          sumText = '部分失败：成功 ' + ok + ' 个，失败 ' + failed + ' 个。请展开「本轮」核对每项说明。';
         } else if (dry) {
-          resultSummary.textContent = '预检通过 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
+          sumText = '预检通过 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
         } else {
-          resultSummary.textContent = '已提交打印队列 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
+          sumText = '已提交打印队列 ' + ok + ' 个，失败 ' + failed + ' 个，共 ' + total + ' 个文件。';
         }
       }
-      const statusLabel = (d) => {
-        if (!d.success) return '失败';
-        if (skipPrint) return '已保存';
-        return dry ? '通过' : '已提交';
-      };
-      const manualItems = (r.details || []).filter(d => {
+      if (r.incremental_output_dir) {
+        sumText += ' 即时保存根目录：' + r.incremental_output_dir + '。';
+      }
+      if (batchSummaryBanner) {
+        batchSummaryBanner.className = sumClass;
+        batchSummaryBanner.textContent = sumText;
+        batchSummaryBanner.style.display = 'block';
+      }
+      if (r.eta_summary && batchTimingLine) {
+        batchTimingLine.style.display = 'block';
+        batchTimingLine.textContent = r.eta_summary;
+      }
+      const manualItems = (r.details || []).filter((d) => {
+        if (d.manual_attention || d.timeout_skip || d.manual_skip) return true;
         const m = String(d.message || '');
         return m.indexOf('请手动打印原文') >= 0
           || m.indexOf('自动打印失败') >= 0
-          || m.indexOf('手动打印') >= 0;
+          || m.indexOf('手动打印') >= 0
+          || m.indexOf('需人工') >= 0;
       });
-      resultBody.innerHTML = (r.details || []).map(d => `
-        <tr>
-          <td class="filename">${escapeHtml(d.filename || d.path || '')}</td>
-          <td class="${d.success ? 'status-ok' : 'status-fail'}">${statusLabel(d)}</td>
-          <td class="message">${escapeHtml(d.message || '')}</td>
-        </tr>
-      `).join('');
-      if (manualItems.length) {
+      if (manualItems.length && manualListWrap && manualList) {
         manualListWrap.style.display = 'block';
-        manualList.innerHTML = manualItems.map(d =>
-          `<li><strong>${escapeHtml(d.filename || d.path || '')}</strong>：${escapeHtml(d.message || '请手动打印原文')}</li>`
+        manualList.innerHTML = manualItems.map((d) =>
+          '<li><strong>' + escapeHtml(d.filename || d.path || '') + '</strong>：' + escapeHtml(d.message || '请手动打印原文') + '</li>'
         ).join('');
       }
+      renderCurrentHistoryPage();
+      loadHistory();
     }
 
     async function runBatch(runMode) {
       if (!pendingUploadFiles.length) return;
       const docCount = pendingUploadFiles.filter(isAllowedDoc).length;
-      if (docCount === 0) {
-        alert('未找到可打印文档（.doc/.docx/.xls/.xlsx/.pdf）');
+      const archiveCount = pendingUploadFiles.filter(isArchiveFile).length;
+      const uploadableCount = pendingUploadFiles.filter(isBatchUploadable).length;
+      if (uploadableCount === 0) {
+        alert('未找到可处理项：请至少选择一个文档（.doc/.docx/.xls/.xlsx/.pdf）或 .zip/.7z/.rar 压缩包');
         return;
       }
-      const form = new FormData();
+      lastRunMode = runMode || 'standard_print';
+      const form = buildBatchOptionsFormData(runMode);
       for (let i = 0; i < pendingUploadFiles.length; i++) {
         const f = pendingUploadFiles[i];
         const name = displayNameForFile(f);
         form.append('files', f, name);
       }
       if (!form.has('files')) {
-        alert('请选择支持的文档（.doc/.docx/.xls/.xlsx/.pdf）');
+        alert('请选择支持的文档或 .zip/.7z/.rar 压缩包');
         return;
       }
-      form.append('run_mode', runMode);
-      form.append('accept_revisions', acceptRevisions.checked ? 'true' : 'false');
-      form.append('dry_run', dryRun.checked ? 'true' : 'false');
-      form.append('word_content_preserve', wordContentPreserve.checked ? 'true' : 'false');
-      form.append('word_preserve_page_count', wordPreservePageCount.checked ? 'true' : 'false');
-      form.append('word_image_risk_guard', wordImageRiskGuard.checked ? 'true' : 'false');
-      form.append('doc_font_profile', wordFontProfile ? wordFontProfile.value : 'mixed');
-      form.append('printer_name', printerSelect.value || '');
-      form.append('copies', copiesInput.value || '1');
 
       setActionLoading(true);
-      resultArea.classList.remove('visible');
+      pendingLocalBatch = null;
+      batchExpandedKeys.clear();
+      batchListPage = 1;
+      if (batchErrorBanner) batchErrorBanner.style.display = 'none';
+      if (batchSummaryBanner) batchSummaryBanner.style.display = 'none';
+      if (batchTimingLine) {
+        batchTimingLine.style.display = 'none';
+        batchTimingLine.textContent = '';
+      }
       showProgress(0, '正在连接…', '');
       runLog.textContent = '';
-      appendRunLog('开始提交任务，文档 ' + docCount + ' 个，上传总文件 ' + pendingUploadFiles.length + ' 个');
-
-      function parseSSEChunks(text) {
-        const normalized = text.replace(/\r\n/g, '\n');
-        const parts = normalized.split('\n\n');
-        const complete = parts.slice(0, -1);
-        const remainder = parts[parts.length - 1] || '';
-        const events = [];
-        for (const block of complete) {
-          if (!block.trim()) continue;
-          let ev = '';
-          let payload = '';
-          for (const line of block.split('\n')) {
-            if (line.startsWith('event: ')) ev = line.slice(7).trim();
-            if (line.startsWith('data: ')) payload = line.slice(6);
-          }
-          if (ev && payload) {
-            try {
-              events.push({ event: ev, data: JSON.parse(payload) });
-            } catch (_) {}
-          }
-        }
-        return { events, remainder };
-      }
+      appendRunLog(
+        '开始提交任务，上传项 ' + uploadableCount + ' 个（文档 ' + docCount + '，压缩包 ' + archiveCount + '），共 ' + pendingUploadFiles.length + ' 个文件'
+      );
 
       try {
         const res = await fetch('/api/batch-print-stream', { method: 'POST', body: form });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          showResult({ ok: false, error: err.error || res.statusText });
-          setActionLoading(false);
-          return;
-        }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
-        let gotResult = false;
-        while (true) {
-          const { value, done } = await reader.read();
-          if (value) {
-            buf += decoder.decode(value, { stream: true });
-          }
-          const { events, remainder } = parseSSEChunks(buf);
-          buf = remainder;
-          for (const { event, data } of events) {
-            if (event === 'progress') {
-              const total = data.fileTotal || 1;
-              const idx = data.fileIndex || 1;
-              let pct = 0;
-              if (typeof data.percent === 'number' && !isNaN(data.percent)) {
-                pct = Math.min(99, Math.max(0, data.percent));
-              } else {
-                pct = total
-                  ? Math.min(99, Math.round(((idx - 1) / total) * 100 + 50 / total))
-                  : 0;
-              }
-              showProgress(
-                pct,
-                '第 ' + idx + '/' + total + ' 个文件',
-                (data.step || '') + (data.fileName ? ' · ' + data.fileName : '')
-              );
-              appendRunLog('进度 ' + pct + '%：' + (data.step || '处理中') + (data.fileName ? ' | ' + data.fileName : ''));
-            } else if (event === 'heartbeat') {
-              appendRunLog(data.message || '仍在处理中...');
-            } else if (event === 'result') {
-              showResult(data);
-              appendRunLog('任务完成');
-              gotResult = true;
-            }
-          }
-          if (gotResult) break;
-          if (done) break;
-        }
-        if (!gotResult && buf.trim()) {
-          const { events: tailEvents } = parseSSEChunks(buf + '\n\n');
-          for (const { event, data } of tailEvents) {
-            if (event === 'result') {
-              showResult(data);
-              gotResult = true;
-            }
-          }
-        }
-        if (!gotResult && buf.includes('data: ')) {
-          const i = buf.indexOf('data: ');
-          try {
-            const line = buf.slice(i + 6).split(/\r?\n/)[0];
-            const data = JSON.parse(line);
-            if (data.result !== undefined || data.error !== undefined) showResult(data);
-          } catch (_) {}
-        }
+        await consumeBatchStreamResponse(res, '任务完成');
       } catch (e) {
         showResult({ ok: false, error: e.message });
       } finally {
@@ -691,6 +1639,15 @@
       div.textContent = s;
       return div.innerHTML;
     }
+
+    function escapeAttr(s) {
+      return String(s || '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/\n/g, ' ');
+    }
+
   </script>
 </body>
 </html>

@@ -27,6 +27,10 @@ echo   aiprintword - starting server
 echo   Open: http://127.0.0.1:5050
 echo   Press Ctrl+C to stop
 echo ========================================
+echo   工作目录: %CD%
+echo   Python 命令: %PYEXE%
+echo   若设置页仍 503 且 JSON 很短: 先关掉所有占用 5050 的旧窗口，再启动本脚本
+echo ========================================
 echo.
 
 "%PYEXE%" app.py

@@ -167,7 +167,28 @@
     <div class="card">
       <h2>2. 选择要签名的文件</h2>
       <p class="hint" id="listHint">暂无已保存文件，请先上传保存。</p>
+      <div class="btn-row" style="margin-bottom:10px;">
+        <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
+          <input type="checkbox" id="batchSelectAll"> 全选（用于下方「一键批量签」）
+        </label>
+      </div>
       <ul class="file-list" id="fileList"></ul>
+    </div>
+
+    <div class="card" id="signerLibCard">
+      <h2>签署人库（笔迹可复用）</h2>
+      <p class="hint" id="signerLibHint">加载中…</p>
+      <div class="btn-row">
+        <input type="text" id="newSignerName" placeholder="姓名或代号" maxlength="128" style="flex:1;min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+        <button type="button" class="btn btn-secondary" id="addSignerBtn">添加签署人</button>
+      </div>
+      <ul class="file-list" id="signerListEl" style="margin-top:12px;"></ul>
+    </div>
+
+    <div class="card" id="needSignCard">
+      <h2>本文件需签角色（检测结果）</h2>
+      <p class="hint">为每个角色选择签署人后，可「从库载入」到画布；手写后也可「保存到签署人」供其它文档复用。不同文件可为同一角色指定不同签署人。</p>
+      <div id="needSignTable"></div>
     </div>
 
     <div class="card">
@@ -178,7 +199,11 @@
     </div>
 
     <div class="card">
-      <button type="button" class="btn btn-primary" id="submitBtn" disabled>生成已签名文档</button>
+      <div class="btn-row" style="align-items:center;">
+        <button type="button" class="btn btn-primary" id="submitBtn" disabled>生成已签名文档</button>
+        <button type="button" class="btn btn-secondary" id="batchSignBtn" disabled>一键批量签（已勾选文件）</button>
+      </div>
+      <p class="hint" id="batchResultMsg" style="display:none;margin-top:10px;"></p>
       <p class="err" id="errMsg" style="display:none;"></p>
     </div>
 

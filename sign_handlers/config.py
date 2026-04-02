@@ -3,9 +3,9 @@
 
 # 每个角色可对应多个模板用词（中英混排表格常见英文标签）
 ROLE_ID_TO_KEYWORD = {
-    "author": ("作者", "Author"),
-    "reviewer": ("审核", "Reviewer", "Review"),
-    "approver": ("批准", "Approver", "Approval"),
+    "author": ("作者", "Author", "编制人", "编制"),
+    "reviewer": ("审核", "审核人", "Reviewer", "Review"),
+    "approver": ("批准", "批准人", "Approver", "Approval"),
     "executor": ("执行人员", "Executor"),
     "reviewer_tail": ("审核人员", "Reviewer"),
 }

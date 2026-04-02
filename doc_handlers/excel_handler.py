@@ -7,18 +7,120 @@ Excel 文档处理：可选接受修订、打印
 import os
 import re
 import time
+import uuid
+import logging
+import subprocess
 from collections import Counter
+from typing import Optional
 
 try:
     import win32com.client
     import pythoncom
     import pywintypes
+    import win32process
 except ImportError:
     win32com = None
     pythoncom = None
     pywintypes = None
+    win32process = None
 
-from config import EXCEL_PROGID
+from config import get_excel_progid, use_wps_runtime
+from doc_handlers.office_pid import (
+    refresh_pid_after_doc_open,
+    resolve_office_app_pid,
+    tasklist_pids_for_images,
+    hwnd_chain_to_pid,
+)
+from doc_handlers.word_handler import FileAbortRequested
+
+logger = logging.getLogger("aiprintword.excel")
+
+_LAST_EXCEL_PID = None
+EXCEL_FILE_ABORT_EVENT = None
+
+
+def set_excel_file_abort_event(ev):
+    global EXCEL_FILE_ABORT_EVENT
+    EXCEL_FILE_ABORT_EVENT = ev
+
+
+def clear_excel_file_abort_event():
+    global EXCEL_FILE_ABORT_EVENT
+    EXCEL_FILE_ABORT_EVENT = None
+
+
+def _check_excel_file_abort():
+    ev = EXCEL_FILE_ABORT_EVENT
+    if ev is not None and ev.is_set():
+        raise FileAbortRequested("单文件总耗时已超过限制，已中止处理")
+
+
+# 与批处理表单「单步超时 / 超时时跳过该文件」共用 Word 侧传入的秒数与开关
+EXCEL_STEP_TIMEOUT_SEC = 3600.0
+EXCEL_SKIP_FILE_ON_TIMEOUT = False
+
+
+class ExcelStepTimeout(RuntimeError):
+    """Excel 某一步骤超过 EXCEL_STEP_TIMEOUT_SEC（由批处理传入，与 Word 一致）。"""
+
+
+_EXCEL_STOP_EXCEPTIONS = (FileAbortRequested, ExcelStepTimeout)
+
+
+def _check_excel_step_deadline(t0, step_name: str) -> None:
+    try:
+        limit = float(EXCEL_STEP_TIMEOUT_SEC)
+    except Exception:
+        limit = 3600.0
+    if limit <= 0:
+        return
+    if (time.perf_counter() - float(t0)) < limit:
+        return
+    if EXCEL_SKIP_FILE_ON_TIMEOUT:
+        raise ExcelStepTimeout(
+            f"【超时跳过】Excel 步骤「{step_name}」超过 {int(limit)} 秒，已标记该文件需人工处理"
+        )
+    raise ExcelStepTimeout(f"【超时】Excel 步骤「{step_name}」超过 {int(limit)} 秒")
+
+
+def _ws_iter(wb, step_t0=None, step_label="Excel 处理"):
+    """遍历工作表；每张表前检查单文件中断，可选检查单步累计超时。"""
+    for ws in wb.Worksheets:
+        _check_excel_file_abort()
+        if step_t0 is not None:
+            _check_excel_step_deadline(step_t0, step_label)
+        yield ws
+
+
+def _excel_host_image_names():
+    return ("et.exe",) if use_wps_runtime() else ("EXCEL.EXE",)
+
+
+def _try_get_app_pid(app):
+    return hwnd_chain_to_pid(app, win32process)
+
+
+def kill_last_excel_app(reason="timeout_or_cancel"):
+    global _LAST_EXCEL_PID
+    pid = _LAST_EXCEL_PID
+    if not pid:
+        logger.warning(
+            "kill_last_excel_app skipped: no PID (reason=%s)；单文件超时/跳过可能无法打断卡死的 COM",
+            reason,
+        )
+        return False
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        logger.warning("killed excel pid=%s reason=%s", pid, reason)
+        return True
+    except Exception:
+        return False
 
 RPC_E_SERVER_UNAVAILABLE = -2147023170
 RPC_E_SERVER_UNAVAILABLE_ALT = -2147023174
@@ -66,15 +168,25 @@ def _desktop_pdf_path(src_path):
 def _get_excel_app(visible=False):
     if win32com is None:
         raise RuntimeError("请安装 pywin32: pip install pywin32")
+    _check_excel_file_abort()
     try:
         pythoncom.CoInitialize()
     except Exception:
         pass
+    before = tasklist_pids_for_images(_excel_host_image_names())
     for attempt in range(3):
         try:
-            excel = win32com.client.dynamic.Dispatch(EXCEL_PROGID)
+            _check_excel_file_abort()
+            excel = win32com.client.dynamic.Dispatch(get_excel_progid())
             excel.Visible = False
             excel.DisplayAlerts = False
+            try:
+                global _LAST_EXCEL_PID
+                _LAST_EXCEL_PID = resolve_office_app_pid(
+                    excel, win32process, _excel_host_image_names(), before
+                )
+            except Exception:
+                _LAST_EXCEL_PID = _try_get_app_pid(excel)
             return excel
         except Exception as e:
             if getattr(e, "args", (None,))[0] in RPC_RETRY_CODES and attempt < 2:
@@ -83,12 +195,84 @@ def _get_excel_app(visible=False):
             raise
 
 
+def _open_excel_workbook(excel, path, *, read_only=False):
+    """打开工作簿并刷新 _LAST_EXCEL_PID。"""
+    _check_excel_file_abort()
+    wb = excel.Workbooks.Open(path, ReadOnly=read_only, UpdateLinks=0)
+    try:
+        global _LAST_EXCEL_PID
+        np = refresh_pid_after_doc_open(excel, win32process)
+        if np:
+            _LAST_EXCEL_PID = np
+    except Exception:
+        pass
+    return wb
+
+
 def _save_wb(wb, original_path, save_path):
     """保存工作簿：同路径用 Save() 避免格式弹窗，不同路径用 SaveAs()。"""
+    _check_excel_file_abort()
     if os.path.normcase(os.path.abspath(save_path)) == os.path.normcase(os.path.abspath(original_path)):
         wb.Save()
     else:
         wb.SaveAs(os.path.abspath(save_path))
+
+
+# xlOpenXMLWorkbook：.xlsx（无宏）
+_XL_FILE_FORMAT_XLSX = 51
+
+
+def convert_xls_to_xlsx(src_path: str, dst_path: Optional[str] = None) -> str:
+    """
+    将 .xls 转为 .xlsx（旧二进制格式 → Open XML，便于后续规范化与打印）。
+    默认输出到与源文件同目录下的唯一文件名，便于批处理临时目录一并清理。
+    非 .xls 原样返回 src_path（绝对路径）。
+    """
+    if win32com is None:
+        raise RuntimeError("请安装 pywin32: pip install pywin32")
+    src = os.path.abspath(src_path)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(src)
+    if os.path.splitext(src)[1].lower() != ".xls":
+        return src
+    if dst_path:
+        dst = os.path.abspath(dst_path)
+    else:
+        d = os.path.dirname(src) or os.getcwd()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        stem = os.path.splitext(os.path.basename(src))[0]
+        dst = os.path.join(d, f"{stem}._aiprint_{uuid.uuid4().hex[:10]}.xlsx")
+        dst = os.path.abspath(dst)
+    excel = None
+    wb = None
+    try:
+        excel = _get_excel_app(visible=False)
+        wb = _open_excel_workbook(excel, src, read_only=False)
+        try:
+            wb.SaveAs(dst, FileFormat=_XL_FILE_FORMAT_XLSX)
+        except Exception:
+            wb.SaveAs(dst, _XL_FILE_FORMAT_XLSX)
+        return dst
+    finally:
+        if wb:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if excel:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+        time.sleep(0.5)
+        if pythoncom:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
 
 # 常见标黄/高亮 ColorIndex（已不再用于自动清除，保留供可选逻辑）
@@ -101,7 +285,7 @@ xlLinkTypeExcelLinks = 1
 _MAX_CELLS_PER_SHEET = 80000
 
 
-def _iter_used_cells(ws, ur):
+def _iter_used_cells(ws, ur, step_t0=None, step_label="单元格扫描"):
     """按行列迭代 UsedRange 内单元格，避免 ur.Cells 枚举器在 WPS 上触发 COM 错误。"""
     if ur is None:
         return
@@ -112,8 +296,14 @@ def _iter_used_cells(ws, ur):
         return
     if nr * nc > _MAX_CELLS_PER_SHEET:
         nr = max(1, _MAX_CELLS_PER_SHEET // max(nc, 1))
+    n = 0
     for i in range(nr):
         for j in range(nc):
+            n += 1
+            if n % 40 == 0:
+                _check_excel_file_abort()
+                if step_t0 is not None:
+                    _check_excel_step_deadline(step_t0, step_label)
             try:
                 yield ws.Cells(top + i, left + j)
             except Exception:
@@ -149,7 +339,8 @@ def _count_formula_error_cells(wb, max_scan_cells=20000, max_errors=50):
     """
     err = 0
     scanned = 0
-    for ws in wb.Worksheets:
+    step_t0 = time.perf_counter()
+    for ws in _ws_iter(wb, step_t0, "公式错误扫描"):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -210,7 +401,8 @@ def _auto_fix_excel_formula_errors_and_links(wb, max_scan_cells=30000, max_fix_e
     # 2) 把报错公式包 IFERROR
     fixed = 0
     scanned = 0
-    for ws in wb.Worksheets:
+    step_t0 = time.perf_counter()
+    for ws in _ws_iter(wb, step_t0, "公式错误自动修复"):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -222,7 +414,7 @@ def _auto_fix_excel_formula_errors_and_links(wb, max_scan_cells=30000, max_fix_e
             continue
         if ur is None:
             continue
-        for c in _iter_used_cells(ws, ur):
+        for c in _iter_used_cells(ws, ur, step_t0, "公式错误自动修复"):
             scanned += 1
             if scanned > max_scan_cells:
                 return
@@ -397,13 +589,25 @@ def _copy_border_style_from_sample(dst_border, sample_border):
             pass
 
 
-def set_runtime_options(*, excel_font_profile=None):
+def set_runtime_options(
+    *,
+    excel_font_profile=None,
+    excel_step_timeout_sec=None,
+    excel_skip_file_on_timeout=None,
+):
     """按请求级别动态设置 Excel 运行开关（本进程内生效）。"""
-    global EXCEL_FONT_PROFILE
+    global EXCEL_FONT_PROFILE, EXCEL_STEP_TIMEOUT_SEC, EXCEL_SKIP_FILE_ON_TIMEOUT
     if excel_font_profile is not None:
         p = str(excel_font_profile).strip().lower()
         if p in ("chinese", "english", "mixed"):
             EXCEL_FONT_PROFILE = p
+    if excel_step_timeout_sec is not None:
+        try:
+            EXCEL_STEP_TIMEOUT_SEC = float(excel_step_timeout_sec)
+        except Exception:
+            pass
+    if excel_skip_file_on_timeout is not None:
+        EXCEL_SKIP_FILE_ON_TIMEOUT = bool(excel_skip_file_on_timeout)
 
 
 def _apply_font_profile_to_excel_font(font_obj):
@@ -447,7 +651,8 @@ def _excel_unify_row_borders_inconsistent_only(wb):
     只修正同一行内框线不统一：仅针对**有值**的单元格；空格不参与比较、也不被补线。
     有值格之间若底/顶边或相邻竖线一侧有一侧无，则补成与同行有值格一致。不修改风险矩阵格。
     """
-    for ws in wb.Worksheets:
+    step_t0 = time.perf_counter()
+    for ws in _ws_iter(wb, step_t0, "行框线统一"):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -464,6 +669,9 @@ def _excel_unify_row_borders_inconsistent_only(wb):
         nr = min(int(ur.Rows.Count), _MAX_ROW_AUTOFIT)
         nc = min(int(ur.Columns.Count), _MAX_COL_AUTOFIT)
         for ri in range(nr):
+            if ri % 24 == 0:
+                _check_excel_file_abort()
+                _check_excel_step_deadline(step_t0, "行框线统一")
             r = top + ri
             for edge_bottom in (True, False):
                 pairs = _row_tls_for_horizontal_edge(ws, r, left, nc, bottom=edge_bottom)
@@ -558,7 +766,8 @@ def _cell_is_risk_matrix_cell(cell):
 
 
 def _excel_clear_fill_outside_matrix(wb):
-    for ws in wb.Worksheets:
+    step_t0 = time.perf_counter()
+    for ws in _ws_iter(wb, step_t0, "矩阵外清底色"):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -570,7 +779,7 @@ def _excel_clear_fill_outside_matrix(wb):
             continue
         if ur is None:
             continue
-        for cell in _iter_used_cells(ws, ur):
+        for cell in _iter_used_cells(ws, ur, step_t0, "矩阵外清底色"):
             if _cell_is_risk_matrix_cell(cell):
                 continue
             try:
@@ -585,8 +794,9 @@ def _excel_clear_fill_outside_matrix(wb):
                     continue
                 if idx in _FILL_CLEAR_COLORINDEX:
                     cell.Interior.ColorIndex = _XL_COLOR_NONE
-            except Exception:
-                pass
+            except Exception as e:
+                if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                    raise
 
 
 def _cell_font_size_pt(cell):
@@ -668,7 +878,8 @@ def _excel_scale_cell_pictures_to_fit_merge_area(wb):
     矩阵外：图片锚定在单元格上且大于合并区域可视范围时，等比例缩小（宽与高同比例）。
     纯文字行高仍由 _excel_autofit_rows_outside_matrix 处理（只拉高行高）。
     """
-    for ws in wb.Worksheets:
+    step_t0 = time.perf_counter()
+    for ws in _ws_iter(wb, step_t0, "矩阵外图片缩放"):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -679,6 +890,8 @@ def _excel_scale_cell_pictures_to_fit_merge_area(wb):
         except Exception:
             continue
         for i in range(1, n + 1):
+            if i % 12 == 0:
+                _check_excel_file_abort()
             try:
                 sh = ws.Shapes(i)
                 if not _excel_shape_is_embedded_picture(sh):
@@ -762,7 +975,8 @@ def _excel_scale_cell_pictures_to_fit_merge_area(wb):
 
 
 def _excel_autofit_rows_outside_matrix(wb):
-    for ws in wb.Worksheets:
+    step_t0 = time.perf_counter()
+    for ws in _ws_iter(wb, step_t0, "矩阵外行高"):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -779,6 +993,9 @@ def _excel_autofit_rows_outside_matrix(wb):
         nr = min(int(ur.Rows.Count), _MAX_ROW_AUTOFIT)
         nc = min(int(ur.Columns.Count), _MAX_COL_AUTOFIT)
         for ri in range(nr):
+            if ri % 12 == 0:
+                _check_excel_file_abort()
+                _check_excel_step_deadline(step_t0, "矩阵外行高")
             row = top + ri
             try:
                 need_h = 14.0
@@ -927,7 +1144,8 @@ def _unify_header_fill_gray(wb):
     按空列分表块，每块每行内有值格多数色为参照，仅给仍有值且白/无填充的格补色。
     不覆盖风险矩阵格。
     """
-    for ws in wb.Worksheets:
+    step_t0 = time.perf_counter()
+    for ws in _ws_iter(wb, step_t0, "表头底色统一"):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -1018,7 +1236,7 @@ def excel_normalize_matrix_and_layout(xl_path, save_path=None):
         except Exception as e:
             _reraise_with_step("启动 WPS/Excel（矩阵外排版）", e)
         try:
-            wb = excel.Workbooks.Open(path, ReadOnly=False, UpdateLinks=0)
+            wb = _open_excel_workbook(excel, path, read_only=False)
         except Exception as e:
             _reraise_with_step("打开工作簿（矩阵外排版）", e)
         try:
@@ -1027,8 +1245,9 @@ def excel_normalize_matrix_and_layout(xl_path, save_path=None):
             _excel_autofit_rows_outside_matrix(wb)
             _excel_unify_row_borders_inconsistent_only(wb)
             _ensure_print_area_covers_used_range(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         try:
             _save_wb(wb, path, save_path)
         except Exception as e:
@@ -1073,7 +1292,7 @@ def check_formal_document(xl_path, check_highlight=True, check_comments=True, ch
         except Exception as e:
             return False, [f"【正式性检查-启动表格】{e}"]
         try:
-            wb = excel.Workbooks.Open(path, ReadOnly=True, UpdateLinks=0)
+            wb = _open_excel_workbook(excel, path, read_only=True)
         except Exception as e:
             try:
                 if e.args and e.args[0] in _COM_USER_CODES:
@@ -1081,50 +1300,55 @@ def check_formal_document(xl_path, check_highlight=True, check_comments=True, ch
             except Exception:
                 pass
             return False, [f"【正式性检查-打开工作簿】{e}"]
+        step_t0 = time.perf_counter()
         if check_highlight:
             has_highlight = False
-            for ws in wb.Worksheets:
+            for ws in _ws_iter(wb, step_t0, "正式性检查"):
                 try:
                     if ws.Type != XL_WORKSHEET:
                         continue
                     ur = ws.UsedRange
                     if ur is None:
                         continue
-                    for c in _iter_used_cells(ws, ur):
+                    for c in _iter_used_cells(ws, ur, step_t0, "正式性检查"):
                         try:
                             if c.Interior.ColorIndex in YELLOW_HIGHLIGHT_INDICES:
                                 has_highlight = True
                                 break
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                                raise
                     if has_highlight:
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                        raise
             if has_highlight:
                 issues.append("存在单元格标黄/高亮")
         if check_comments:
             comment_count = 0
-            for ws in wb.Worksheets:
+            for ws in _ws_iter(wb, step_t0, "正式性检查"):
                 try:
                     if ws.Type != XL_WORKSHEET:
                         continue
                     ur = ws.UsedRange
                     if ur is None:
                         continue
-                    for c in _iter_used_cells(ws, ur):
+                    for c in _iter_used_cells(ws, ur, step_t0, "正式性检查"):
                         try:
                             if c.Comment is not None:
                                 comment_count += 1
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as e:
+                            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                                raise
+                except Exception as e:
+                    if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                        raise
             if comment_count > 0:
                 issues.append(f"存在 {comment_count} 个单元格批注")
         if check_font_color:
             has_non_black = False
-            for ws in wb.Worksheets:
+            for ws in _ws_iter(wb, step_t0, "正式性检查"):
                 try:
                     if ws.Type != XL_WORKSHEET:
                         continue
@@ -1136,18 +1360,20 @@ def check_formal_document(xl_path, check_highlight=True, check_comments=True, ch
                             has_non_black = True
                             break
                     except Exception:
-                        for c in _iter_used_cells(ws, ur):
+                        for c in _iter_used_cells(ws, ur, step_t0, "正式性检查"):
                             try:
                                 col = c.Font.Color
                                 if col not in (0, 16777215, -4105):  # -4105 = 自动色
                                     has_non_black = True
                                     break
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                                    raise
                             if has_non_black:
                                 break
-                except Exception:
-                    pass
+                except Exception as e:
+                    if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                        raise
                 if has_non_black:
                     break
             if has_non_black:
@@ -1167,6 +1393,8 @@ def check_formal_document(xl_path, check_highlight=True, check_comments=True, ch
         passed = len(issues) == 0
         return passed, issues
     except Exception as e:
+        if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+            raise
         return False, [f"正式性检查异常: {e}"]
     finally:
         if wb:
@@ -1206,20 +1434,20 @@ def auto_fix_formal_excel(xl_path, save_path=None):
         except Exception as e:
             _reraise_with_step("启动 WPS/Excel（自动修复）", e)
         try:
-            wb = excel.Workbooks.Open(path, ReadOnly=False, UpdateLinks=0)
+            wb = _open_excel_workbook(excel, path, read_only=False)
         except Exception as e:
             _reraise_with_step("打开工作簿（自动修复，需可写）", e)
         try:
             wb.AcceptAllChanges()
         except Exception:
             pass
-        for ws in wb.Worksheets:
+        for ws in _ws_iter(wb):
             try:
                 if ws.Type == XL_WORKSHEET:
                     ws.Cells.ClearComments()
             except Exception:
                 pass
-        for ws in wb.Worksheets:
+        for ws in _ws_iter(wb):
             try:
                 if ws.Type == XL_WORKSHEET:
                     _apply_font_black_sheet(ws)
@@ -1233,8 +1461,9 @@ def auto_fix_formal_excel(xl_path, save_path=None):
             _excel_unify_row_borders_inconsistent_only(wb)
             _ensure_print_area_covers_used_range(wb)
             _auto_fix_excel_formula_errors_and_links(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         try:
             _save_wb(wb, path, save_path)
         except Exception as e:
@@ -1280,15 +1509,17 @@ def ensure_font_black(xl_path, save_path=None):
         except Exception as e:
             _reraise_with_step("启动 WPS/Excel（字体改黑）", e)
         try:
-            wb = excel.Workbooks.Open(path, ReadOnly=False, UpdateLinks=0)
+            wb = _open_excel_workbook(excel, path, read_only=False)
         except Exception as e:
             _reraise_with_step("打开工作簿（字体改黑）", e)
-        for ws in wb.Worksheets:
+        step_t0 = time.perf_counter()
+        for ws in _ws_iter(wb, step_t0, "字体改黑"):
             try:
                 if ws.Type == XL_WORKSHEET:
                     _apply_font_black_sheet(ws)
-            except Exception:
-                pass
+            except Exception as e:
+                if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                    raise
         try:
             _save_wb(wb, path, save_path)
         except Exception as e:
@@ -1317,7 +1548,7 @@ def ensure_font_black(xl_path, save_path=None):
 def _remove_cell_highlights(wb):
     """去除工作簿中单元格的标黄/高亮填充（逐格访问，避免 WPS 对 ur.Cells 枚举报错）。"""
     xlNone = -4142
-    for ws in wb.Worksheets:
+    for ws in _ws_iter(wb):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -1351,12 +1582,13 @@ def accept_all_changes_and_save(xl_path, save_path=None, accept_revisions=True, 
     wb = None
     try:
         excel = _get_excel_app(visible=False)
-        wb = excel.Workbooks.Open(path, ReadOnly=False, UpdateLinks=0)
+        wb = _open_excel_workbook(excel, path, read_only=False)
         if accept_revisions:
             try:
                 wb.AcceptAllChanges()
-            except Exception:
-                pass
+            except Exception as e:
+                if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                    raise
         if remove_highlights:
             try:
                 _remove_cell_highlights(wb)
@@ -1396,7 +1628,7 @@ def _apply_excel_print_layout_for_readability(wb):
         inch = float(wb.Application.InchesToPoints(1))
     except Exception:
         inch = 72.0
-    for ws in wb.Worksheets:
+    for ws in _ws_iter(wb):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -1465,9 +1697,80 @@ def _used_range_address_for_print(ur):
         return None
 
 
+def _worksheet_content_bounds(ws):
+    """
+    返回 (top_row, left_col, bottom_row, right_col) 的内容边界（基于 Find("*")，尽量忽略仅格式残留）。
+    找不到内容时返回 None。
+    """
+    try:
+        cells = ws.Cells
+    except Exception:
+        return None
+    # Excel 常量：1=xlByRows, 2=xlByColumns；1=xlNext, 2=xlPrevious
+    xlByRows, xlByColumns, xlNext, xlPrevious = 1, 2, 1, 2
+    # LookIn：优先用公式视图，可覆盖纯公式结果/文本
+    lookin_candidates = [None]
+    try:
+        lookin_candidates = [1, 2, None]  # 1=xlFormulas, 2=xlValues
+    except Exception:
+        pass
+    first = last = None
+    for lookin in lookin_candidates:
+        try:
+            first = cells.Find(
+                "*",
+                LookIn=lookin,
+                SearchOrder=xlByRows,
+                SearchDirection=xlNext,
+            )
+            last = cells.Find(
+                "*",
+                LookIn=lookin,
+                SearchOrder=xlByRows,
+                SearchDirection=xlPrevious,
+            )
+            if first is not None and last is not None:
+                break
+        except Exception:
+            first = last = None
+    if first is None or last is None:
+        return None
+    try:
+        top = int(first.Row)
+        bottom = int(last.Row)
+    except Exception:
+        return None
+    # 再按列方向找左右边界
+    left = right = None
+    for lookin in lookin_candidates:
+        try:
+            c1 = cells.Find(
+                "*",
+                LookIn=lookin,
+                SearchOrder=xlByColumns,
+                SearchDirection=xlNext,
+            )
+            c2 = cells.Find(
+                "*",
+                LookIn=lookin,
+                SearchOrder=xlByColumns,
+                SearchDirection=xlPrevious,
+            )
+            if c1 is not None and c2 is not None:
+                left = int(c1.Column)
+                right = int(c2.Column)
+                break
+        except Exception:
+            left = right = None
+    if left is None or right is None:
+        return None
+    return top, left, bottom, right
+
+
 def _ensure_print_area_covers_used_range(wb):
     """
-    将**每个**普通工作表的 `PrintArea` 设为当前 `UsedRange` 地址，保证整本工作簿各页内容按 Excel 已用区域完整打印；
+    将**每个**普通工作表的 `PrintArea` 设为“真实内容范围”，避免仅格式残留导致 UsedRange 膨胀而多打空白页；
+    若无法定位内容边界，则回退为 UsedRange。
     不修改纸张方向（横向/纵向），不改缩放模式以外的版式。
     在规范化保存与打印前各执行一次（打印为内存，保存会写回文件）。
     """
@@ -1475,19 +1778,32 @@ def _ensure_print_area_covers_used_range(wb):
         wb.Application.Calculate()
     except Exception:
         pass
-    for ws in wb.Worksheets:
+    for ws in _ws_iter(wb):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
         except Exception:
             continue
         try:
-            ur = ws.UsedRange
-            if ur is None:
-                continue
-            addr = _used_range_address_for_print(ur)
+            addr = None
+            b = _worksheet_content_bounds(ws)
+            if b:
+                top, left, bottom, right = b
+                try:
+                    addr = ws.Range(ws.Cells(top, left), ws.Cells(bottom, right)).Address
+                except Exception:
+                    addr = None
+            if not addr:
+                ur = ws.UsedRange
+                if ur is None:
+                    continue
+                addr = _used_range_address_for_print(ur)
             if addr:
                 ws.PageSetup.PrintArea = addr
+                try:
+                    ws.ResetAllPageBreaks()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1496,7 +1812,7 @@ def _normalize_page_markers_safe(wb):
     """
     仅替换页眉/页脚中的“Page:数字[/数字]”片段为动态页码，避免改动正文编号等字段。
     """
-    for ws in wb.Worksheets:
+    for ws in _ws_iter(wb):
         try:
             if ws.Type != XL_WORKSHEET:
                 continue
@@ -1557,7 +1873,7 @@ def _refresh_excel_pagination_before_print(wb):
     仅对 PageSetup 做「读回写」以刷新分页布局。
     """
     try:
-        for ws in wb.Worksheets:
+        for ws in _ws_iter(wb):
             try:
                 if ws.Type != XL_WORKSHEET:
                     continue
@@ -1600,34 +1916,40 @@ def print_excel_workbook(xl_path, printer_name=None, copies=1):
         except Exception as e:
             _reraise_with_step("启动 WPS/Excel（打印）", e)
         try:
-            wb = excel.Workbooks.Open(path, ReadOnly=False, UpdateLinks=0)
+            wb = _open_excel_workbook(excel, path, read_only=False)
         except Exception as e:
             _reraise_with_step("打开工作簿（打印）", e)
         try:
             _excel_scale_cell_pictures_to_fit_merge_area(wb)
             _excel_autofit_rows_outside_matrix(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         try:
             _unify_header_fill_gray(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         try:
             _excel_unify_row_borders_inconsistent_only(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         try:
             _apply_excel_print_layout_for_readability(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         try:
             _ensure_print_area_covers_used_range(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         try:
             _normalize_page_markers_safe(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         if printer_name:
             line = _printer_line_for_excel_com(printer_name)
             applied = False
@@ -1648,8 +1970,9 @@ def print_excel_workbook(xl_path, printer_name=None, copies=1):
                     _reraise_with_step("设置打印机（COM 与系统默认均失败）", e)
         try:
             _refresh_excel_pagination_before_print(wb)
-        except Exception:
-            pass
+        except Exception as e:
+            if isinstance(e, _EXCEL_STOP_EXCEPTIONS):
+                raise
         if _is_pdf_printer(printer_name):
             out_pdf = _desktop_pdf_path(path)
             try:

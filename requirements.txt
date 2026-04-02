@@ -11,3 +11,5 @@ flask>=3.0.0
 # 在线签名：可选 MySQL 共享上传列表（配置 MYSQL_HOST 后启用）
 PyMySQL>=1.1.0
 python-dotenv>=1.0.0
+# 无 7-Zip 命令行时解压 .7z（.rar 建议安装 7-Zip 或使用 UnRAR）
+py7zr>=0.20.0

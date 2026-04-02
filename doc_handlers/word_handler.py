@@ -9,20 +9,344 @@ import re
 import shutil
 import tempfile
 import time
+import uuid
 import logging
+import subprocess
+from typing import Optional
 
 try:
     import win32com.client
     import pythoncom
     import pywintypes
+    import win32process
 except ImportError:
     win32com = None
     pythoncom = None
     pywintypes = None
+    win32process = None
 
-from config import WORD_PROGID
+from config import get_word_progid, use_wps_runtime
+from doc_handlers.office_pid import (
+    hwnd_chain_to_pid,
+    refresh_pid_after_doc_open,
+    resolve_office_app_pid,
+    tasklist_pids_for_images,
+)
 
 logger = logging.getLogger("aiprintword.word")
+
+
+def convert_doc_to_docx(src_path: str, dst_path: Optional[str] = None) -> str:
+    """
+    将 .doc 转为 .docx（用于启用 XML 表格计数与更稳定的后续处理）。
+    失败时抛异常；调用方可自行回退按原文件处理。
+    """
+    if win32com is None:
+        raise RuntimeError("请安装 pywin32: pip install pywin32")
+    src = os.path.abspath(src_path)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(src)
+    ext = os.path.splitext(src)[1].lower()
+    if ext != ".doc":
+        return src
+    if dst_path:
+        dst = os.path.abspath(dst_path)
+    else:
+        d = os.path.dirname(src) or os.getcwd()
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            d = os.path.dirname(src)
+        stem = os.path.splitext(os.path.basename(src))[0]
+        dst = os.path.join(d, f"{stem}._aiprint_{uuid.uuid4().hex[:10]}.docx")
+        dst = os.path.abspath(dst)
+    word = None
+    doc = None
+    try:
+        word = _get_word_app(visible=False)
+        doc = _open_word_document(word, src, read_only=False)
+        # Word 常量：wdFormatXMLDocument = 12
+        try:
+            _com_call(doc.SaveAs2, dst, FileFormat=12)
+        except Exception:
+            _com_call(doc.SaveAs, dst)
+        return dst
+    finally:
+        _word_post_document_cleanup(word, doc, mark_doc_saved=True)
+
+
+def docx_table_count_hint(path: str) -> int:
+    """
+    对 .docx/.docm 快速统计 word/document.xml 中 w:tbl 数量（不启动 Word）。
+    失败或非 OOXML 时返回 -1。
+    """
+    try:
+        import zipfile
+        import xml.etree.ElementTree as ET
+
+        p = os.path.abspath(path)
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in (".docx", ".docm"):
+            return -1
+        with zipfile.ZipFile(p, "r") as zf:
+            data = zf.read("word/document.xml")
+        root = ET.fromstring(data)
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        return len(root.findall(".//w:tbl", ns))
+    except Exception:
+        return -1
+
+
+def docx_table_row_count_hint(path: str) -> int:
+    """
+    对 .docx/.docm 快速统计 word/document.xml 中所有表格行 w:tr 总数（含嵌套表，不启动 Word）。
+    失败或非 OOXML 时返回 -1。
+    """
+    try:
+        import zipfile
+        import xml.etree.ElementTree as ET
+
+        p = os.path.abspath(path)
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in (".docx", ".docm"):
+            return -1
+        with zipfile.ZipFile(p, "r") as zf:
+            data = zf.read("word/document.xml")
+        root = ET.fromstring(data)
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        return len(root.findall(".//w:tbl//w:tr", ns))
+    except Exception:
+        return -1
+
+
+def word_lite_repair_many_tables_save(
+    doc_path,
+    save_path=None,
+    change_notes=None,
+    full_change_log=None,
+):
+    """
+    表格行数多、处理耗时场景：仅接受修订、去标黄/高亮、按字体策略统一、更新目录与页码后保存。
+    不执行全文正式性检查、删删除线、表格自适应、单元格内图片缩放、水印清理、图片风险对比等重步骤。
+
+    为控制 COM 调用量：不做风险矩阵底纹快照（表格极多时逐格读写很慢）；不按段落再扫一遍字体
+   （StoryRanges + Content 已覆盖主故事）；接受修订阶段不重复执行内置全量域更新（由后续
+    _ensure_toc_updated 统一处理）。
+    """
+    if win32com is None:
+        raise RuntimeError("请安装 pywin32: pip install pywin32")
+    path = os.path.abspath(doc_path)
+    save_path = os.path.abspath(save_path) if save_path else path
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    word = None
+    doc = None
+    backup_path = None
+    try:
+        try:
+            fd, backup_path = _mkstemp_word_backup()
+            os.close(fd)
+            shutil.copyfile(path, backup_path)
+        except Exception:
+            backup_path = None
+
+        word = _get_word_app(visible=False)
+        doc = _open_word_document(word, path, read_only=False)
+        pages_before = _get_doc_page_count(doc) if WORD_PRESERVE_PAGE_COUNT else None
+        try:
+            doc.TrackRevisions = False
+        except Exception:
+            pass
+        n_rev = 0
+        try:
+            n_rev = int(doc.Revisions.Count)
+        except Exception:
+            pass
+        _accept_all_revisions_in_document(doc, skip_builtin_toc_pass=True)
+        if change_notes is not None and n_rev > 0:
+            change_notes.append(f"已接受全部修订（约 {n_rev} 处跟踪更改）")
+        wdStoryTypes = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+        for stType in wdStoryTypes:
+            try:
+                r = doc.StoryRanges(stType)
+                while r is not None:
+                    try:
+                        r.HighlightColorIndex = wdNoHighlight
+                        r.Font.Color = wdColorBlack
+                        _apply_font_profile_to_range(r)
+                    except Exception:
+                        pass
+                    try:
+                        r = r.NextStoryRange
+                    except Exception:
+                        break
+            except Exception:
+                pass
+        try:
+            doc.Content.Font.Color = wdColorBlack
+            _apply_font_profile_to_range(doc.Content)
+            doc.Content.HighlightColorIndex = wdNoHighlight
+        except Exception:
+            pass
+        n_com = 0
+        try:
+            n_com = int(doc.Comments.Count)
+        except Exception:
+            pass
+        _delete_all_comments_robust(doc)
+        if change_notes is not None and n_com > 0:
+            change_notes.append(f"已删除 {n_com} 条批注")
+        if change_notes is not None:
+            change_notes.append(
+                "【多表格轻量】已去除高亮与标黄、将非黑色字体改为黑色并统一为「"
+                + _word_font_profile_label()
+                + "」（为缩短耗时未做风险矩阵颜色保留；已跳过全文正式性检查、删删除线、"
+                "表格自适应与图片缩放等；若须保留风险矩阵色，请提高「表格行轻量阈值」使该文档走完整流程）"
+            )
+        _ensure_toc_updated(doc)
+        _sync_page_numbers_after_edit(doc)
+        _check_page_count_unchanged_or_restore(doc, pages_before, backup_path, path)
+        _finalize_no_track_changes_state(doc)
+        _save_doc(doc, path, save_path)
+        return True
+    except Exception as e:
+        try:
+            if getattr(e, "args", (None,))[0] in (COM_E_EXCEPTION, COM_E_FAIL):
+                raise RuntimeError(
+                    "文档处理时发生意外，请确认 WPS 已安装、文档未被占用，或稍后重试。"
+                ) from e
+        except RuntimeError:
+            raise
+        raise
+    finally:
+        _word_post_document_cleanup(word, doc, mark_doc_saved=True)
+        if backup_path:
+            try:
+                if os.path.isfile(backup_path):
+                    os.remove(backup_path)
+            except Exception:
+                pass
+
+# 记录最近创建的 Word 应用 PID，供超时/取消时强制结束（避免 COM 永久卡死）
+_LAST_WORD_PID = None
+
+# 整批连续 Word：同一线程内复用 Application，仅开关文档（run_batch 内开启；遇 Excel/PDF 或批末关闭）
+_word_batch_session_active = False
+_word_batch_cached_app = None
+
+
+def word_batch_session_active() -> bool:
+    return bool(_word_batch_session_active)
+
+
+def word_batch_session_begin() -> None:
+    """在即将处理 Word 文件前调用；已在会话中则为空操作。"""
+    global _word_batch_session_active
+    _word_batch_session_active = True
+
+
+def word_batch_session_end() -> None:
+    """结束批量 Word 会话：关闭残留文档并退出进程（无会话则为空操作）。"""
+    global _word_batch_session_active, _word_batch_cached_app, _LAST_WORD_PID
+    if not _word_batch_session_active:
+        return
+    _word_batch_session_active = False
+    w = _word_batch_cached_app
+    _word_batch_cached_app = None
+    if w:
+        try:
+            for _ in range(80):
+                try:
+                    if int(w.Documents.Count) <= 0:
+                        break
+                except Exception:
+                    break
+                try:
+                    w.Documents(1).Close(SaveChanges=False)
+                except Exception:
+                    break
+        except Exception:
+            pass
+        try:
+            w.Quit()
+        except Exception:
+            pass
+    _LAST_WORD_PID = None
+    time.sleep(1)
+    if pythoncom:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _word_batch_drop_cached_app() -> None:
+    """进程已被 kill 或 COM 失效时丢弃缓存，下次将重新 Dispatch。"""
+    global _word_batch_cached_app, _LAST_WORD_PID
+    _word_batch_cached_app = None
+    _LAST_WORD_PID = None
+
+
+def _word_post_document_cleanup(word, doc, *, mark_doc_saved=False):
+    """
+    关闭当前文档；批量复用模式下不 Quit Word。
+    mark_doc_saved：规范化保存路径在 Close 前标记已保存，避免提示。
+    """
+    if doc:
+        try:
+            if mark_doc_saved:
+                doc.Saved = True
+            doc.Close(SaveChanges=False)
+        except Exception:
+            pass
+    if word_batch_session_active():
+        time.sleep(0.25)
+        return
+    if word:
+        try:
+            word.Quit()
+        except Exception:
+            pass
+    time.sleep(1)
+    if pythoncom:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _word_host_image_names():
+    return ("wps.exe",) if use_wps_runtime() else ("WINWORD.EXE",)
+
+
+def _try_get_app_pid(app):
+    """从 COM Application 的窗口链推导 PID（WPS 常 Hwnd=0，需多源尝试）。"""
+    return hwnd_chain_to_pid(app, win32process)
+
+
+def kill_last_word_app(reason="timeout_or_cancel"):
+    """强制结束最近创建的 Word/WPS Writer 进程（仅本工具创建的那个 PID）。"""
+    global _LAST_WORD_PID
+    pid = _LAST_WORD_PID
+    if not pid:
+        logger.warning(
+            "kill_last_word_app skipped: no PID (reason=%s)；单文件超时/跳过可能无法打断卡死的 COM",
+            reason,
+        )
+        return False
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        logger.warning("killed word pid=%s reason=%s", pid, reason)
+        _word_batch_drop_cached_app()
+        return True
+    except Exception:
+        return False
 
 # 修改明细文件中单条文本预览长度（删除线等）
 _MAX_CHANGE_TEXT_PREVIEW = 100
@@ -43,24 +367,75 @@ def _sanitize_change_preview(text, max_len=_MAX_CHANGE_TEXT_PREVIEW):
     return t
 
 
-# 内容保真优先：默认开启。开启后避免执行可能导致图形/图片对象丢失的激进清理步骤。
-WORD_CONTENT_PRESERVE = (
-    str(os.environ.get("WORD_CONTENT_PRESERVE", "1")).strip().lower() not in ("0", "false", "no", "off")
-)
-# 图片风险检测：默认开启；采用“图片对象”级判定，尽量降低误报。
-WORD_IMAGE_RISK_GUARD = (
-    str(os.environ.get("WORD_IMAGE_RISK_GUARD", "1")).strip().lower() not in ("0", "false", "no", "off")
-)
-# 图片保全模式：先将链接图片断链并内嵌，再避免触发会重新解析外链的域刷新步骤。
-WORD_PRESERVE_LINKED_IMAGES = (
-    str(os.environ.get("WORD_PRESERVE_LINKED_IMAGES", "0")).strip().lower()
-    in ("1", "true", "yes", "on")
-)
-# 页眉页脚自动修复：默认开启；仅保存模式可按请求关闭，避免改动原模板排版。
-WORD_HEADER_FOOTER_LAYOUT_FIX = (
-    str(os.environ.get("WORD_HEADER_FOOTER_LAYOUT_FIX", "1")).strip().lower()
-    not in ("0", "false", "no", "off")
-)
+# Word 模块级开关：由 apply_resolved_word_base_settings() 从库内配置 / .env / 默认值加载；
+# 每批任务开始前 batch_print 会再次调用，随后 set_runtime_options 可按单次请求覆盖。
+WORD_CONTENT_PRESERVE = True
+WORD_IMAGE_RISK_GUARD = True
+WORD_PRESERVE_LINKED_IMAGES = False
+WORD_HEADER_FOOTER_LAYOUT_FIX = True
+WORD_STEP_TIMEOUT_SEC = 3600.0
+WORD_SKIP_FILE_ON_TIMEOUT = True
+# 页数保护备份目录：SSD 路径可减少慢盘与杀毒实时扫描干扰（留空用系统 TEMP）
+WORD_BACKUP_TEMP_DIR = ""
+
+
+class WordStepTimeout(RuntimeError):
+    pass
+
+
+def _mkstemp_word_backup(suffix=".docx"):
+    """页数保护等临时备份；目录由 WORD_BACKUP_TEMP_DIR / 配置项指定。"""
+    d = (WORD_BACKUP_TEMP_DIR or "").strip()
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            d = ""
+    kw = {"prefix": "aiprintword_wordbak_", "suffix": suffix}
+    if d:
+        kw["dir"] = d
+    return tempfile.mkstemp(**kw)
+
+
+class FileAbortRequested(Exception):
+    """单文件总超时/取消/手动跳过：在下一 COM 调用前中止（与看门狗 kill 配合）。"""
+
+
+# 由 batch_print 在每文件开始时设置，结束时清空；用于在 _com_call 等处协作退出。
+WORD_FILE_ABORT_EVENT = None
+
+
+def set_word_file_abort_event(ev):
+    """ev 为 threading.Event；置位后下一 COM 包装调用将抛出 FileAbortRequested。"""
+    global WORD_FILE_ABORT_EVENT
+    WORD_FILE_ABORT_EVENT = ev
+
+
+def clear_word_file_abort_event():
+    global WORD_FILE_ABORT_EVENT
+    WORD_FILE_ABORT_EVENT = None
+
+
+def _check_file_abort():
+    ev = WORD_FILE_ABORT_EVENT
+    if ev is not None and ev.is_set():
+        raise FileAbortRequested("单文件总耗时已超过限制，已中止处理")
+
+
+def _step_timed_out(t0, timeout_sec=None):
+    try:
+        limit = float(timeout_sec) if timeout_sec is not None else float(WORD_STEP_TIMEOUT_SEC)
+    except Exception:
+        limit = 3600.0
+    if limit <= 0:
+        return False
+    return (time.perf_counter() - float(t0)) >= limit
+
+
+def _raise_or_mark_timeout(step_name):
+    if WORD_SKIP_FILE_ON_TIMEOUT:
+        raise WordStepTimeout(f"【超时跳过】步骤「{step_name}」超过 {int(WORD_STEP_TIMEOUT_SEC)} 秒，已标记该文件需人工处理")
+    raise WordStepTimeout(f"【超时】步骤「{step_name}」超过 {int(WORD_STEP_TIMEOUT_SEC)} 秒")
 
 
 def _snapshot_visual_objects(doc):
@@ -239,7 +614,11 @@ FONT_NAME_LATIN = "Times New Roman"
 WORD_FONT_PROFILE = "mixed"
 # 页眉页脚：1= primary, 2= first page, 3= even
 wdHeaderFooterPrimary = 1
-# 域类型：页码、目录
+# 域类型：页码、目录（保全链接图时用选择性更新，不全量 Fields.Update）
+wdFieldPageRef = 25
+wdFieldNumPages = 26
+wdFieldSection = 28
+wdFieldSectionPages = 30
 wdFieldPage = 33
 wdFieldTOC = 37
 # 统计类型：页数（强制重算布局时常用）
@@ -262,10 +641,35 @@ wdBorderHorizontal = -5
 wdBorderVertical = -6
 
 # 总页数保护：处理前后 ComputeStatistics 页数不一致则中止保存并恢复备份（默认开启）
-WORD_PRESERVE_PAGE_COUNT = (
-    str(os.environ.get("WORD_PRESERVE_PAGE_COUNT", "1")).strip().lower()
-    not in ("0", "false", "no", "off")
-)
+WORD_PRESERVE_PAGE_COUNT = True
+
+
+def apply_resolved_word_base_settings():
+    """
+    从 runtime_settings（MySQL / 环境变量 / 默认值）刷新 Word 相关全局开关。
+    在 run_batch 开头调用；单次请求仍可通过 set_runtime_options 覆盖。
+    """
+    from runtime_settings.resolve import get_setting
+
+    global WORD_CONTENT_PRESERVE, WORD_IMAGE_RISK_GUARD, WORD_PRESERVE_LINKED_IMAGES
+    global WORD_HEADER_FOOTER_LAYOUT_FIX, WORD_STEP_TIMEOUT_SEC, WORD_SKIP_FILE_ON_TIMEOUT
+    global WORD_PRESERVE_PAGE_COUNT, WORD_BACKUP_TEMP_DIR
+    try:
+        WORD_CONTENT_PRESERVE = bool(get_setting("WORD_CONTENT_PRESERVE"))
+        WORD_IMAGE_RISK_GUARD = bool(get_setting("WORD_IMAGE_RISK_GUARD"))
+        WORD_PRESERVE_LINKED_IMAGES = bool(get_setting("WORD_PRESERVE_LINKED_IMAGES"))
+        WORD_HEADER_FOOTER_LAYOUT_FIX = bool(get_setting("WORD_HEADER_FOOTER_LAYOUT_FIX"))
+        WORD_STEP_TIMEOUT_SEC = float(get_setting("WORD_STEP_TIMEOUT_SEC"))
+        WORD_SKIP_FILE_ON_TIMEOUT = bool(get_setting("WORD_SKIP_FILE_ON_TIMEOUT"))
+        WORD_PRESERVE_PAGE_COUNT = bool(get_setting("WORD_PRESERVE_PAGE_COUNT"))
+        WORD_BACKUP_TEMP_DIR = str(
+            get_setting("AIPRINTWORD_WORD_BACKUP_TEMP_DIR") or ""
+        ).strip()
+    except Exception:
+        pass
+
+
+apply_resolved_word_base_settings()
 
 
 def set_runtime_options(
@@ -274,11 +678,15 @@ def set_runtime_options(
     word_preserve_page_count=None,
     word_image_risk_guard=None,
     word_preserve_linked_images=None,
+    word_step_timeout_sec=None,
+    word_skip_file_on_timeout=None,
     word_header_footer_layout_fix=None,
     word_font_profile=None,
 ):
     """按请求级别动态设置运行开关（本进程内生效）。"""
-    global WORD_CONTENT_PRESERVE, WORD_PRESERVE_PAGE_COUNT, WORD_IMAGE_RISK_GUARD, WORD_PRESERVE_LINKED_IMAGES, WORD_HEADER_FOOTER_LAYOUT_FIX, WORD_FONT_PROFILE
+    global WORD_CONTENT_PRESERVE, WORD_PRESERVE_PAGE_COUNT, WORD_IMAGE_RISK_GUARD, WORD_PRESERVE_LINKED_IMAGES
+    global WORD_STEP_TIMEOUT_SEC, WORD_SKIP_FILE_ON_TIMEOUT
+    global WORD_HEADER_FOOTER_LAYOUT_FIX, WORD_FONT_PROFILE
     if word_content_preserve is not None:
         WORD_CONTENT_PRESERVE = bool(word_content_preserve)
     if word_preserve_page_count is not None:
@@ -287,6 +695,13 @@ def set_runtime_options(
         WORD_IMAGE_RISK_GUARD = bool(word_image_risk_guard)
     if word_preserve_linked_images is not None:
         WORD_PRESERVE_LINKED_IMAGES = bool(word_preserve_linked_images)
+    if word_step_timeout_sec is not None:
+        try:
+            WORD_STEP_TIMEOUT_SEC = float(word_step_timeout_sec)
+        except Exception:
+            pass
+    if word_skip_file_on_timeout is not None:
+        WORD_SKIP_FILE_ON_TIMEOUT = bool(word_skip_file_on_timeout)
     if word_header_footer_layout_fix is not None:
         WORD_HEADER_FOOTER_LAYOUT_FIX = bool(word_header_footer_layout_fix)
     if word_font_profile is not None:
@@ -455,18 +870,26 @@ def _is_risk_matrix_table(table):
         nc = int(table.Columns.Count)
         if nr < 2 or nc < 2:
             return False
+        slots = nr * nc
+        if slots < 4:
+            return False
+        need = max(4, slots // 4)
         count_risk = 0
-        total = 0
+        k = 0
         for ri in range(1, nr + 1):
             for ci in range(1, nc + 1):
+                k += 1
                 try:
                     cell = table.Cell(ri, ci)
-                    total += 1
                     if _cell_has_risk_color(cell):
                         count_risk += 1
+                        if count_risk >= need:
+                            return True
                 except Exception:
                     pass
-        return total >= 4 and count_risk >= max(4, total // 4)
+                if count_risk + (slots - k) < need:
+                    return False
+        return count_risk >= need
     except Exception:
         return False
 
@@ -557,18 +980,37 @@ def _range_in_risk_matrix(doc, start, end):
 
 
 def _get_word_app(visible=False):
-    """获取或创建 Word Application 实例。当前线程需已调用 CoInitialize。"""
+    """获取或创建 Word Application 实例。批量复用模式下返回同一线程内已缓存的 Application。"""
     if win32com is None:
         raise RuntimeError("请安装 pywin32: pip install pywin32")
+    _check_file_abort()
+    global _word_batch_cached_app
+    if word_batch_session_active() and _word_batch_cached_app is not None:
+        try:
+            _ = _word_batch_cached_app.Documents.Count
+            return _word_batch_cached_app
+        except Exception:
+            _word_batch_drop_cached_app()
     try:
         pythoncom.CoInitialize()
     except Exception:
         pass
+    before = tasklist_pids_for_images(_word_host_image_names())
     for attempt in range(3):
         try:
-            word = win32com.client.dynamic.Dispatch(WORD_PROGID)
+            _check_file_abort()
+            word = win32com.client.dynamic.Dispatch(get_word_progid())
             word.Visible = False
             word.DisplayAlerts = 0  # wdAlertsNone，禁止一切弹窗
+            try:
+                global _LAST_WORD_PID
+                _LAST_WORD_PID = resolve_office_app_pid(
+                    word, win32process, _word_host_image_names(), before
+                )
+            except Exception:
+                _LAST_WORD_PID = _try_get_app_pid(word)
+            if word_batch_session_active():
+                _word_batch_cached_app = word
             return word
         except Exception as e:
             is_rpc = getattr(e, "args", (None,))[0] in RPC_RETRY_CODES
@@ -578,6 +1020,72 @@ def _get_word_app(visible=False):
             raise
 
 
+def _open_word_document(word, path, *, read_only=True):
+    """打开文档并在打开后刷新 _LAST_WORD_PID（窗口句柄常在此后才可用）。"""
+    doc = _com_call(
+        word.Documents.Open,
+        path,
+        ReadOnly=read_only,
+        AddToRecentFiles=False,
+    )
+    try:
+        global _LAST_WORD_PID
+        np = refresh_pid_after_doc_open(word, win32process)
+        if np:
+            _LAST_WORD_PID = np
+    except Exception:
+        pass
+    return doc
+
+
+def verify_word_saved_no_pending_revisions(path: str):
+    """
+    仅保存任务落盘后：只读再次打开，检查是否仍有未接受修订。
+    用于避免「界面显示成功但 ZIP/成品仍为旧稿或未合并修订」的假成功。
+    返回 (True, "") 或 (False, 原因说明)。
+    """
+    if win32com is None:
+        return True, ""
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        return False, "成品路径不存在，无法校验"
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".doc", ".docx", ".docm"):
+        return True, ""
+    word = None
+    doc = None
+    out_ok, out_msg = True, ""
+    try:
+        word = _get_word_app(visible=False)
+        doc = _open_word_document(word, path, read_only=True)
+        try:
+            n_rev = int(doc.Revisions.Count)
+        except Exception:
+            n_rev = -1
+        if n_rev > 0:
+            out_ok, out_msg = (
+                False,
+                f"仍检测到约 {n_rev} 处未接受修订，请用 Word/WPS 打开合并修订后保存",
+            )
+        else:
+            try:
+                if bool(doc.TrackRevisions):
+                    out_ok, out_msg = (
+                        False,
+                        "文档仍开启「修订」跟踪，请关闭修订跟踪后保存",
+                    )
+            except Exception:
+                pass
+    except Exception as e:
+        out_ok, out_msg = False, "二次打开校验失败：" + str(e)
+    finally:
+        try:
+            _word_post_document_cleanup(word, doc, mark_doc_saved=False)
+        except Exception:
+            pass
+    return out_ok, out_msg
+
+
 def _com_call(func, *args, retries=3, delay=2, **kwargs):
     """
     带重试的 COM 调用包装器。
@@ -585,7 +1093,10 @@ def _com_call(func, *args, retries=3, delay=2, **kwargs):
     """
     for attempt in range(retries):
         try:
+            _check_file_abort()
             return func(*args, **kwargs)
+        except FileAbortRequested:
+            raise
         except Exception as e:
             code = getattr(e, "args", (None,))[0]
             if code in RPC_RETRY_CODES and attempt < retries - 1:
@@ -599,6 +1110,7 @@ def _save_doc(doc, original_path, save_path):
     保存文档：当目标路径与原路径相同时用 doc.Save() 避免格式弹窗；
     不同路径时用 doc.SaveAs()。
     """
+    _check_file_abort()
     if os.path.normcase(os.path.abspath(save_path)) == os.path.normcase(os.path.abspath(original_path)):
         doc.Save()
     else:
@@ -639,23 +1151,11 @@ def _extract_field_value(cover_text, keyword, next_keywords):
     return cover_text[start:end].strip()
 
 
-def check_cover_signature(doc_path):
+def _check_cover_signature_on_doc(doc):
     """
-    检查 Word 文档封面页签字是否完成。
-    通过封面页（第一页）的 作者、审核、批准、日期 是否为空判断。
-    任一为空则视为签字未完成。
+    对已打开的 Word 文档做封面签字检查（不 Open / Quit），供单次会话内调用。
     """
-    if win32com is None:
-        return True, "未安装 pywin32，跳过签字检查"
-    path = os.path.abspath(doc_path)
-    if not os.path.isfile(path):
-        return False, "文件不存在"
-    word = None
-    doc = None
     try:
-        word = _get_word_app(visible=False)
-        doc = _com_call(word.Documents.Open, path, ReadOnly=True, AddToRecentFiles=False)
-        # 获取第一页文本
         try:
             r1 = doc.GoTo(wdGoToPage, wdGoToFirst, 1)
             p1_start = r1.Start
@@ -668,7 +1168,6 @@ def check_cover_signature(doc_path):
             p2_start = min(p1_start + 8000, doc.Content.End)
         cover_range = doc.Range(p1_start, min(p2_start, doc.Content.End))
         cover_text = cover_range.Text or ""
-        # 检查 作者、审核、批准、日期
         next_kw = ["审核", "批准", "日期"]
         author = _extract_field_value(cover_text, "作者", next_kw)
         next_kw = ["批准", "日期"]
@@ -687,22 +1186,29 @@ def check_cover_signature(doc_path):
         return True, "封面签字检查通过（作者、审核、批准、日期均已填写）"
     except Exception as e:
         return False, f"签字检查异常: {e}"
+
+
+def check_cover_signature(doc_path):
+    """
+    检查 Word 文档封面页签字是否完成。
+    通过封面页（第一页）的 作者、审核、批准、日期 是否为空判断。
+    任一为空则视为签字未完成。
+    """
+    if win32com is None:
+        return True, "未安装 pywin32，跳过签字检查"
+    path = os.path.abspath(doc_path)
+    if not os.path.isfile(path):
+        return False, "文件不存在"
+    word = None
+    doc = None
+    try:
+        word = _get_word_app(visible=False)
+        doc = _open_word_document(word, path, read_only=True)
+        return _check_cover_signature_on_doc(doc)
+    except Exception as e:
+        return False, f"签字检查异常: {e}"
     finally:
-        if doc:
-            try:
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=False)
 
 
 # 草稿水印关键词（页眉页脚 Shape 文本包含任一则视为非正式）
@@ -775,6 +1281,7 @@ def _embed_linked_pictures(doc, change_notes=None, full_change_log=None):
     """
     if not WORD_PRESERVE_LINKED_IMAGES:
         return
+    t0 = time.perf_counter()
     converted = 0
     failures = 0
 
@@ -805,6 +1312,8 @@ def _embed_linked_pictures(doc, change_notes=None, full_change_log=None):
 
     try:
         for i in range(1, int(doc.InlineShapes.Count) + 1):
+            if _step_timed_out(t0):
+                _raise_or_mark_timeout("图片断链内嵌")
             try:
                 _break_link_obj(doc.InlineShapes(i))
             except Exception:
@@ -814,6 +1323,8 @@ def _embed_linked_pictures(doc, change_notes=None, full_change_log=None):
 
     try:
         for i in range(1, int(doc.Shapes.Count) + 1):
+            if _step_timed_out(t0):
+                _raise_or_mark_timeout("图片断链内嵌")
             try:
                 _break_link_obj(doc.Shapes(i))
             except Exception:
@@ -831,6 +1342,8 @@ def _embed_linked_pictures(doc, change_notes=None, full_change_log=None):
                         if not hf.Exists:
                             continue
                         for i in range(1, int(hf.Shapes.Count) + 1):
+                            if _step_timed_out(t0):
+                                _raise_or_mark_timeout("图片断链内嵌")
                             try:
                                 _break_link_obj(hf.Shapes(i))
                             except Exception:
@@ -1070,12 +1583,11 @@ def _has_toc_error_or_unupdated(doc):
     return False
 
 
-def _ensure_toc_updated(doc):
-    """更新所有目录域与域结果。"""
-    if WORD_PRESERVE_LINKED_IMAGES:
-        return
+def _update_toc_tables_only(doc):
+    """仅通过 TablesOfContents 更新目录（与全量 doc.Fields.Update 分离）。"""
     n_toc, toc_coll = _tables_of_contents_safe(doc)
-    if n_toc and toc_coll:
+    if not n_toc or not toc_coll:
+        return
         try:
             for i in range(1, n_toc + 1):
                 try:
@@ -1084,6 +1596,67 @@ def _ensure_toc_updated(doc):
                     pass
         except Exception:
             pass
+
+
+def _field_is_toc_or_pagination(field):
+    """是否目录/页码/节页等与分页、目录相关的域（不含 HYPERLINK、INCLUDEPICTURE 等）。"""
+    try:
+        ft = int(getattr(field, "Type", -999))
+    except Exception:
+        return False
+    return ft in (
+        wdFieldPageRef,
+        wdFieldNumPages,
+        wdFieldSection,
+        wdFieldSectionPages,
+        wdFieldPage,
+        wdFieldTOC,
+    )
+
+
+def _update_pagination_fields_selective(doc):
+    """不调用 doc.Fields.Update()，只刷新目录/页码类域（正文 + 页眉页脚），降低链接图被全量刷新破坏的风险。"""
+    try:
+        for i in range(1, int(doc.Fields.Count) + 1):
+            try:
+                f = doc.Fields(i)
+                if _field_is_toc_or_pagination(f):
+                    f.Update()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        for si in range(1, doc.Sections.Count + 1):
+            sec = doc.Sections(si)
+            for hf_type in (1, 2, 3):
+                for hf_getter in (sec.Headers, sec.Footers):
+                    try:
+                        hf = hf_getter(hf_type)
+                        if not hf.Exists:
+                            continue
+                        r = hf.Range
+                        if r is None:
+                            continue
+                        for fi in range(1, int(r.Fields.Count) + 1):
+                            try:
+                                f2 = r.Fields(fi)
+                                if _field_is_toc_or_pagination(f2):
+                                    f2.Update()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _ensure_toc_updated(doc):
+    """更新所有目录域与域结果。"""
+    _update_toc_tables_only(doc)
+    if WORD_PRESERVE_LINKED_IMAGES:
+        _update_pagination_fields_selective(doc)
+        return
     try:
         doc.Fields.Update()
     except Exception:
@@ -1133,8 +1706,11 @@ def _word_scale_table_inline_pictures_to_fit(doc):
     """
     wdInlineShapePicture = 3
     wdInlineShapeLinkedPicture = 4
+    t0 = time.perf_counter()
     try:
         for ti in range(1, doc.Tables.Count + 1):
+            if _step_timed_out(t0):
+                _raise_or_mark_timeout("表格图片缩放")
             tbl = doc.Tables(ti)
             try:
                 if _is_risk_matrix_table(tbl):
@@ -1146,6 +1722,8 @@ def _word_scale_table_inline_pictures_to_fit(doc):
             except Exception:
                 continue
             for ci in range(1, nc + 1):
+                if _step_timed_out(t0):
+                    _raise_or_mark_timeout("表格图片缩放")
                 try:
                     cell = tbl.Cells(ci)
                     rng = cell.Range
@@ -1162,6 +1740,8 @@ def _word_scale_table_inline_pictures_to_fit(doc):
                         continue
                     nsh = int(rng.InlineShapes.Count)
                     for j in range(1, nsh + 1):
+                        if _step_timed_out(t0):
+                            _raise_or_mark_timeout("表格图片缩放")
                         try:
                             ish = rng.InlineShapes(j)
                             it = int(ish.Type)
@@ -1372,12 +1952,20 @@ def _cleanup_extra_page_breaks(doc, change_notes=None):
         change_notes.append("已调整主文档分页符（合并连续分页或删除文末多余分页符）")
 
 
-def auto_fix_formal_word(doc_path, save_path=None, change_notes=None, full_change_log=None):
+def auto_fix_formal_word(
+    doc_path,
+    save_path=None,
+    change_notes=None,
+    full_change_log=None,
+    *,
+    run_cover_check=False,
+):
     """
     正式性检查失败后自动修复。执行顺序：表格排版 → 统一表格框线 → 去高亮/统一字体/去水印 → 目录更新 → 接受修订 → 删除批注 → 页眉页脚与页码补齐 → 保存。
     非风险矩阵中的标红、标黄、标绿会被修复为黑色；风险矩阵内保留。
     change_notes：传入 list 时追加格式/内容变更说明（供仅保存模式展示）。
     full_change_log：传入 list 时追加删除线、水印等逐条记录（写入下载包「修改明细」）。
+    run_cover_check：为 True 时在保存前对当前文档做封面签字检查（仅追加提示，不中断保存）。
     """
     if win32com is None:
         raise RuntimeError("请安装 pywin32: pip install pywin32")
@@ -1390,14 +1978,14 @@ def auto_fix_formal_word(doc_path, save_path=None, change_notes=None, full_chang
     backup_path = None
     try:
         try:
-            fd, backup_path = tempfile.mkstemp(prefix="aiprintword_wordbak_", suffix=".docx")
+            fd, backup_path = _mkstemp_word_backup()
             os.close(fd)
             shutil.copyfile(path, backup_path)
         except Exception:
             backup_path = None
 
         word = _get_word_app(visible=False)
-        doc = _com_call(word.Documents.Open, path, ReadOnly=False, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=False)
         pages_before = _get_doc_page_count(doc) if WORD_PRESERVE_PAGE_COUNT else None
         try:
             doc.TrackRevisions = False
@@ -1464,10 +2052,7 @@ def auto_fix_formal_word(doc_path, save_path=None, change_notes=None, full_chang
             n_com = int(doc.Comments.Count)
         except Exception:
             pass
-        try:
-            doc.DeleteAllComments()
-        except Exception:
-            pass
+        _delete_all_comments_robust(doc)
         if change_notes is not None and n_com > 0:
             change_notes.append(f"已删除 {n_com} 条批注")
         after_visual = _snapshot_visual_objects(doc)
@@ -1480,6 +2065,11 @@ def auto_fix_formal_word(doc_path, save_path=None, change_notes=None, full_chang
         _apply_formal_header_footer_fixes(doc)
         _sync_page_numbers_after_edit(doc)
         _check_page_count_unchanged_or_restore(doc, pages_before, backup_path, path)
+        if run_cover_check:
+            ok_cov, msg_cov = _check_cover_signature_on_doc(doc)
+            if not ok_cov and change_notes is not None:
+                change_notes.append("封面签字未通过（仍继续保存）：" + msg_cov)
+        _finalize_no_track_changes_state(doc)
         _save_doc(doc, path, save_path)
         return True
     except Exception as e:
@@ -1492,23 +2082,7 @@ def auto_fix_formal_word(doc_path, save_path=None, change_notes=None, full_chang
             raise
         raise
     finally:
-        if doc:
-            try:
-                doc.Saved = True
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        time.sleep(1)
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=True)
         if backup_path:
             try:
                 if os.path.isfile(backup_path):
@@ -1546,7 +2120,7 @@ def check_formal_document(
     doc = None
     try:
         word = _get_word_app(visible=False)
-        doc = _com_call(word.Documents.Open, path, ReadOnly=True, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=True)
 
         if check_revisions:
             n = int(doc.Revisions.Count)
@@ -1671,21 +2245,7 @@ def check_formal_document(
             pass
         return False, [f"正式性检查异常: {e}"]
     finally:
-        if doc:
-            try:
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=False)
 
 
 def has_revisions(doc_path):
@@ -1699,28 +2259,14 @@ def has_revisions(doc_path):
     doc = None
     try:
         word = _get_word_app(visible=False)
-        doc = _com_call(word.Documents.Open, path, ReadOnly=True, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=True)
         revs = doc.Revisions
         count = int(revs.Count)
         return count > 0, count
     except Exception:
         return False, 0
     finally:
-        if doc:
-            try:
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=False)
 
 
 def ensure_font_black(doc_path, save_path=None, remove_highlights=True):
@@ -1741,13 +2287,13 @@ def ensure_font_black(doc_path, save_path=None, remove_highlights=True):
     try:
         if WORD_PRESERVE_PAGE_COUNT:
             try:
-                fd, backup_path = tempfile.mkstemp(prefix="aiprintword_wordbak_", suffix=".docx")
+                fd, backup_path = _mkstemp_word_backup()
                 os.close(fd)
                 shutil.copyfile(path, backup_path)
             except Exception:
                 backup_path = None
         word = _get_word_app(visible=False)
-        doc = _com_call(word.Documents.Open, path, ReadOnly=False, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=False)
         pages_before = _get_doc_page_count(doc) if WORD_PRESERVE_PAGE_COUNT else None
         try:
             doc.Content.Font.Color = wdColorBlack
@@ -1787,23 +2333,7 @@ def ensure_font_black(doc_path, save_path=None, remove_highlights=True):
         _save_doc(doc, path, save_path)
         return True
     finally:
-        if doc:
-            try:
-                doc.Saved = True
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        time.sleep(1)
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=True)
         if backup_path:
             try:
                 if os.path.isfile(backup_path):
@@ -1841,12 +2371,103 @@ def _unify_paragraph_fonts(doc, set_black=True, remove_highlight=True):
         pass
 
 
-def _accept_all_revisions_in_document(doc):
+def _finalize_no_track_changes_state(doc):
+    """
+    保存前强制关闭修订跟踪与「显示标记」视图。
+    否则部分宿主（尤其 WPS）落盘后仍呈修订/草稿视图，或 settings 仍带跟踪标记。
+    """
+    try:
+        doc.TrackRevisions = False
+    except Exception:
+        pass
+    try:
+        doc.ShowRevisions = False
+    except Exception:
+        pass
+    for win_try in (
+        lambda: doc.ActiveWindow,
+        lambda: doc.Windows(1) if int(getattr(doc.Windows, "Count", 0) or 0) >= 1 else None,
+    ):
+        try:
+            aw = win_try()
+            if aw is None:
+                continue
+            v = aw.View
+            try:
+                v.ShowRevisionsAndComments = False
+            except Exception:
+                pass
+            try:
+                v.RevisionsView = 0
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+def _accept_revisions_residual_loop(doc, max_iter=100000):
+    """逐条 Accept 残留修订，避免 Count 很大时 range(Count+1) 不够。"""
+    try:
+        for _ in range(max_iter):
+            try:
+                n = int(doc.Revisions.Count)
+            except Exception:
+                break
+            if n <= 0:
+                break
+            try:
+                doc.Revisions(1).Accept()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+
+def _delete_all_comments_robust(doc):
+    """
+    尽可能删除所有批注/评论。
+    某些 WPS/Word 场景下 doc.DeleteAllComments() 可能无效或部分失败，因此增加按集合逐条删除兜底。
+    """
+    try:
+        n = int(getattr(getattr(doc, "Comments", None), "Count", 0) or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return 0
+    try:
+        doc.DeleteAllComments()
+    except Exception:
+        pass
+    deleted = 0
+    try:
+        for _ in range(n + 5):
+            try:
+                c = doc.Comments(1)
+            except Exception:
+                break
+            try:
+                c.Delete()
+                deleted += 1
+            except Exception:
+                break
+    except Exception:
+        pass
+    try:
+        left = int(doc.Comments.Count)
+    except Exception:
+        left = 0
+    return max(0, n - left)
+
+
+def _accept_all_revisions_in_document(doc, *, skip_builtin_toc_pass=False):
     """
     接受文档中所有修订，包括正文、目录页、页眉页脚、文本框等。
 
     关键：必须先关闭 TrackRevisions，否则后续 Fields.Update / TOC.Update
     会把目录重新生成的内容当作新修订记录下来，导致修订永远清不完。
+
+    skip_builtin_toc_pass=True：不执行末尾的目录/全量域更新与紧随其后的二次修订清理
+    （供多表格轻量路径等调用方在字体等处理之后再统一 _ensure_toc_updated，避免重复 Fields.Update）。
     """
     # ===== 0) 关闭修订跟踪与修订显示，防止后续操作产生新修订 =====
     try:
@@ -1870,17 +2491,25 @@ def _accept_all_revisions_in_document(doc):
     except Exception:
         pass
 
-    # ===== 2) 逐段接受（含目录页每一段） =====
+    t0 = time.perf_counter()
     try:
-        for i in range(1, doc.Paragraphs.Count + 1):
-            try:
-                r = doc.Paragraphs(i).Range
-                if r is not None and int(r.Revisions.Count) > 0:
-                    r.Revisions.AcceptAll()
-            except Exception:
-                pass
+        n_rev_after_bulk = int(doc.Revisions.Count)
     except Exception:
-        pass
+        n_rev_after_bulk = -1
+    # ===== 2) 逐段接受（含目录页每一段）— 无残留修订时跳过，避免表格文档上万段 COM =====
+    if n_rev_after_bulk > 0:
+        try:
+            for i in range(1, doc.Paragraphs.Count + 1):
+                if _step_timed_out(t0):
+                    _raise_or_mark_timeout("接受修订（深扫）")
+                try:
+                    r = doc.Paragraphs(i).Range
+                    if r is not None and int(r.Revisions.Count) > 0:
+                        r.Revisions.AcceptAll()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ===== 3) 全文 Content =====
     try:
@@ -1895,6 +2524,8 @@ def _accept_all_revisions_in_document(doc):
         try:
             r = doc.StoryRanges(stType)
             while r is not None:
+                if _step_timed_out(t0):
+                    _raise_or_mark_timeout("接受修订（深扫）")
                 try:
                     if int(r.Revisions.Count) > 0:
                         r.Revisions.AcceptAll()
@@ -1981,30 +2612,17 @@ def _accept_all_revisions_in_document(doc):
         pass
 
     # ===== 9) 逐条接受残留修订 =====
-    try:
-        for _ in range(int(doc.Revisions.Count) + 1):
-            if int(doc.Revisions.Count) == 0:
-                break
-            try:
-                doc.Revisions(1).Accept()
-            except Exception:
-                break
-    except Exception:
-        pass
+    _accept_revisions_residual_loop(doc)
+
+    if skip_builtin_toc_pass:
+        return
 
     # ===== 10) 更新目录（TrackRevisions 已关闭，不会产生新修订） =====
-    # 图片保全模式下跳过域更新，避免触发链接图片刷新后丢失显示。
-    if not WORD_PRESERVE_LINKED_IMAGES:
-        n_toc, toc_coll = _tables_of_contents_safe(doc)
-        if n_toc and toc_coll:
-            try:
-                for i in range(1, n_toc + 1):
-                    try:
-                        toc_coll(i).Update()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+    # 图片保全模式下避免全量 Fields.Update，仍刷新目录与页码相关域。
+    _update_toc_tables_only(doc)
+    if WORD_PRESERVE_LINKED_IMAGES:
+        _update_pagination_fields_selective(doc)
+    else:
         try:
             doc.Fields.Update()
         except Exception:
@@ -2021,16 +2639,8 @@ def _accept_all_revisions_in_document(doc):
             doc.Revisions.AcceptAll()
     except Exception:
         pass
-    try:
-        for _ in range(int(doc.Revisions.Count) + 1):
-            if int(doc.Revisions.Count) == 0:
-                break
-            try:
-                doc.Revisions(1).Accept()
-            except Exception:
-                break
-    except Exception:
-        pass
+    _accept_revisions_residual_loop(doc)
+    _finalize_no_track_changes_state(doc)
 
 
 def accept_all_revisions_and_save(
@@ -2057,14 +2667,14 @@ def accept_all_revisions_and_save(
     backup_path = None
     try:
         try:
-            fd, backup_path = tempfile.mkstemp(prefix="aiprintword_wordbak_", suffix=".docx")
+            fd, backup_path = _mkstemp_word_backup()
             os.close(fd)
             shutil.copyfile(path, backup_path)
         except Exception:
             backup_path = None
 
         word = _get_word_app(visible=False)
-        doc = _com_call(word.Documents.Open, path, ReadOnly=False, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=False)
         pages_before = _get_doc_page_count(doc) if WORD_PRESERVE_PAGE_COUNT else None
         try:
             doc.TrackRevisions = False
@@ -2131,6 +2741,7 @@ def accept_all_revisions_and_save(
         _apply_formal_header_footer_fixes(doc)
         _sync_page_numbers_after_edit(doc)
         _check_page_count_unchanged_or_restore(doc, pages_before, backup_path, path)
+        _finalize_no_track_changes_state(doc)
         _save_doc(doc, path, save_path)
         return True
     except Exception as e:
@@ -2143,23 +2754,7 @@ def accept_all_revisions_and_save(
             raise
         raise
     finally:
-        if doc:
-            try:
-                doc.Saved = True
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        time.sleep(1)
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=True)
         if backup_path:
             try:
                 if os.path.isfile(backup_path):
@@ -2185,13 +2780,13 @@ def accept_revisions_basic_word(doc_path, save_path=None):
     try:
         if WORD_PRESERVE_PAGE_COUNT:
             try:
-                fd, backup_path = tempfile.mkstemp(prefix="aiprintword_wordbak_", suffix=".docx")
+                fd, backup_path = _mkstemp_word_backup()
                 os.close(fd)
                 shutil.copyfile(path, backup_path)
             except Exception:
                 backup_path = None
         word = _get_word_app(visible=False)
-        doc = _com_call(word.Documents.Open, path, ReadOnly=False, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=False)
         pages_before = _get_doc_page_count(doc) if WORD_PRESERVE_PAGE_COUNT else None
         try:
             doc.TrackRevisions = False
@@ -2218,13 +2813,11 @@ def accept_revisions_basic_word(doc_path, save_path=None):
             doc.Content.HighlightColorIndex = wdNoHighlight
         except Exception:
             pass
-        try:
-            doc.DeleteAllComments()
-        except Exception:
-            pass
+        _delete_all_comments_robust(doc)
         _apply_formal_header_footer_fixes(doc)
         _sync_page_numbers_after_edit(doc)
         _check_page_count_unchanged_or_restore(doc, pages_before, backup_path, path)
+        _finalize_no_track_changes_state(doc)
         _save_doc(doc, path, save_path)
         return True
     except Exception as e:
@@ -2237,23 +2830,7 @@ def accept_revisions_basic_word(doc_path, save_path=None):
             raise
         raise
     finally:
-        if doc:
-            try:
-                doc.Saved = True
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        time.sleep(1)
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=True)
         if backup_path:
             try:
                 if os.path.isfile(backup_path):
@@ -2267,56 +2844,52 @@ def _sync_page_numbers_after_edit(doc):
     批量接受修订/规范化后，总页数或分页常会变，需重算版式并刷新页码域（PAGE/NUMPAGES 等）。
     正文与每节页眉页脚中的域分别更新，兼容页码在页眉页脚的情况。
     """
-    if WORD_PRESERVE_LINKED_IMAGES:
-        return
+    preserve = WORD_PRESERVE_LINKED_IMAGES
     try:
         doc.Repaginate()
     except Exception:
         pass
-    try:
-        for i in range(1, doc.Fields.Count + 1):
-            try:
-                doc.Fields(i).Update()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
-        for si in range(1, doc.Sections.Count + 1):
-            sec = doc.Sections(si)
-            for hf_type in (1, 2, 3):
-                for hf_getter in (sec.Headers, sec.Footers):
-                    try:
-                        hf = hf_getter(hf_type)
-                        if not hf.Exists:
-                            continue
-                        r = hf.Range
-                        if r is None:
-                            continue
-                        n = int(r.Fields.Count)
-                        for fi in range(1, n + 1):
-                            try:
-                                r.Fields(fi).Update()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    n_toc, toc_coll = _tables_of_contents_safe(doc)
-    if n_toc and toc_coll:
+    if preserve:
+        _update_pagination_fields_selective(doc)
+    else:
         try:
-            for i in range(1, n_toc + 1):
+            for i in range(1, doc.Fields.Count + 1):
                 try:
-                    toc_coll(i).Update()
+                    doc.Fields(i).Update()
                 except Exception:
                     pass
         except Exception:
             pass
-    try:
-        doc.Fields.Update()
-    except Exception:
-        pass
+        try:
+            for si in range(1, doc.Sections.Count + 1):
+                sec = doc.Sections(si)
+                for hf_type in (1, 2, 3):
+                    for hf_getter in (sec.Headers, sec.Footers):
+                        try:
+                            hf = hf_getter(hf_type)
+                            if not hf.Exists:
+                                continue
+                            r = hf.Range
+                            if r is None:
+                                continue
+                            n = int(r.Fields.Count)
+                            for fi in range(1, n + 1):
+                                try:
+                                    r.Fields(fi).Update()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    _update_toc_tables_only(doc)
+    if preserve:
+        _update_pagination_fields_selective(doc)
+    else:
+        try:
+            doc.Fields.Update()
+        except Exception:
+            pass
     try:
         doc.Content.ComputeStatistics(wdStatisticPages)
     except Exception:
@@ -2326,31 +2899,35 @@ def _sync_page_numbers_after_edit(doc):
         doc.Repaginate()
     except Exception:
         pass
-    try:
-        doc.Fields.Update()
-    except Exception:
-        pass
-    try:
-        for si in range(1, doc.Sections.Count + 1):
-            sec = doc.Sections(si)
-            for hf_type in (1, 2, 3):
-                for hf_getter in (sec.Headers, sec.Footers):
-                    try:
-                        hf = hf_getter(hf_type)
-                        if not hf.Exists:
-                            continue
-                        r = hf.Range
-                        if r is None:
-                            continue
-                        for fi in range(1, int(r.Fields.Count) + 1):
-                            try:
-                                r.Fields(fi).Update()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+    if preserve:
+        _update_pagination_fields_selective(doc)
+        _update_toc_tables_only(doc)
+    else:
+        try:
+            doc.Fields.Update()
+        except Exception:
+            pass
+        try:
+            for si in range(1, doc.Sections.Count + 1):
+                sec = doc.Sections(si)
+                for hf_type in (1, 2, 3):
+                    for hf_getter in (sec.Headers, sec.Footers):
+                        try:
+                            hf = hf_getter(hf_type)
+                            if not hf.Exists:
+                                continue
+                            r = hf.Range
+                            if r is None:
+                                continue
+                            for fi in range(1, int(r.Fields.Count) + 1):
+                                try:
+                                    r.Fields(fi).Update()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
 
 def _refresh_word_pagination_before_print(doc):
@@ -2359,6 +2936,34 @@ def _refresh_word_pagination_before_print(doc):
     WPS 可能不支持部分 API，逐项 try。
     """
     _sync_page_numbers_after_edit(doc)
+
+
+def _ensure_no_markup_print(word, doc):
+    """
+    确保打印/导出 PDF 不携带修订标记/批注气泡等。
+    说明：是否“打印标记”常是宿主全局选项（WPS/Word UI 设置），仅隐藏视图不一定影响 PrintOut/ExportAsFixedFormat。
+    """
+    # 1) 先尽量切到“无标记”视图（不落盘）
+    try:
+        _finalize_no_track_changes_state(doc)
+    except Exception:
+        pass
+    # 2) 再关掉宿主打印选项（不同版本/WPS 可能不支持部分字段，逐项 try）
+    try:
+        opt = getattr(word, "Options", None)
+        if opt is not None:
+            for k, v in (
+                ("PrintRevisions", False),
+                ("PrintComments", False),
+                ("PrintHiddenText", False),
+                ("PrintFieldCodes", False),
+            ):
+                try:
+                    setattr(opt, k, v)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def print_word_document(doc_path, printer_name=None, copies=1):
@@ -2379,7 +2984,8 @@ def print_word_document(doc_path, printer_name=None, copies=1):
         if printer_name:
             old_printer = word.ActivePrinter
             word.ActivePrinter = printer_name
-        doc = _com_call(word.Documents.Open, path, ReadOnly=True, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=True)
+        _ensure_no_markup_print(word, doc)
         _refresh_word_pagination_before_print(doc)
         if _is_pdf_printer(printer_name):
             out_pdf = _desktop_pdf_path(path)
@@ -2411,23 +3017,7 @@ def print_word_document(doc_path, printer_name=None, copies=1):
                 word.ActivePrinter = old_printer
             except Exception:
                 pass
-        if doc:
-            try:
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        # 给 WPS/Word 时间完全退出，再处理下一份时新建实例不会冲突
-        time.sleep(1)
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=False)
 
 
 def print_word_with_basic_processing_no_save(
@@ -2456,7 +3046,8 @@ def print_word_with_basic_processing_no_save(
         if printer_name:
             old_printer = word.ActivePrinter
             word.ActivePrinter = printer_name
-        doc = _com_call(word.Documents.Open, path, ReadOnly=False, AddToRecentFiles=False)
+        doc = _open_word_document(word, path, read_only=False)
+        _ensure_no_markup_print(word, doc)
         pages_before = _get_doc_page_count(doc) if WORD_PRESERVE_PAGE_COUNT else None
         try:
             doc.TrackRevisions = False
@@ -2518,20 +3109,4 @@ def print_word_with_basic_processing_no_save(
                 word.ActivePrinter = old_printer
             except Exception:
                 pass
-        if doc:
-            try:
-                doc.Saved = True
-                doc.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if word:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        time.sleep(1)
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+        _word_post_document_cleanup(word, doc, mark_doc_saved=True)
