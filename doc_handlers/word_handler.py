@@ -371,10 +371,14 @@ def _sanitize_change_preview(text, max_len=_MAX_CHANGE_TEXT_PREVIEW):
 # 每批任务开始前 batch_print 会再次调用，随后 set_runtime_options 可按单次请求覆盖。
 WORD_CONTENT_PRESERVE = True
 WORD_IMAGE_RISK_GUARD = True
-WORD_PRESERVE_LINKED_IMAGES = False
+# 默认开启：很多“图片丢失/红叉”来源于链接图片（导出 PDF/跨机/COM 打开时更明显）。
+# 如需极致性能可在运行时配置里关闭。
+WORD_PRESERVE_LINKED_IMAGES = True
 WORD_HEADER_FOOTER_LAYOUT_FIX = True
 WORD_STEP_TIMEOUT_SEC = 3600.0
 WORD_SKIP_FILE_ON_TIMEOUT = True
+# 无人值守默认开启：尽量禁止弹窗，并在检测到外部域时跳过“更新域”等会触发安全声明的步骤
+WORD_UNATTENDED = True
 # 页数保护备份目录：SSD 路径可减少慢盘与杀毒实时扫描干扰（留空用系统 TEMP）
 WORD_BACKUP_TEMP_DIR = ""
 
@@ -590,6 +594,98 @@ def _desktop_pdf_path(src_path):
         return out
     ts = time.strftime("%Y%m%d_%H%M%S")
     return os.path.join(desktop, f"{stem}_printed_{ts}.pdf")
+
+
+def _convert_to_pdf_via_soffice(src_path: str, out_pdf: str) -> bool:
+    """
+    使用 LibreOffice/soffice 无头转换为 PDF。
+    目的：完全无人值守（无 WPS 安全声明/保存对话框），且对“导出丢图”更稳。
+    """
+    try:
+        def _candidate_soffice_paths():
+            # 1) PATH
+            p = shutil.which("soffice") or shutil.which("soffice.exe")
+            if p:
+                yield p
+            # 2) env: LIBREOFFICE_PATH
+            envp = (os.environ.get("LIBREOFFICE_PATH") or "").strip().strip('"')
+            if envp:
+                # 允许填安装目录或 soffice.exe 路径
+                if envp.lower().endswith("soffice.exe"):
+                    yield envp
+                else:
+                    yield os.path.join(envp, "program", "soffice.exe")
+                    yield os.path.join(envp, "soffice.exe")
+            # 3) common install locations
+            pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+            pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+            for base in (pf, pf86):
+                if base:
+                    yield os.path.join(base, "LibreOffice", "program", "soffice.exe")
+
+        soffice = None
+        for c in _candidate_soffice_paths():
+            try:
+                if c and os.path.isfile(c):
+                    soffice = c
+                    break
+            except Exception:
+                continue
+        if not soffice:
+            return False
+        src = os.path.abspath(src_path)
+        out_pdf = os.path.abspath(out_pdf)
+        out_dir = os.path.dirname(out_pdf)
+        os.makedirs(out_dir, exist_ok=True)
+
+        stem = os.path.splitext(os.path.basename(src))[0]
+        tmp_pdf = os.path.join(out_dir, stem + ".pdf")
+        if os.path.isfile(tmp_pdf):
+            try:
+                os.remove(tmp_pdf)
+            except Exception:
+                pass
+        cmd = [
+            soffice,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--norestore",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            out_dir,
+            src,
+        ]
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=300,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if p.returncode != 0:
+            return False
+        if not os.path.isfile(tmp_pdf):
+            return False
+        if os.path.abspath(tmp_pdf) != os.path.abspath(out_pdf):
+            try:
+                if os.path.isfile(out_pdf):
+                    os.remove(out_pdf)
+            except Exception:
+                pass
+            try:
+                os.replace(tmp_pdf, out_pdf)
+            except Exception:
+                try:
+                    shutil.copyfile(tmp_pdf, out_pdf)
+                    os.remove(tmp_pdf)
+                except Exception:
+                    return False
+        return os.path.isfile(out_pdf)
+    except Exception:
+        return False
 
 
 # 可重试的 COM 错误码
@@ -1002,6 +1098,26 @@ def _get_word_app(visible=False):
             word = win32com.client.dynamic.Dispatch(get_word_progid())
             word.Visible = False
             word.DisplayAlerts = 0  # wdAlertsNone，禁止一切弹窗
+            # 无人值守：尽量禁用“更新外部链接/安全确认”等交互（不同 Word/WPS 版本字段名不同，逐项 try）
+            try:
+                opt = getattr(word, "Options", None)
+                if opt is not None:
+                    for k, v in (
+                        ("UpdateLinksAtOpen", False),
+                        ("AskToUpdateLinks", False),
+                        ("ConfirmConversions", False),
+                    ):
+                        try:
+                            setattr(opt, k, v)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Office 宏安全：ForceDisable 可避免部分弹窗（WPS/Word 兼容性不一，忽略失败）
+            try:
+                setattr(word, "AutomationSecurity", 3)  # msoAutomationSecurityForceDisable
+            except Exception:
+                pass
             try:
                 global _LAST_WORD_PID
                 _LAST_WORD_PID = resolve_office_app_pid(
@@ -1022,12 +1138,27 @@ def _get_word_app(visible=False):
 
 def _open_word_document(word, path, *, read_only=True):
     """打开文档并在打开后刷新 _LAST_WORD_PID（窗口句柄常在此后才可用）。"""
-    doc = _com_call(
-        word.Documents.Open,
-        path,
-        ReadOnly=read_only,
-        AddToRecentFiles=False,
-    )
+    # UpdateLinks=0：禁止打开时更新链接，避免 WPS「安全声明」弹窗打断自动化
+    try:
+        doc = _com_call(
+            word.Documents.Open,
+            path,
+            ReadOnly=read_only,
+            AddToRecentFiles=False,
+            UpdateLinks=0,
+            ConfirmConversions=False,
+            NoEncodingDialog=True,
+        )
+    except Exception:
+        doc = _com_call(
+            word.Documents.Open,
+            path,
+            ReadOnly=read_only,
+            AddToRecentFiles=False,
+        )
+    except Exception:
+        # 最后兜底：极少数宿主连命名参数都不兼容
+        doc = _com_call(word.Documents.Open, path)
     try:
         global _LAST_WORD_PID
         np = refresh_pid_after_doc_open(word, win32process)
@@ -1614,6 +1745,80 @@ def _field_is_toc_or_pagination(field):
     )
 
 
+def _field_code_text(field) -> str:
+    try:
+        c = getattr(field, "Code", None)
+        if c is None:
+            return ""
+        t = getattr(c, "Text", "") or ""
+        return str(t)
+    except Exception:
+        return ""
+
+
+def _has_external_data_fields(doc) -> bool:
+    """
+    是否存在可能触发 WPS「安全声明」的外部数据/链接类域。
+    常见对应 INCLUDEPICTURE/LINK/INCLUDETEXT/DDE/HYPERLINK 等。
+    """
+    try:
+        n = int(getattr(doc, "Fields", None).Count)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return False
+    for i in range(1, n + 1):
+        try:
+            f = doc.Fields(i)
+        except Exception:
+            continue
+        if _field_is_toc_or_pagination(f):
+            continue
+        code = _field_code_text(f).upper()
+        if not code:
+            continue
+        if (
+            "INCLUDEPICTURE" in code
+            or "INCLUDETEXT" in code
+            or "HYPERLINK" in code
+            or "DDE" in code
+            or "LINK" in code
+            or "IMPORT" in code
+        ):
+            return True
+    return False
+
+
+def _lock_external_fields(doc) -> None:
+    """锁定外部域，避免 Update 时触发外部访问/安全声明。"""
+    try:
+        n = int(getattr(doc, "Fields", None).Count)
+    except Exception:
+        n = 0
+    for i in range(1, n + 1):
+        try:
+            f = doc.Fields(i)
+        except Exception:
+            continue
+        if _field_is_toc_or_pagination(f):
+            continue
+        code = _field_code_text(f).upper()
+        if not code:
+            continue
+        if (
+            "INCLUDEPICTURE" in code
+            or "INCLUDETEXT" in code
+            or "HYPERLINK" in code
+            or "DDE" in code
+            or "LINK" in code
+            or "IMPORT" in code
+        ):
+            try:
+                f.Locked = True
+            except Exception:
+                pass
+
+
 def _update_pagination_fields_selective(doc):
     """不调用 doc.Fields.Update()，只刷新目录/页码类域（正文 + 页眉页脚），降低链接图被全量刷新破坏的风险。"""
     try:
@@ -1653,6 +1858,13 @@ def _update_pagination_fields_selective(doc):
 
 def _ensure_toc_updated(doc):
     """更新所有目录域与域结果。"""
+    # 无人值守且存在外部域：任何 Update 都可能触发 WPS「安全声明」，直接跳过
+    try:
+        if WORD_UNATTENDED and _has_external_data_fields(doc):
+            _lock_external_fields(doc)
+            return
+    except Exception:
+        pass
     _update_toc_tables_only(doc)
     if WORD_PRESERVE_LINKED_IMAGES:
         _update_pagination_fields_selective(doc)
@@ -2327,6 +2539,45 @@ def ensure_font_black(doc_path, save_path=None, remove_highlights=True):
                     doc.Content.HighlightColorIndex = wdNoHighlight
             except Exception:
                 pass
+        # 页眉/页脚里的 Shape 文本框不一定包含在 StoryRanges 的字体设置中，单独兜底一次
+        try:
+            for si in range(1, int(doc.Sections.Count) + 1):
+                sec = doc.Sections(si)
+                for hf_type in (1, 2, 3):
+                    for hf_getter in (sec.Headers, sec.Footers):
+                        try:
+                            hf = hf_getter(hf_type)
+                            if not hf.Exists:
+                                continue
+                            for i in range(1, int(hf.Shapes.Count) + 1):
+                                try:
+                                    sh = hf.Shapes(i)
+                                    if sh.TextFrame.HasText and sh.TextFrame.TextRange is not None:
+                                        r = sh.TextFrame.TextRange
+                                        _apply_font_profile_to_range(r)
+                                        r.Font.Color = wdColorBlack
+                                        if remove_highlights:
+                                            r.HighlightColorIndex = wdNoHighlight
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        try:
+            for i in range(1, int(doc.Shapes.Count) + 1):
+                try:
+                    sh = doc.Shapes(i)
+                    if sh.TextFrame.HasText and sh.TextFrame.TextRange is not None:
+                        r = sh.TextFrame.TextRange
+                        _apply_font_profile_to_range(r)
+                        r.Font.Color = wdColorBlack
+                        if remove_highlights:
+                            r.HighlightColorIndex = wdNoHighlight
+                except Exception:
+                    pass
+        except Exception:
+            pass
         _apply_formal_header_footer_fixes(doc)
         _sync_page_numbers_after_edit(doc)
         _check_page_count_unchanged_or_restore(doc, pages_before, backup_path, path)
@@ -2849,6 +3100,13 @@ def _sync_page_numbers_after_edit(doc):
         doc.Repaginate()
     except Exception:
         pass
+    # 无人值守且存在外部域：域更新会触发 WPS 安全声明，跳过所有域更新动作
+    try:
+        if WORD_UNATTENDED and _has_external_data_fields(doc):
+            _lock_external_fields(doc)
+            return
+    except Exception:
+        pass
     if preserve:
         _update_pagination_fields_selective(doc)
     else:
@@ -2957,6 +3215,10 @@ def _ensure_no_markup_print(word, doc):
                 ("PrintComments", False),
                 ("PrintHiddenText", False),
                 ("PrintFieldCodes", False),
+                # 关键：导出/打印 PDF 时强制输出图片/图形（否则可能“丢图”）
+                # Word/WPS 版本差异较大，逐项 try。
+                ("PrintDrawingObjects", True),
+                ("PrintBackgrounds", True),
             ):
                 try:
                     setattr(opt, k, v)
@@ -2964,6 +3226,81 @@ def _ensure_no_markup_print(word, doc):
                     pass
     except Exception:
         pass
+
+
+def _export_word_to_pdf(doc, out_pdf):
+    """
+    统一的 Word->PDF 导出入口。
+    经验：部分环境 ExportAsFixedFormat 会因为打印选项/渲染问题导致“图片不输出”，
+    这里尽量显式传参并在失败时做轻触刷新后重试一次。
+    """
+    try:
+        # wdExportFormatPDF = 17
+        # wdExportOptimizeForPrint = 0（某些宿主不认识常量，用数字更稳）
+        doc.ExportAsFixedFormat(
+            out_pdf,
+            17,
+            False,  # OpenAfterExport
+            0,  # OptimizeFor: print
+            0,  # Range: all document
+            1,
+            1,
+            0,  # Item: document content
+            True,  # IncludeDocProps
+            True,  # KeepIRM
+            1,  # CreateBookmarks: headings
+            True,  # DocStructureTags
+            True,  # BitmapMissingFonts
+            False,  # UseISO19005_1
+        )
+        return True
+    except Exception:
+        # 轻触刷新后再试一次
+        try:
+            doc.Repaginate()
+        except Exception:
+            pass
+        try:
+            doc.ExportAsFixedFormat(out_pdf, 17)
+            return True
+        except Exception:
+            return False
+
+
+def _saveas_word_pdf(doc, out_pdf):
+    """优先使用 SaveAs/SaveAs2 输出 PDF（很多 WPS 环境比 ExportAsFixedFormat 更不易丢图）。"""
+    try:
+        doc.SaveAs2(os.path.abspath(out_pdf), FileFormat=17)
+        return True
+    except Exception:
+        try:
+            doc.SaveAs(os.path.abspath(out_pdf), FileFormat=17)
+            return True
+        except Exception:
+            return False
+
+
+def _print_word_to_pdf_via_driver(doc, out_pdf, copies=1):
+    """
+    通过“打印到 PDF”驱动生成 PDF（比 ExportAsFixedFormat 更贴近真实打印渲染，常用于规避丢图）。
+    注意：不同 Word/WPS 版本参数支持不完全，失败则返回 False 供上层回退。
+    """
+    try:
+        # 一些宿主 Background=True 会提前返回导致文件未写完，这里尽量同步等待
+        doc.PrintOut(
+            Background=False,
+            Append=False,
+            Range=0,
+            Item=0,
+            Copies=int(max(1, int(copies or 1))),
+            Collate=True,
+            PrintToFile=True,
+            OutputFileName=os.path.abspath(out_pdf),
+        )
+        return True
+    except Exception:
+        # 兼容：有的版本不支持 OutputFileName/PrintToFile 组合，直接失败回退
+        return False
 
 
 def print_word_document(doc_path, printer_name=None, copies=1):
@@ -2976,6 +3313,11 @@ def print_word_document(doc_path, printer_name=None, copies=1):
     path = os.path.abspath(doc_path)
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
+    # PDF 输出（无人值守优先）：soffice 无头转换（无 WPS 安全声明/保存对话框、对丢图更稳）
+    if _is_pdf_printer(printer_name):
+        out_pdf = _desktop_pdf_path(path)
+        if _convert_to_pdf_via_soffice(path, out_pdf):
+            return out_pdf
     word = None
     doc = None
     old_printer = None
@@ -2985,11 +3327,18 @@ def print_word_document(doc_path, printer_name=None, copies=1):
             old_printer = word.ActivePrinter
             word.ActivePrinter = printer_name
         doc = _open_word_document(word, path, read_only=True)
+        # 导出/打印前尽量内嵌链接图片，避免 PDF 丢图（无链接图片时几乎无开销）
+        try:
+            _embed_linked_pictures(doc)
+        except Exception:
+            pass
         _ensure_no_markup_print(word, doc)
         _refresh_word_pagination_before_print(doc)
         if _is_pdf_printer(printer_name):
             out_pdf = _desktop_pdf_path(path)
-            doc.ExportAsFixedFormat(out_pdf, 17)  # wdExportFormatPDF
+            ok = _export_word_to_pdf(doc, out_pdf)
+            if not ok:
+                raise RuntimeError("生成 PDF 失败（已尝试：soffice 无头转换、Word/WPS 导出 PDF）")
             return out_pdf
         doc.PrintOut(
             Background=True,
@@ -3038,6 +3387,10 @@ def print_word_with_basic_processing_no_save(
     path = os.path.abspath(doc_path)
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
+    if _is_pdf_printer(printer_name):
+        out_pdf = _desktop_pdf_path(path)
+        if _convert_to_pdf_via_soffice(path, out_pdf):
+            return out_pdf
     word = None
     doc = None
     old_printer = None
@@ -3047,6 +3400,11 @@ def print_word_with_basic_processing_no_save(
             old_printer = word.ActivePrinter
             word.ActivePrinter = printer_name
         doc = _open_word_document(word, path, read_only=False)
+        # 导出/打印前尽量内嵌链接图片，避免 PDF 丢图（无链接图片时几乎无开销）
+        try:
+            _embed_linked_pictures(doc)
+        except Exception:
+            pass
         _ensure_no_markup_print(word, doc)
         pages_before = _get_doc_page_count(doc) if WORD_PRESERVE_PAGE_COUNT else None
         try:
@@ -3091,7 +3449,9 @@ def print_word_with_basic_processing_no_save(
                 )
         if _is_pdf_printer(printer_name):
             out_pdf = _desktop_pdf_path(path)
-            doc.ExportAsFixedFormat(out_pdf, 17)  # wdExportFormatPDF
+            ok = _export_word_to_pdf(doc, out_pdf)
+            if not ok:
+                raise RuntimeError("生成 PDF 失败（已尝试：soffice 无头转换、Word/WPS 导出 PDF）")
             return out_pdf
         doc.PrintOut(
             Background=True,
