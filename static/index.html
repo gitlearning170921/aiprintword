@@ -629,7 +629,7 @@
               <th style="min-width:14rem;">操作</th>
             </tr>
           </thead>
-          <tbody id="batchRecordsBody"></tbody>
+          <tbody id="batchRecordsBody"><tr><td colspan="6" style="color:var(--text-muted);padding:14px 10px;">正在加载列表…</td></tr></tbody>
         </table>
       </div>
       <div id="batchPagerBar" class="hint" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:10px;">
@@ -887,9 +887,14 @@
     }
 
     function loadPrinters() {
+      if (printerSelect) {
+        printerSelect.innerHTML = '<option value="">正在加载打印机列表…</option>';
+        printerSelect.disabled = true;
+      }
       fetch('/api/printers')
         .then(r => r.json())
         .then(data => {
+          if (printerSelect) printerSelect.disabled = false;
           const list = data.printers || [];
           printerSelect.innerHTML = '<option value="">使用默认打印机</option>';
           list.forEach(name => {
@@ -899,7 +904,12 @@
             printerSelect.appendChild(opt);
           });
         })
-        .catch(() => {});
+        .catch(() => {
+          if (printerSelect) {
+            printerSelect.disabled = false;
+            printerSelect.innerHTML = '<option value="">打印机列表加载失败（仍可用默认打印机）</option>';
+          }
+        });
     }
     loadPrinters();
 
@@ -1128,11 +1138,19 @@
       const skipPrint = r.skip_print === true;
       const dry = r.dry_run === true;
       const filter = buildDetailCoarseFilter(detailKey);
-      const rows = (details || []).map((d) => {
+      const rows = (details || []).map((d, i) => {
         let saveCell = '—';
         if (d.saved_to) saveCell = escapeHtml(d.saved_to);
         else if (d.save_error) {
           saveCell = '<span class="status-fail">失败：' + escapeHtml(d.save_error) + '</span>';
+        }
+        let finalDl = '—';
+        if (d && d.final_ftp_path) {
+          if (detailKey && detailKey !== 'local') {
+            finalDl = '<a class="btn btn-ghost" href="/api/batch-history/' + encodeURIComponent(detailKey) + '/final/' + String(i) + '">下载</a>';
+          } else if (detailKey === 'local' && r && r.final_download_key) {
+            finalDl = '<a class="btn btn-ghost" href="/api/batch-final/' + encodeURIComponent(String(r.final_download_key)) + '/' + String(i) + '">下载</a>';
+          }
         }
         const coarse = detailCoarseBucket(d);
         const coarseAttr = escapeAttr(coarse);
@@ -1143,6 +1161,7 @@
           + '<td class="mod-mode">' + modeCell + '</td>'
           + '<td class="message">' + escapeHtml(d.message || '') + '</td>'
           + '<td class="saved-to">' + saveCell + '</td>'
+          + '<td>' + finalDl + '</td>'
           + '</tr>';
       }).join('');
       const inc = incrementalLine ? '<p class="hint" style="margin:0 0 8px;">' + escapeHtml(incrementalLine) + '</p>' : '';
@@ -1150,7 +1169,7 @@
         + inc
         + '<div style="margin-bottom:8px;">' + filter + '</div>'
         + '<table class="result-table batch-detail-table"><thead><tr>'
-        + '<th>文件名</th><th>状态</th><th>处理模式</th><th>说明</th><th>即时保存路径</th>'
+        + '<th>文件名</th><th>状态</th><th>处理模式</th><th>说明</th><th>即时保存路径</th><th>终版下载</th>'
         + '</tr></thead><tbody>' + rows + '</tbody></table>'
         + '<p class="hint" style="margin:8px 0 0;">逐条修改说明见该次 ZIP 根目录「修改明细.txt」（若该次任务生成了 ZIP）。</p>'
         + '</div>';
@@ -1349,8 +1368,15 @@
       });
     }
 
-    async function loadHistory() {
+    async function loadHistory(opts) {
       if (!batchRecordsBody) return;
+      const showLoading = !(opts && opts.showLoading === false);
+      if (showLoading) {
+        batchRecordsBody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:14px 10px;">正在加载列表…</td></tr>';
+        if (batchPagerInfo) batchPagerInfo.textContent = '加载中…';
+        if (batchPagerPrev) batchPagerPrev.disabled = true;
+        if (batchPagerNext) batchPagerNext.disabled = true;
+      }
       try {
         const r = await fetch('/api/batch-history');
         const data = await r.json().catch(() => ({}));
@@ -1580,7 +1606,7 @@
         ).join('');
       }
       renderCurrentHistoryPage();
-      loadHistory();
+      loadHistory({ showLoading: false });
     }
 
     async function runBatch(runMode) {

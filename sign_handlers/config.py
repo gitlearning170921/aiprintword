@@ -1,19 +1,9 @@
 # -*- coding: utf-8 -*-
-"""在线签名：角色 id 与文档内关键词对应（前端用英文 id 提交）。"""
+"""在线签名：角色 id 与同义词（自 sign_role_keywords.json 加载）。"""
 
-# 每个角色可对应多个模板用词（中英混排表格常见英文标签）
-ROLE_ID_TO_KEYWORD = {
-    "author": ("作者", "Author", "编制人", "编制"),
-    "reviewer": ("审核", "审核人", "Reviewer", "Review"),
-    "approver": ("批准", "批准人", "Approver", "Approval"),
-    "executor": ("执行人员", "Executor"),
-    "reviewer_tail": ("审核人员", "Reviewer"),
-}
+from sign_handlers.sign_role_keywords import ROLE_ID_TO_KEYWORD, role_keywords
 
-
-def role_keywords(role_id: str) -> tuple[str, ...]:
-    v = ROLE_ID_TO_KEYWORD[role_id]
-    return (v,) if isinstance(v, str) else tuple(v)
+__all__ = ["ROLE_ID_TO_KEYWORD", "role_keywords", "role_display_name"]
 
 
 def role_display_name(role_id: str) -> str:

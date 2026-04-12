@@ -31,7 +31,7 @@
       padding: 24px;
       line-height: 1.5;
     }
-    .container { max-width: 720px; margin: 0 auto; }
+    .container { max-width: 880px; margin: 0 auto; }
     h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 8px; }
     .subtitle { color: var(--text-muted); font-size: 0.95rem; margin-bottom: 16px; }
     .nav-top { margin-bottom: 24px; }
@@ -72,7 +72,21 @@
       border: 1px solid var(--border);
     }
     .role-panel.visible { display: block; }
-    .canvas-wrap { margin-bottom: 14px; }
+    #needSignTable {
+      overflow-x: auto;
+      max-width: 100%;
+      margin-top: 8px;
+      -webkit-overflow-scrolling: touch;
+    }
+    #rolePanels {
+      max-width: 100%;
+      overflow-x: auto;
+    }
+    .role-panel {
+      max-width: 100%;
+      box-sizing: border-box;
+    }
+    .canvas-wrap { margin-bottom: 14px; max-width: 100%; }
     .canvas-wrap label { font-weight: 500; }
     canvas.sign-pad {
       display: block;
@@ -138,6 +152,15 @@
     .file-list li label { margin: 0; cursor: pointer; flex: 1; min-width: 0; word-break: break-all; }
     .file-list .del-btn { flex-shrink: 0; }
     .signed-meta { font-size: 0.85rem; color: var(--text-muted); margin-top: 4px; width: 100%; }
+    .sign-region { margin-bottom: 28px; }
+    .sign-region-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin: 0 0 6px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--accent);
+    }
+    .sign-region-desc { color: var(--text-muted); font-size: 0.92rem; margin: 0 0 16px; }
   </style>
 </head>
 <body>
@@ -146,10 +169,72 @@
       <a href="/">返回批量打印</a>
     </div>
     <h1>在线签名</h1>
-    <p class="subtitle">先上传并保存到列表，再从列表选择要签名的文件；按角色手写签名与日期后生成下载。不影响批量打印。</p>
+    <p class="subtitle">分两块使用：先维护「签署人笔迹」，再在「文件签名」中上传文档、按角色套用笔迹并生成已签文件。</p>
     <div id="fileProtoWarn" class="card" style="display:none;background:#fff8e1;border-color:#ffc107;">
       <strong>请勿用本地文件打开本页。</strong> 请在本机运行 <code>python app.py</code> 后，用浏览器打开 <strong>http://127.0.0.1:5050/sign</strong>（或本机局域网 IP 同端口），否则「保存到列表」会失败。
     </div>
+
+    <section class="sign-region" id="regionSignerStroke" aria-label="签署人笔迹录入">
+      <h2 class="sign-region-title">一、签署人笔迹录入</h2>
+      <p class="sign-region-desc">添加签署人（支持逗号一次多个），在下方为每人录入签名与日期手写图；保存后可在「文件签名」中从库载入或批量签时自动使用。</p>
+
+      <div class="card" id="signerLibCard">
+        <h2>签署人列表</h2>
+        <p class="hint" id="signerLibHint">加载中…</p>
+        <div class="btn-row" id="signerPager" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span class="hint" id="signerPagerInfo" style="margin:0;">—</span>
+          <button type="button" class="btn btn-secondary" id="signerPrevBtn" style="padding:6px 12px;">上一页</button>
+          <button type="button" class="btn btn-secondary" id="signerNextBtn" style="padding:6px 12px;">下一页</button>
+        </div>
+        <label for="newSignerName" style="margin-top:8px;">添加签署人（多人请用逗号、分号或换行分隔）</label>
+        <div class="btn-row" style="margin-top:6px;">
+          <input type="text" id="newSignerName" placeholder="例如：张三, 李四, 王五" maxlength="2000" style="flex:1;min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+          <button type="button" class="btn btn-secondary" id="addSignerBtn">添加</button>
+        </div>
+        <p class="hint" id="signerErrMsg" style="display:none;margin-top:8px;min-height:1.2em;"></p>
+        <ul class="file-list" id="signerListEl" style="margin-top:12px;"></ul>
+      </div>
+
+      <div class="card" id="signerStrokeCard">
+        <h2>为所选签署人录入 / 更新笔迹</h2>
+        <p class="hint">选择签署人后可选手写、载入；同一签署人可保存多套「签名+日期」笔迹（内容相同则覆盖同一套）。此处与下方「按文件、按角色」签字相互独立。</p>
+        <label for="libSignerSelect" style="margin-top:8px;">当前签署人</label>
+        <select id="libSignerSelect" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+          <option value="">请先添加签署人</option>
+        </select>
+        <label for="libStrokeSetSelect" style="margin-top:8px;">笔迹套（可选：载入指定一套；不选则按该人最近一套）</label>
+        <select id="libStrokeSetSelect" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+          <option value="">最近一套</option>
+        </select>
+        <label for="libLocaleSelect" style="margin-top:8px;">版本（中文/英文）</label>
+        <select id="libLocaleSelect" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+          <option value="zh" selected>中文</option>
+          <option value="en">英文</option>
+        </select>
+        <div class="canvas-wrap" style="margin-top:14px;">
+          <label>签名</label>
+          <canvas class="sign-pad" id="lib_sig_canvas" width="400" height="120"></canvas>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary" id="libClearSigBtn">清除签名</button>
+          </div>
+        </div>
+        <div class="canvas-wrap">
+          <label>日期</label>
+          <canvas class="sign-pad" id="lib_date_canvas" width="400" height="120"></canvas>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary" id="libClearDateBtn">清除日期</button>
+          </div>
+        </div>
+        <div class="btn-row" style="margin-top:12px;">
+          <button type="button" class="btn btn-secondary" id="libLoadStrokesBtn">从服务器载入该人笔迹</button>
+          <button type="button" class="btn btn-primary" id="libSaveStrokesBtn" style="padding:10px 18px;">保存笔迹到该签署人</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="sign-region" id="regionFileSign" aria-label="文件签名">
+      <h2 class="sign-region-title">二、文件签名</h2>
+      <p class="sign-region-desc">上传 Word/Excel 待签文件，按检测结果或自选角色配置「角色→笔迹套（含签署人）」；可从库载入已有签字或重新手写，支持将当前画布一键入库（同人同图同日期覆盖）。可多选文件一键批量签（需 MySQL）。</p>
 
     <div class="card">
       <h2>1. 上传并保存到列表</h2>
@@ -166,7 +251,7 @@
 
     <div class="card">
       <h2>2. 选择要签名的文件</h2>
-      <p class="hint" id="listHint">暂无已保存文件，请先上传保存。</p>
+      <p class="hint" id="listHint">正在加载文件列表…</p>
       <div class="btn-row" style="margin-bottom:10px;">
         <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
           <input type="checkbox" id="batchSelectAll"> 全选（用于下方「一键批量签」）
@@ -175,25 +260,18 @@
       <ul class="file-list" id="fileList"></ul>
     </div>
 
-    <div class="card" id="signerLibCard">
-      <h2>签署人库（笔迹可复用）</h2>
-      <p class="hint" id="signerLibHint">加载中…</p>
-      <div class="btn-row">
-        <input type="text" id="newSignerName" placeholder="姓名或代号" maxlength="128" style="flex:1;min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
-        <button type="button" class="btn btn-secondary" id="addSignerBtn">添加签署人</button>
-      </div>
-      <ul class="file-list" id="signerListEl" style="margin-top:12px;"></ul>
-    </div>
-
     <div class="card" id="needSignCard">
-      <h2>本文件需签角色（检测结果）</h2>
-      <p class="hint">为每个角色选择签署人后，可「从库载入」到画布；手写后也可「保存到签署人」供其它文档复用。不同文件可为同一角色指定不同签署人。</p>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;">
+        <h2 style="margin:0;font-size:1rem;font-weight:600;">本文件需签角色（检测结果）</h2>
+        <button type="button" class="btn btn-secondary" id="redetectRolesBtn">重新识别需签字角色</button>
+      </div>
+      <p class="hint">根据模板中的编制/审核/批准等关键词自动识别；为每个角色绑定签名/日期素材后可「载入签名」「载入日期」到下方画布。表格较宽时可左右滑动查看。</p>
       <div id="needSignTable"></div>
     </div>
 
     <div class="card">
       <h2>3. 签字角色（可多选）</h2>
-      <p class="hint">每个角色需分别手写「签名」和「日期」；模板中需有对应关键词空白位。</p>
+      <p class="hint">勾选后会在<strong>本卡片下方</strong>展开对应签字画布；每个角色需分别完成「签名」和「日期」后再生成文档。未识别到角色时可手动勾选。</p>
       <div id="roleChecks"></div>
       <div id="rolePanels"></div>
     </div>
@@ -209,9 +287,10 @@
 
     <div class="card" id="signedSection">
       <h2>已签名文档（数据库共享）</h2>
-      <p class="hint" id="signedHint" style="display:none;"></p>
+      <p class="hint" id="signedHint">正在加载已签名列表…</p>
       <ul class="file-list" id="signedList"></ul>
     </div>
+    </section>
   </div>
 
   <script>

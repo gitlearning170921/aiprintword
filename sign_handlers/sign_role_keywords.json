@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "documentation": "签字角色同义词。synonyms/zh/en 会合并去重后用于匹配；zh、en 仅便于对照维护，可只改 synonyms。",
+  "roles": {
+    "author": {
+      "zh": [
+        "作者",
+        "编制人",
+        "编制",
+        "制表人",
+        "制表",
+        "填表人",
+        "填报人",
+        "经办人",
+        "经办",
+        "拟稿人",
+        "拟稿",
+        "起草人",
+        "起草",
+        "录入人",
+        "填写人",
+        "填制人",
+        "记录人",
+        "作者/日期",
+        "编制/日期",
+        "编制人/日期"
+      ],
+      "en": [
+        "Author",
+        "Author:",
+        "Author/Date:",
+        "Author/date",
+        "Prepared by",
+        "Prepared By",
+        "Written by",
+        "Created by",
+        "Drafted by",
+        "Developed by",
+        "Compiled by",
+        "Document owner"
+      ],
+      "synonyms": []
+    },
+    "reviewer": {
+      "zh": [
+        "审核",
+        "审核人",
+        "复核",
+        "复核人",
+        "校对",
+        "校对人",
+        "审定",
+        "审查人",
+        "校核人",
+        "验证人",
+        "审核人/日期",
+        "复核/日期"
+      ],
+      "en": [
+        "Reviewed by",
+        "Reviewed By",
+        "Reviewer",
+        "Reviewer:",
+        "Reviewer/Date:",
+        "Reviewer/date",
+        "Review",
+        "Checked by",
+        "Checked By",
+        "Verified by",
+        "Verified By",
+        "Verification by",
+        "Inspector",
+        "Inspection"
+      ],
+      "synonyms": []
+    },
+    "approver": {
+      "zh": [
+        "批准",
+        "批准人",
+        "签发",
+        "签发人",
+        "核准",
+        "核准人",
+        "审定人",
+        "授权人",
+        "签批",
+        "批准人/日期",
+        "核准/日期",
+        "签发/日期"
+      ],
+      "en": [
+        "Approved by",
+        "Approved By",
+        "Approver",
+        "Approver:",
+        "Approver/Date:",
+        "Approver/date",
+        "Approval",
+        "Authorize",
+        "Authorised by",
+        "Authorized by",
+        "Sign-off",
+        "Release approval",
+        "Approve Release"
+      ],
+      "synonyms": []
+    },
+    "executor": {
+      "zh": [
+        "执行人员",
+        "执行人",
+        "实施人",
+        "操作人",
+        "经手人",
+        "测试人",
+        "试验人",
+        "测试人/日期"
+      ],
+      "en": [
+        "Executor",
+        "Tester",
+        "Tester:",
+        "Tester/Date",
+        "Tester/Date:",
+        "Tested by",
+        "Tested by/Date",
+        "Test engineer",
+        "Operator"
+      ],
+      "synonyms": []
+    },
+    "reviewer_tail": {
+      "zh": [
+        "审核人员",
+        "审核组员",
+        "审核成员",
+        "会签",
+        "会签人",
+        "会签人员",
+        "会签栏",
+        "质控",
+        "质控人",
+        "质控签字",
+        "质量控制",
+        "质量保证",
+        "质保",
+        "质保人",
+        "技术审核",
+        "专业审核",
+        "部门审核",
+        "二级审核",
+        "质检",
+        "质检员",
+        "质检负责人",
+        "检查人",
+        "检验人",
+        "检验员"
+      ],
+      "en": [
+        "QA",
+        "Q.A.",
+        "QC",
+        "Q.C.",
+        "Quality assurance",
+        "Quality control",
+        "Inspection",
+        "Independent reviewer"
+      ],
+      "synonyms": []
+    }
+  }
+}

@@ -198,6 +198,9 @@
 
     document.getElementById('btnLoad').addEventListener('click', async () => {
       showMsg('', true);
+      const root = document.getElementById('formRoot');
+      const itemsBackup = items.slice();
+      root.innerHTML = '<p class="hint" style="margin:12px 0 0;">正在加载配置…</p>';
       try {
         const r = await fetch('/api/admin/settings', { headers: headers() });
         let j;
@@ -205,6 +208,8 @@
           j = await r.json();
         } catch (e) {
           showMsg('HTTP ' + r.status + '：响应不是 JSON，可能未连到本应用或中间层替换了错误页。', false);
+          items = itemsBackup;
+          renderForm();
           return;
         }
         if (!j.ok) {
@@ -217,6 +222,8 @@
               + ' cwd=' + (j.diag.cwd || '');
           }
           showMsg(t, false);
+          items = itemsBackup;
+          renderForm();
           return;
         }
         items = j.items || [];
@@ -224,6 +231,8 @@
         showMsg('已加载 ' + items.length + ' 项', true);
       } catch (e) {
         showMsg(String(e), false);
+        items = itemsBackup;
+        renderForm();
       }
     });
 

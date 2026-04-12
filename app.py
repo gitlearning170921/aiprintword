@@ -92,6 +92,9 @@ class _BatchJob:
 
 _BATCH_JOB_REGISTRY = {}
 
+# 本轮终版下载映射（local）：key -> {created_at, items:[{ftp_path, filename}]}
+_FINAL_DOWNLOAD_CACHE = {}
+
 # Allowed file extensions（批处理实际处理的文档类型）
 ALLOWED_EXT = {
     ".doc", ".docx", ".docm",
@@ -771,13 +774,13 @@ def api_batch_print():
                 for p2, r2 in _expand_archive_for_batch(tmp_dir, path, rel):
                     saved_paths.append(p2)
                     original_names.append(r2)
-                    original_backup_paths.append(
-                        _write_original_backup(tmp_dir, r2, p2)
-                    )
+                    bk = _write_original_backup(tmp_dir, r2, p2)
+                    original_backup_paths.append(bk)
             elif _allowed_file(rel):
                 saved_paths.append(path)
                 original_names.append(rel)
-                original_backup_paths.append(_write_original_backup(tmp_dir, rel, path))
+                bk = _write_original_backup(tmp_dir, rel, path)
+                original_backup_paths.append(bk)
 
         if not saved_paths:
             return jsonify(
@@ -1028,6 +1031,21 @@ def _zip_batch_exports(
                     arcname = name.replace("\\", "/")
             if os.path.isfile(src):
                 zf.write(src, arcname=arcname)
+                # 终版成品同步到 FTP（仅成功且有 processed_path 的情况）
+                try:
+                    if d.get("success") and (d.get("processed_path") or "").strip() and os.path.isfile(src):
+                        from ftp_store import upload_file
+
+                        upload_file(src, f"batch/final/{token}/{arcname}")
+                except Exception:
+                    pass
+    # 同步 ZIP 到 FTP（供下载复用；失败不影响主流程）
+    try:
+        from ftp_store import upload_file
+
+        upload_file(zip_path, f"batch/exports/{token}.zip")
+    except Exception:
+        pass
     return zip_path
 
 
@@ -1219,6 +1237,30 @@ def _batch_history_persist(stream_state, tmp_dir):
         "download_token": (result or {}).get("download_token") if result else None,
         "has_stash": has_stash,
     }
+    # 打印模式也上传“终版成品”到 FTP，并在历史记录中写入下载信息
+    try:
+        if ok and isinstance(result, dict):
+            details = result.get("details") or []
+            orig = list(stream_state.get("original_names") or [])
+            # 仅在有明细时处理
+            if isinstance(details, list) and details:
+                from ftp_store import upload_file
+
+                for i, d in enumerate(details):
+                    if not isinstance(d, dict):
+                        continue
+                    proc = (d.get("processed_path") or "").strip()
+                    if not d.get("success") or not proc or (not os.path.isfile(proc)):
+                        continue
+                    name = orig[i] if i < len(orig) else (d.get("filename") or d.get("path") or f"file_{i+1}")
+                    arcname = _zip_arcname_with_processed_ext(str(name), proc)
+                    try:
+                        ftp_p = upload_file(proc, f"batch/final/{hid}/{arcname}")
+                        d["final_ftp_path"] = ftp_p
+                    except Exception:
+                        pass
+    except Exception:
+        pass
     record["display_title"] = compute_display_title(
         record["original_names"], result
     )
@@ -1494,6 +1536,29 @@ def api_admin_batch_history_migrate_from_disk():
         return jsonify({"ok": False, "error": _format_com_error(e)}), 500
 
 
+@app.route("/api/admin/sign/migrate-mysql-blobs-to-ftp", methods=["POST"])
+def api_admin_sign_migrate_mysql_blobs_to_ftp():
+    """将在线签名模块历史遗留的 MySQL BLOB 文件迁移到 FTP。"""
+    err, code = _admin_settings_auth_error()
+    if err:
+        if isinstance(err, dict):
+            return jsonify({"ok": False, **err}), code
+        return jsonify({"ok": False, "error": err}), code
+    try:
+        from sign_handlers import mysql_store
+
+        if not mysql_store.mysql_sign_enabled():
+            return jsonify({"ok": False, "error": "未配置 MySQL（MYSQL_HOST），无需迁移或无法读取"}), 400
+        data = request.get_json(silent=True) or {}
+        limit = data.get("limit", 2000)
+        clear_blob = data.get("clear_blob", True)
+        st = mysql_store.migrate_mysql_blobs_to_ftp(limit=limit, clear_blob=bool(clear_blob))
+        st2 = mysql_store.migrate_signer_strokes_blobs_to_ftp(limit=limit, clear_blob=bool(clear_blob))
+        return jsonify({"ok": True, **st, "strokes": st2})
+    except Exception as e:
+        return jsonify({"ok": False, "error": _format_com_error(e)}), 500
+
+
 @app.route("/api/batch-export/<token>")
 def api_batch_export(token):
     """?????????? ZIP?token ???????????"""
@@ -1501,7 +1566,15 @@ def api_batch_export(token):
         return jsonify({"ok": False, "error": "invalid token"}), 404
     path = os.path.join(BATCH_EXPORT_ROOT, token + ".zip")
     if not os.path.isfile(path):
-        return jsonify({"ok": False, "error": "not found or expired"}), 404
+        try:
+            from ftp_store import download_bytes
+
+            b = download_bytes(f"batch/exports/{token}.zip")
+            os.makedirs(BATCH_EXPORT_ROOT, exist_ok=True)
+            with open(path, "wb") as fp:
+                fp.write(b)
+        except Exception:
+            return jsonify({"ok": False, "error": "not found or expired"}), 404
     return send_file(
         path,
         as_attachment=True,
@@ -1646,6 +1719,33 @@ def _run_batch_with_progress(
                 logger.exception("batch zip failed: %s", e)
                 queue.put(("result", {"ok": False, "error": _format_com_error(e)}))
                 return
+        # 本轮（local）也提供终版下载：上传成功项终版到 FTP 并下发 final_download_key
+        try:
+            details = result.get("details") or []
+            if isinstance(details, list) and details:
+                key = uuid.uuid4().hex
+                from ftp_store import upload_file
+
+                items = []
+                for i, d in enumerate(details):
+                    if not isinstance(d, dict):
+                        continue
+                    proc = (d.get("processed_path") or "").strip()
+                    if not d.get("success") or not proc or (not os.path.isfile(proc)):
+                        continue
+                    name = original_names[i] if i < len(original_names) else (d.get("filename") or d.get("path") or f"file_{i+1}")
+                    arcname = _zip_arcname_with_processed_ext(str(name), proc)
+                    try:
+                        ftp_p = upload_file(proc, f"batch/final/{key}/{arcname}")
+                        d["final_ftp_path"] = ftp_p
+                        items.append({"ftp_path": ftp_p, "filename": os.path.basename(arcname) or f"file_{i+1}"})
+                    except Exception:
+                        pass
+                if items:
+                    _FINAL_DOWNLOAD_CACHE[key] = {"created_at": time.time(), "items": items}
+                    result["final_download_key"] = key
+        except Exception:
+            pass
         queue.put(("result", {"ok": True, "result": result}))
     except Exception as e:
         logger.exception("batch worker failed: %s", e)
@@ -1776,13 +1876,13 @@ def api_batch_print_stream():
                 for p2, r2 in _expand_archive_for_batch(tmp_dir, path, rel):
                     saved_paths.append(p2)
                     original_names.append(r2)
-                    original_backup_paths.append(
-                        _write_original_backup(tmp_dir, r2, p2)
-                    )
+                    bk = _write_original_backup(tmp_dir, r2, p2)
+                    original_backup_paths.append(bk)
             elif _allowed_file(rel):
                 saved_paths.append(path)
                 original_names.append(rel)
-                original_backup_paths.append(_write_original_backup(tmp_dir, rel, path))
+                bk = _write_original_backup(tmp_dir, rel, path)
+                original_backup_paths.append(bk)
 
         if not saved_paths:
             return jsonify(
@@ -1892,11 +1992,82 @@ def api_batch_history_download(hid):
         return jsonify({"ok": False, "error": "该次任务无打包下载"}), 404
     path = os.path.join(BATCH_EXPORT_ROOT, str(token) + ".zip")
     if not os.path.isfile(path):
-        return jsonify({"ok": False, "error": "文件已删除或已过期"}), 404
+        try:
+            from ftp_store import download_bytes
+
+            b = download_bytes(f"batch/exports/{token}.zip")
+            os.makedirs(BATCH_EXPORT_ROOT, exist_ok=True)
+            with open(path, "wb") as fp:
+                fp.write(b)
+        except Exception:
+            return jsonify({"ok": False, "error": "文件已删除或已过期"}), 404
     return send_file(
         path,
         as_attachment=True,
         download_name="processed_documents.zip",
+        max_age=0,
+    )
+
+
+@app.route("/api/batch-history/<hid>/final/<int:idx>", methods=["GET"])
+def api_batch_history_final_download(hid, idx: int):
+    """下载某次历史任务的单文件终版成品（来自 FTP）。"""
+    rec = _load_history_record(hid)
+    if not rec:
+        return jsonify({"ok": False, "error": "记录不存在"}), 404
+    res = (rec.get("result") or {}) if isinstance(rec, dict) else {}
+    details = res.get("details") or []
+    if not isinstance(details, list) or idx < 0 or idx >= len(details):
+        return jsonify({"ok": False, "error": "无效的文件索引"}), 404
+    d = details[idx] if isinstance(details[idx], dict) else {}
+    ftp_p = (d.get("final_ftp_path") or "").strip()
+    if not ftp_p:
+        return jsonify({"ok": False, "error": "该文件无可下载终版"}), 404
+    try:
+        from ftp_store import download_bytes
+
+        b = download_bytes(ftp_p)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "FTP 下载失败"}), 502
+    # 下载文件名：优先 filename/path，再退回 idx
+    nm = (d.get("filename") or d.get("path") or f"file_{idx+1}").replace("\\", "/")
+    base = os.path.basename(nm) or f"file_{idx+1}"
+    return send_file(
+        io.BytesIO(b),
+        as_attachment=True,
+        download_name=base,
+        mimetype="application/octet-stream",
+        max_age=0,
+    )
+
+
+@app.route("/api/batch-final/<key>/<int:idx>", methods=["GET"])
+def api_batch_final_download_local(key: str, idx: int):
+    """下载本轮（local）终版成品：通过内存 key 映射到 FTP 路径。"""
+    if not _BATCH_EXPORT_TOKEN_RE.match(key or ""):
+        return jsonify({"ok": False, "error": "invalid key"}), 404
+    rec = _FINAL_DOWNLOAD_CACHE.get(key)
+    if not rec:
+        return jsonify({"ok": False, "error": "该下载已过期，请刷新历史列表后从历史记录下载"}), 404
+    items = rec.get("items") or []
+    if idx < 0 or idx >= len(items):
+        return jsonify({"ok": False, "error": "无效的文件索引"}), 404
+    it = items[idx] if isinstance(items[idx], dict) else {}
+    ftp_p = (it.get("ftp_path") or "").strip()
+    fn = (it.get("filename") or f"file_{idx+1}").strip()
+    if not ftp_p:
+        return jsonify({"ok": False, "error": "无可下载终版"}), 404
+    try:
+        from ftp_store import download_bytes
+
+        b = download_bytes(ftp_p)
+    except Exception:
+        return jsonify({"ok": False, "error": "FTP 下载失败"}), 502
+    return send_file(
+        io.BytesIO(b),
+        as_attachment=True,
+        download_name=fn,
+        mimetype="application/octet-stream",
         max_age=0,
     )
 
@@ -2033,10 +2204,70 @@ def _sign_upload_display_name(client_filename):
 
 
 def _sign_find_record(file_id: str):
+    fid = str(file_id or "")
     for rec in session.get("sign_files") or []:
-        if rec.get("id") == file_id:
+        if str(rec.get("id") or "") == fid:
             return rec
     return None
+
+
+def _sign_norm_ext(ext: Optional[str]) -> str:
+    e = (ext or ".docx").lower().strip()
+    if not e.startswith("."):
+        e = "." + e
+    return e if e in SIGN_ALLOWED_EXT else ".docx"
+
+
+def _sign_saved_file_exists(sid: str, file_id: str, ext: Optional[str]) -> bool:
+    """会话收件箱中该 id 是否仍有对应磁盘文件（兼容扩展名与记录不一致）。"""
+    fid = str(file_id or "").strip()
+    if not fid or not _SIGN_FILE_ID_RE.match(fid):
+        return False
+    primary = _sign_norm_ext(ext)
+    path = _sign_saved_disk_path(sid, fid, primary)
+    if os.path.isfile(path):
+        return True
+    for alt in SIGN_ALLOWED_EXT:
+        if alt == primary:
+            continue
+        p2 = _sign_saved_disk_path(sid, fid, alt)
+        if os.path.isfile(p2):
+            return True
+    return False
+
+
+def _sign_prune_session_files_to_disk(sid: str) -> list:
+    """
+    以磁盘为准修剪 session['sign_files']：已删文件但 Cookie 未写回时，刷新列表仍会从库里删掉条目。
+    """
+    records = list(session.get("sign_files") or [])
+    pruned = [
+        r
+        for r in records
+        if _sign_saved_file_exists(sid, str(r.get("id") or ""), r.get("ext"))
+    ]
+    if len(pruned) != len(records):
+        session["sign_files"] = pruned
+        session.modified = True
+    return pruned
+
+
+def _sign_remove_disk_files_for_id(sid: str, file_id: str, ext: Optional[str]) -> None:
+    """删除收件箱内该 file_id 可能存在的 .docx/.xlsx（避免扩展名记录与磁盘不一致导致删不干净）。"""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return
+    tried = set()
+    for e in (_sign_norm_ext(ext), ".docx", ".xlsx"):
+        if e in tried:
+            continue
+        tried.add(e)
+        path = _sign_saved_disk_path(sid, fid, e)
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def _decode_png_data_url_or_b64(s):
@@ -2136,8 +2367,10 @@ def api_sign_files_list():
         except Exception as e:
             return jsonify({"ok": False, "error": f"MySQL ????: {e}"}), 500
     _sign_ensure_session_inbox()
+    sid = session["sign_inbox_sid"]
+    pruned = _sign_prune_session_files_to_disk(sid)
     files = []
-    for rec in session.get("sign_files") or []:
+    for rec in pruned:
         files.append({"id": rec.get("id"), "name": rec.get("name"), "ext": rec.get("ext")})
     return jsonify({"ok": True, "files": files})
 
@@ -2254,16 +2487,14 @@ def api_sign_file_delete(file_id):
     rec = _sign_find_record(file_id)
     if not rec:
         return jsonify({"ok": False, "error": "??????"}), 404
-    ext = rec.get("ext") or ".docx"
-    path = _sign_saved_disk_path(sid, file_id, ext)
-    try:
-        if os.path.isfile(path):
-            os.remove(path)
-    except Exception:
-        pass
-    session["sign_files"] = [r for r in (session.get("sign_files") or []) if r.get("id") != file_id]
+    _sign_remove_disk_files_for_id(sid, file_id, rec.get("ext"))
+    fid = str(file_id)
+    session["sign_files"] = [
+        r for r in (session.get("sign_files") or []) if str(r.get("id") or "") != fid
+    ]
     session.modified = True
-    return jsonify({"ok": True, "files": session["sign_files"]})
+    pruned = _sign_prune_session_files_to_disk(sid)
+    return jsonify({"ok": True, "files": pruned})
 
 
 @app.route("/api/sign/detect", methods=["GET"])
@@ -2497,22 +2728,57 @@ def api_sign_signers_list():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _parse_signer_names_from_json(data: dict) -> list[str]:
+    """支持 names 数组，或 name 中用中英文逗号/分号/换行分隔的多个姓名。"""
+    import re as _re
+
+    out: list[str] = []
+    seen: set[str] = set()
+    names_field = data.get("names")
+    if isinstance(names_field, list):
+        for x in names_field:
+            n = str(x).strip()[:128]
+            if not n:
+                continue
+            key = n.casefold()
+            if key not in seen:
+                seen.add(key)
+                out.append(n)
+    raw = (data.get("name") or "").strip()
+    if raw:
+        for part in _re.split(r"[,，;；\r\n]+", raw):
+            n = part.strip()[:128]
+            if not n:
+                continue
+            key = n.casefold()
+            if key not in seen:
+                seen.add(key)
+                out.append(n)
+    return out
+
+
 @app.route("/api/sign/signers", methods=["POST"])
 def api_sign_signers_create():
     data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    if not name:
-        return jsonify({"ok": False, "error": "请填写签署人名称"}), 400
+    names = _parse_signer_names_from_json(data)
+    if not names:
+        return jsonify({"ok": False, "error": "请填写至少一个签署人名称（可用逗号分隔多个）"}), 400
+    if len(names) > 50:
+        return jsonify({"ok": False, "error": "一次最多添加 50 个签署人"}), 400
     try:
         if _sign_using_mysql():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            nid = mysql_store.insert_signer(name)
+            created = []
+            for name in names:
+                nid = mysql_store.insert_signer(name)
+                created.append({"id": nid, "name": name})
             return jsonify(
                 {
                     "ok": True,
-                    "signer": {"id": nid, "name": name},
+                    "added": len(created),
+                    "created": created,
                     "signers": mysql_store.list_signers(),
                 }
             )
@@ -2521,11 +2787,15 @@ def api_sign_signers_create():
         from sign_handlers.sign_library_local import insert_signer as local_insert_signer
         from sign_handlers.sign_library_local import list_signers as local_list_signers
 
-        nid = local_insert_signer(SIGN_INBOX_ROOT, sid, name)
+        created = []
+        for name in names:
+            nid = local_insert_signer(SIGN_INBOX_ROOT, sid, name)
+            created.append({"id": nid, "name": name})
         return jsonify(
             {
                 "ok": True,
-                "signer": {"id": nid, "name": name},
+                "added": len(created),
+                "created": created,
                 "signers": local_list_signers(SIGN_INBOX_ROOT, sid),
             }
         )
@@ -2565,6 +2835,7 @@ def api_sign_signers_strokes_put(signer_id):
         return jsonify({"ok": False, "error": "无效的签署人 id"}), 400
     sig_raw = request.form.get("sig") or ""
     date_raw = request.form.get("date") or ""
+    locale = (request.form.get("locale") or "zh").strip().lower()
     sig_b = _decode_png_data_url_or_b64(sig_raw) if str(sig_raw).strip() else None
     date_b = _decode_png_data_url_or_b64(date_raw) if str(date_raw).strip() else None
     if sig_b is None and date_b is None:
@@ -2574,14 +2845,56 @@ def api_sign_signers_strokes_put(signer_id):
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            mysql_store.upsert_signer_strokes(signer_id, sig_b, date_b)
-            return jsonify({"ok": True})
+            sig_res = None
+            date_res = None
+            if sig_b is not None:
+                sig_res = mysql_store.upsert_signer_stroke_item(signer_id, "sig", sig_b, locale=locale)
+            if date_b is not None:
+                date_res = mysql_store.upsert_signer_stroke_item(signer_id, "date", date_b, locale=locale)
+            # 兼容旧返回字段：stroke_set_id 仍返回（若两者都提交则也写入旧 set）
+            stroke_set_res = None
+            if sig_b is not None and date_b is not None:
+                try:
+                    stroke_set_res = mysql_store.upsert_signer_strokes(signer_id, sig_b, date_b, locale=locale)
+                except Exception:
+                    stroke_set_res = None
+            return jsonify(
+                {
+                    "ok": True,
+                    "sig_item_id": (sig_res or {}).get("stroke_item_id"),
+                    "date_item_id": (date_res or {}).get("stroke_item_id"),
+                    "stroke_set_id": (stroke_set_res or {}).get("stroke_set_id"),
+                    "overwritten": bool((sig_res or {}).get("overwritten") or (date_res or {}).get("overwritten") or (stroke_set_res or {}).get("overwritten")),
+                }
+            )
         _sign_ensure_session_inbox()
         sid = session["sign_inbox_sid"]
         from sign_handlers.sign_library_local import upsert_strokes as local_upsert
 
-        local_upsert(SIGN_INBOX_ROOT, sid, signer_id, sig_b, date_b)
-        return jsonify({"ok": True})
+        # 会话模式：同样拆分保存（仍兼容 stroke_set）
+        from sign_handlers.sign_library_local import upsert_stroke_item as local_upsert_item
+
+        sig_res = None
+        date_res = None
+        if sig_b is not None:
+            sig_res = local_upsert_item(SIGN_INBOX_ROOT, sid, signer_id, "sig", sig_b, locale=locale)
+        if date_b is not None:
+            date_res = local_upsert_item(SIGN_INBOX_ROOT, sid, signer_id, "date", date_b, locale=locale)
+        stroke_set_res = None
+        if sig_b is not None and date_b is not None:
+            try:
+                stroke_set_res = local_upsert(SIGN_INBOX_ROOT, sid, signer_id, sig_b, date_b, locale=locale)
+            except Exception:
+                stroke_set_res = None
+        return jsonify(
+            {
+                "ok": True,
+                "sig_item_id": (sig_res or {}).get("stroke_item_id"),
+                "date_item_id": (date_res or {}).get("stroke_item_id"),
+                "stroke_set_id": (stroke_set_res or {}).get("stroke_set_id"),
+                "overwritten": bool((sig_res or {}).get("overwritten") or (date_res or {}).get("overwritten") or (stroke_set_res or {}).get("overwritten")),
+            }
+        )
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
@@ -2617,6 +2930,59 @@ def api_sign_signer_stroke_get(signer_id, kind):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/sign/stroke-sets/<set_id>/stroke/<kind>", methods=["GET"])
+def api_sign_stroke_set_stroke_get(set_id, kind):
+    if not _SIGN_FILE_ID_RE.match(set_id or ""):
+        return jsonify({"ok": False, "error": "无效的笔迹套 id"}), 400
+    if kind not in ("sig", "date"):
+        return jsonify({"ok": False, "error": "kind 须为 sig 或 date"}), 400
+    try:
+        blob = None
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            row = mysql_store.get_stroke_set_row(set_id)
+            if row:
+                blob = row.get("sig_png") if kind == "sig" else row.get("date_png")
+        else:
+            _sign_ensure_session_inbox()
+            sid = session["sign_inbox_sid"]
+            from sign_handlers.sign_library_local import get_strokes_for_set as local_get_set
+
+            sig_b, date_b = local_get_set(SIGN_INBOX_ROOT, sid, set_id)
+            blob = sig_b if kind == "sig" else date_b
+        if not blob:
+            return Response(status=404)
+        return Response(blob, mimetype="image/png")
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/stroke-items/<item_id>/png", methods=["GET"])
+def api_sign_stroke_item_get(item_id):
+    if not _SIGN_FILE_ID_RE.match(item_id or ""):
+        return jsonify({"ok": False, "error": "无效的笔迹素材 id"}), 400
+    try:
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            row = mysql_store.get_stroke_item_row(item_id)
+            blob = (row or {}).get("png")
+        else:
+            _sign_ensure_session_inbox()
+            sid = session["sign_inbox_sid"]
+            from sign_handlers.sign_library_local import get_stroke_item_bytes as local_get_item
+
+            blob = local_get_item(SIGN_INBOX_ROOT, sid, item_id)
+        if not blob:
+            return Response(status=404)
+        return Response(blob, mimetype="image/png")
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/sign/files/<file_id>/role-map", methods=["GET"])
 def api_sign_file_role_map_get(file_id):
     if not _SIGN_FILE_ID_RE.match(file_id or ""):
@@ -2645,7 +3011,14 @@ def api_sign_file_role_map_put(file_id):
     m = data.get("map")
     if not isinstance(m, dict):
         return jsonify({"ok": False, "error": "请求体需包含 map 对象"}), 400
-    clean = {str(k): str(v) for k, v in m.items() if k and v}
+    clean = {}
+    for k, v in m.items():
+        if not k or not v:
+            continue
+        if isinstance(v, dict):
+            clean[str(k)] = {"sig": v.get("sig"), "date": v.get("date")}
+        else:
+            clean[str(k)] = str(v)
     try:
         if _sign_using_mysql():
             from sign_handlers import mysql_store
@@ -2719,13 +3092,19 @@ def api_sign_batch():
         date_map = {}
         miss = None
         for rid in roles:
-            sid_signer = mapping[rid]
-            srow = mysql_store.get_signer_strokes_row(sid_signer)
-            if not srow or not srow.get("sig_png") or not srow.get("date_png"):
-                miss = f"角色 {rid} 对应签署人缺少完整笔迹"
+            pair = mapping.get(rid) or {}
+            sig_id = (pair.get("sig") if isinstance(pair, dict) else None) or None
+            date_id = (pair.get("date") if isinstance(pair, dict) else None) or None
+            if not sig_id or not date_id:
+                miss = f"角色 {rid} 未同时绑定签名与日期素材"
                 break
-            sig_map[rid] = srow["sig_png"]
-            date_map[rid] = srow["date_png"]
+            srow = mysql_store.get_stroke_item_row(sig_id)
+            drow = mysql_store.get_stroke_item_row(date_id)
+            if not srow or not srow.get("png") or not drow or not drow.get("png"):
+                miss = f"角色 {rid} 对应素材缺失"
+                break
+            sig_map[rid] = srow["png"]
+            date_map[rid] = drow["png"]
         if miss:
             results.append({"file_id": fid, "ok": False, "error": miss})
             continue
