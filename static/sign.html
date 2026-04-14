@@ -98,6 +98,9 @@
       background: #fff;
       touch-action: none;
       cursor: crosshair;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
     }
     .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
     .btn {
@@ -169,18 +172,21 @@
       <a href="/">返回批量打印</a>
     </div>
     <h1>在线签名</h1>
-    <p class="subtitle">分两块使用：先维护「签署人笔迹」，再在「文件签名」中上传文档、按角色套用笔迹并生成已签文件。</p>
+    <p class="subtitle">分两块使用：先维护每位签署人的<strong>手写签名图、手写日期图</strong>（保存为 PNG 素材，可成套或分条），再在「文件签名」中上传文档、按角色套用并生成已签文件。</p>
     <div id="fileProtoWarn" class="card" style="display:none;background:#fff8e1;border-color:#ffc107;">
       <strong>请勿用本地文件打开本页。</strong> 请在本机运行 <code>python app.py</code> 后，用浏览器打开 <strong>http://127.0.0.1:5050/sign</strong>（或本机局域网 IP 同端口），否则「保存到列表」会失败。
     </div>
 
     <section class="sign-region" id="regionSignerStroke" aria-label="签署人笔迹录入">
-      <h2 class="sign-region-title">一、签署人笔迹录入</h2>
-      <p class="sign-region-desc">添加签署人（支持逗号一次多个），在下方为每人录入签名与日期手写图；保存后可在「文件签名」中从库载入或批量签时自动使用。</p>
+      <h2 class="sign-region-title">一、签署人手写素材</h2>
+      <p class="sign-region-desc">添加签署人（支持逗号一次多个），在下方为每人保存<strong>签名手写图</strong>与<strong>日期手写图</strong>（可只存其一）。列表中的「生成已签文档」一行会标明还缺签名还是还缺日期。保存后可在「文件签名」中从库载入或批量签时使用。</p>
 
       <div class="card" id="signerLibCard">
         <h2>签署人列表</h2>
         <p class="hint" id="signerLibHint">加载中…</p>
+        <div class="btn-row" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-secondary" id="btnRefreshSigners" style="padding:6px 12px;">刷新列表</button>
+        </div>
         <div class="btn-row" id="signerPager" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
           <span class="hint" id="signerPagerInfo" style="margin:0;">—</span>
           <button type="button" class="btn btn-secondary" id="signerPrevBtn" style="padding:6px 12px;">上一页</button>
@@ -196,13 +202,14 @@
       </div>
 
       <div class="card" id="signerStrokeCard">
-        <h2>为所选签署人录入 / 更新笔迹</h2>
-        <p class="hint">选择签署人后可选手写、载入；同一签署人可保存多套「签名+日期」笔迹（内容相同则覆盖同一套）。此处与下方「按文件、按角色」签字相互独立。</p>
+        <h2>为所选签署人录入 / 更新手写图</h2>
+        <p class="hint">选择签署人后在画布上手写；可只保存左侧「签名」或只保存右侧「日期」，也可两项一起保存（内容相同则覆盖）。此处与下方「按文件、按角色」画布相互独立。</p>
         <label for="libSignerSelect" style="margin-top:8px;">当前签署人</label>
+        <input type="search" id="libSignerFilter" placeholder="按签署人姓名或 ID 筛选…" maxlength="200" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
         <select id="libSignerSelect" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
           <option value="">请先添加签署人</option>
         </select>
-        <label for="libStrokeSetSelect" style="margin-top:8px;">笔迹套（可选：载入指定一套；不选则按该人最近一套）</label>
+        <label for="libStrokeSetSelect" style="margin-top:8px;">成对素材套（签名+日期成套；可选指定一套载入，不选则按该人最近一套）</label>
         <select id="libStrokeSetSelect" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
           <option value="">最近一套</option>
         </select>
@@ -230,6 +237,25 @@
           <button type="button" class="btn btn-primary" id="libSaveStrokesBtn" style="padding:10px 18px;">保存笔迹到该签署人</button>
         </div>
       </div>
+
+      <div class="card" id="strokeItemsCard">
+        <h2>已存储的签字图片</h2>
+        <p class="hint" id="strokeItemsHint">加载中…</p>
+        <div class="btn-row" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-secondary" id="btnRefreshStrokeItems" style="padding:6px 12px;">刷新列表</button>
+        </div>
+        <label for="strokeItemSearchInput">按签署人搜索（姓名或 ID）</label>
+        <div class="btn-row" style="margin-top:6px;">
+          <input type="search" id="strokeItemSearchInput" placeholder="输入关键字" maxlength="200" style="flex:1;min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+          <button type="button" class="btn btn-secondary" id="strokeItemSearchBtn">搜索</button>
+        </div>
+        <div class="btn-row" id="strokeItemPager" style="margin-top:8px;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span class="hint" id="strokeItemPagerInfo" style="margin:0;">—</span>
+          <button type="button" class="btn btn-secondary" id="strokeItemPrevBtn" style="padding:6px 12px;">上一页</button>
+          <button type="button" class="btn btn-secondary" id="strokeItemNextBtn" style="padding:6px 12px;">下一页</button>
+        </div>
+        <ul class="file-list" id="strokeItemListEl" style="margin-top:12px;"></ul>
+      </div>
     </section>
 
     <section class="sign-region" id="regionFileSign" aria-label="文件签名">
@@ -252,6 +278,9 @@
     <div class="card">
       <h2>2. 选择要签名的文件</h2>
       <p class="hint" id="listHint">正在加载文件列表…</p>
+      <div class="btn-row" style="margin:6px 0 10px;align-items:center;gap:8px;flex-wrap:wrap;">
+        <button type="button" class="btn btn-secondary" id="btnRefreshFiles" style="padding:6px 12px;">刷新列表</button>
+      </div>
       <div class="btn-row" style="margin-bottom:10px;">
         <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
           <input type="checkbox" id="batchSelectAll"> 全选（用于下方「一键批量签」）
@@ -281,6 +310,13 @@
         <button type="button" class="btn btn-primary" id="submitBtn" disabled>生成已签名文档</button>
         <button type="button" class="btn btn-secondary" id="batchSignBtn" disabled>一键批量签（已勾选文件）</button>
       </div>
+      <div class="btn-row" style="align-items:center;margin-top:8px;">
+        <label for="signSourceMode" style="margin:0;font-size:0.9rem;min-width:5.5em;">签名来源</label>
+        <select id="signSourceMode" style="flex:1;min-width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+          <option value="canvas" selected>画布（当前手写 / 已载入到画布）</option>
+          <option value="library">库映射（按“角色→素材”直接取库中签名/日期）</option>
+        </select>
+      </div>
       <p class="hint" id="batchResultMsg" style="display:none;margin-top:10px;"></p>
       <p class="err" id="errMsg" style="display:none;"></p>
     </div>
@@ -288,6 +324,21 @@
     <div class="card" id="signedSection">
       <h2>已签名文档（数据库共享）</h2>
       <p class="hint" id="signedHint">正在加载已签名列表…</p>
+      <div class="btn-row" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
+        <button type="button" class="btn btn-secondary" id="btnRefreshSigned" style="padding:6px 12px;">刷新列表</button>
+      </div>
+      <div id="signedSearchRow" style="display:none;">
+        <label for="signedSearchInput">按文件名搜索（输出文件名或源文件名）</label>
+        <div class="btn-row" style="margin-top:6px;">
+          <input type="search" id="signedSearchInput" placeholder="输入关键字" maxlength="200" style="flex:1;min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+          <button type="button" class="btn btn-secondary" id="signedSearchBtn">搜索</button>
+        </div>
+        <div class="btn-row" id="signedPager" style="margin-top:8px;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span class="hint" id="signedPagerInfo" style="margin:0;">—</span>
+          <button type="button" class="btn btn-secondary" id="signedPrevBtn" style="padding:6px 12px;">上一页</button>
+          <button type="button" class="btn btn-secondary" id="signedNextBtn" style="padding:6px 12px;">下一页</button>
+        </div>
+      </div>
       <ul class="file-list" id="signedList"></ul>
     </div>
     </section>

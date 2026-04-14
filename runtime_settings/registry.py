@@ -188,6 +188,16 @@ _reg(
 )
 _reg(
     SettingMeta(
+        "SIGN_FTP_REQUIRED",
+        False,
+        "bool",
+        "sign",
+        "签名：强制上传 FTP 成功",
+        description="1=生成/保存素材时必须上传 FTP 成功，否则返回失败；0=FTP 失败则回退 MySQL BLOB（仍可下载），并在相关记录中保存 ftp_last_error 便于排查",
+    )
+)
+_reg(
+    SettingMeta(
         "MYSQL_HOST",
         "",
         "str",
@@ -240,6 +250,77 @@ _reg(
         "str",
         "mysql",
         "MySQL 字符集",
+    )
+)
+
+# ----------------
+# FTP（签名素材/已签输出/待签文件等可上传到 FTP）
+# ----------------
+_reg(
+    SettingMeta(
+        "FTP_HOST",
+        "10.26.1.221",
+        "str",
+        "ftp",
+        "FTP 主机",
+    )
+)
+_reg(
+    SettingMeta(
+        "FTP_PORT",
+        "2121",
+        "str",
+        "ftp",
+        "FTP 端口",
+    )
+)
+_reg(
+    SettingMeta(
+        "FTP_USER",
+        "aiwordftpuser",
+        "str",
+        "ftp",
+        "FTP 用户",
+    )
+)
+_reg(
+    SettingMeta(
+        "FTP_PASSWORD",
+        "",
+        "str",
+        "ftp",
+        "FTP 密码",
+        is_secret=True,
+    )
+)
+_reg(
+    SettingMeta(
+        "FTP_BASE_DIR",
+        "/upload",
+        "str",
+        "ftp",
+        "FTP 根目录",
+        description="远端父目录（会与 FTP_APP_DIR 拼接）；例如 /upload",
+    )
+)
+_reg(
+    SettingMeta(
+        "FTP_APP_DIR",
+        "aiprintword",
+        "str",
+        "ftp",
+        "FTP 应用目录名",
+        description="在 FTP_BASE_DIR 下的子目录名；默认 aiprintword",
+    )
+)
+_reg(
+    SettingMeta(
+        "FTP_PASV",
+        True,
+        "bool",
+        "ftp",
+        "FTP 被动模式（PASV）",
+        description="建议开启（移动/局域网/NAT 环境更稳定）；关闭则用主动模式",
     )
 )
 

@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 Word .docx：在模板已预留的空白处插入签名/日期 PNG（不新增签名字段）。
-定位：优先表格「关键词单元格 → 右侧空单元格」；否则段落内关键词后的占位符/下划线 run。
+定位顺序：
+1) 表格内「角色/姓名格 + 邻列 Date/日期 表头」→ 签名只插角色侧（姓名后或尾部空白），日期只插日期列；
+2) 三列表「角色+姓名 | 空签字列 | 日期列」→ 签名插中间格，日期插日期列；
+3) 原逻辑：关键词单元格 → 右侧空单元格；段落内关键词后的占位符/下划线 run。
 """
 from __future__ import annotations
 
@@ -17,10 +20,16 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from sign_handlers.config import ROLE_ID_TO_KEYWORD, role_keywords
-from sign_handlers.label_match import cell_text_matches_keyword, paragraph_text_keyword_end_offset
+from sign_handlers.label_match import (
+    cell_text_matches_keyword,
+    paragraph_text_keyword_end_offset,
+    xlsx_cell_has_leading_role_keyword,
+)
 
 # 可见占位字符（作者：____ 等）
 _PLACEHOLDER_CHARS = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·]+$")
+# 右侧「日期」列表头（整格以 Date/日期 开头）
+_DATE_HEADER_CELL = re.compile(r"^\s*(日期|Date)\s*[:：]?\s*", re.IGNORECASE)
 
 _PIC_WIDTH = Cm(2.8)
 _PIC_WIDTH_SMALL = Cm(2.0)
@@ -96,10 +105,145 @@ def _clear_runs_after_offset(p: Paragraph, start_char_offset: int) -> None:
 
 
 def _insert_pictures_in_paragraph(p: Paragraph, sig_png: bytes, date_png: bytes) -> None:
-    p.add_run(" ")
     p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
     p.add_run(" ")
     p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+
+
+def _cell_looks_like_date_header_cell(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(_DATE_HEADER_CELL.match(t))
+
+
+def _char_is_signature_blank_placeholder(c: str) -> bool:
+    if not c:
+        return False
+    if c in " \t\n\r_\u00a0":
+        return True
+    if c in "-—–\u2014\u2015\u2500\u3000.·…．~～":
+        return True
+    return False
+
+
+def _sig_image_insert_char_offset(full: str, kw_end: int) -> int:
+    """
+    签名图插入点（字符下标）：关键词结束后，若有「姓名等正文 + 尾部下划线空白」则插在空白起点；
+    若关键词后整段为占位则插在关键词后；否则插在段落末尾（姓名后无下划线时）。
+    """
+    if kw_end < 0:
+        return len(full)
+    if kw_end >= len(full):
+        return len(full)
+    tail = full[kw_end:]
+    if _is_emptyish_text(tail):
+        return kw_end
+    j = len(full)
+    while j > kw_end and _char_is_signature_blank_placeholder(full[j - 1]):
+        j -= 1
+    if j < len(full):
+        return j
+    return len(full)
+
+
+def _find_date_label_end_in_paragraph(p: Paragraph) -> int:
+    full = _paragraph_full_text(p)
+    if not full:
+        return -1
+    m = re.search(r"(?i)(?:\bDate\b|日期)\s*[:：]?", full)
+    return m.end() if m else -1
+
+
+def _insert_sig_only_at_char_offset(p: Paragraph, char_offset: int, sig_png: bytes) -> None:
+    # 不能把插入点挪到段落末尾：
+    # Word 模板中常用 tab leader/制表符/空格作为“占位留白”，若插入点被挪到末尾，
+    # 图片会被推到占位末端（看起来离“Author:/Date:”很远）。
+    # 因此保持插入点在“正文末尾/冒号后”，并清除其后的占位字符即可。
+    _clear_runs_after_offset(p, char_offset)
+    p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+
+
+def _insert_date_only_in_date_cell(date_cell, date_png: bytes) -> bool:
+    """在「日期/Date」标签后的空白处只插入日期手写图。"""
+    for p in date_cell.paragraphs:
+        offd = _find_date_label_end_in_paragraph(p)
+        if offd < 0:
+            continue
+        _clear_runs_after_offset(p, offd)
+        p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+        return True
+    if date_cell.paragraphs:
+        p0 = date_cell.paragraphs[0]
+        for r in list(p0.runs):
+            r.text = ""
+        p0.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+        return True
+    p = date_cell.add_paragraph()
+    p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+    return True
+
+
+def _insert_sig_in_role_cell_for_adjacent_date_column(
+    role_cell, keyword: str, sig_png: bytes
+) -> bool:
+    for p in role_cell.paragraphs:
+        off = _find_keyword_in_paragraph(p, keyword)
+        if off < 0:
+            continue
+        full = _paragraph_full_text(p)
+        ins = _sig_image_insert_char_offset(full, off)
+        _insert_sig_only_at_char_offset(p, ins, sig_png)
+        return True
+    return False
+
+
+def _insert_sig_only_in_empty_cell(cell, sig_png: bytes) -> None:
+    p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+    for r in list(p.runs):
+        r.text = ""
+    p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+
+
+def _try_table_adjacent_date_column(
+    table: Table,
+    keyword: str,
+    sig_png: bytes,
+    date_png: bytes,
+) -> bool:
+    """
+    常见审批表：
+    - 两列：左格「角色/姓名 + 签字空白」+ 右邻格「Date:/日期: + 空白」→ 签名只插左格，日期只插右格。
+    - 三列：角色+姓名 | 空签字列 | 日期列 → 签名优先插左格关键词/冒号后（更贴近字段标记），日期插右格。
+    避免两段图都落在左侧姓名后。
+    """
+    for row in table.rows:
+        cells = row.cells
+        for ci in range(len(cells) - 1):
+            left = cells[ci]
+            lt = _cell_text(left)
+            if not xlsx_cell_has_leading_role_keyword(lt, keyword):
+                continue
+            date_idx = None
+            if ci + 1 < len(cells) and _cell_looks_like_date_header_cell(_cell_text(cells[ci + 1])):
+                date_idx = ci + 1
+            elif ci + 2 < len(cells) and _cell_looks_like_date_header_cell(_cell_text(cells[ci + 2])):
+                date_idx = ci + 2
+            if date_idx is None:
+                continue
+            date_cell = cells[date_idx]
+            if date_idx == ci + 1:
+                if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
+                    continue
+            else:
+                mid = cells[ci + 1]
+                if not _is_emptyish_text(_cell_text(mid)):
+                    continue
+                # 优先贴近“角色/姓名”字段标记插入，避免落到 tab leader/占位末端导致距离过远
+                if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
+                    _insert_sig_only_in_empty_cell(mid, sig_png)
+            if not _insert_date_only_in_date_cell(date_cell, date_png):
+                continue
+            return True
+    return False
 
 
 def _try_paragraph_inline(
@@ -156,6 +300,8 @@ def _try_table_role(
     sig_png: bytes,
     date_png: bytes,
 ) -> bool:
+    if _try_table_adjacent_date_column(table, keyword, sig_png, date_png):
+        return True
     rows_list = list(table.rows)
     for ri, row in enumerate(rows_list):
         cells = row.cells

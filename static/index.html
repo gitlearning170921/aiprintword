@@ -1192,6 +1192,8 @@
           has_zip: !!r.download_token,
           has_stash: false,
           download_token: r.download_token,
+          zip_ftp: (r.zip_ftp_uploaded === true ? true : (r.zip_ftp_uploaded === false ? false : null)),
+          zip_ftp_error: r.zip_ftp_error || null,
           _resultSnapshot: r,
         });
       }
@@ -1208,6 +1210,8 @@
           failed: e.failed,
           has_zip: !!e.has_zip,
           has_stash: !!e.has_stash,
+          zip_ftp: (e.zip_ftp === true ? true : (e.zip_ftp === false ? false : null)),
+          zip_ftp_error: e.zip_ftp_error || null,
         });
       });
       return rows;
@@ -1272,7 +1276,23 @@
         const badgeText = row.failed === 0 ? '全部成功' : ('失败 ' + row.failed);
         const modeLabel = RUN_MODE_LABEL[row.run_mode] || row.run_mode || '—';
         const localBadge = row._local ? '<span class="badge-local">本轮</span>' : '';
-        const stats = '共 ' + (row.total || 0) + ' · 成 ' + (row.ok || 0) + ' · 败 ' + (row.failed || 0);
+        let zipFtpPart = '';
+        if (row.has_zip) {
+          let z = ' · ZIP→FTP：';
+          if (row.zip_ftp === true) {
+            z += '已传';
+          } else if (row.zip_ftp === false) {
+            z += '未传';
+            if (row.zip_ftp_error) {
+              const s = String(row.zip_ftp_error);
+              z += '（' + s.slice(0, 120) + (s.length > 120 ? '…' : '') + '）';
+            }
+          } else {
+            z += '—';
+          }
+          zipFtpPart = z;
+        }
+        const stats = '共 ' + (row.total || 0) + ' · 成 ' + (row.ok || 0) + ' · 败 ' + (row.failed || 0) + zipFtpPart;
         let dl;
         if (row._local && row.has_zip && row.download_token) {
           dl = '<a class="btn btn-ghost" href="/api/batch-export/' + encodeURIComponent(row.download_token) + '">下载 ZIP</a>';

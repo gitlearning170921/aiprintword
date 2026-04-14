@@ -33,6 +33,33 @@ from pymysql.cursors import DictCursor
 
 _DB_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
 
+
+def _sign_ftp_required() -> bool:
+    try:
+        from runtime_settings.resolve import get_setting
+
+        return bool(get_setting("SIGN_FTP_REQUIRED"))
+    except Exception:
+        return False
+
+
+def _ftp_upload_bytes_or_mysql(data: bytes, remote_rel: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    优先 FTP；失败返回 (None, err_msg) 供写入 ftp_last_error，并由调用方将内容落 MySQL BLOB。
+    未配置 FTP 时返回 (None, None)。SIGN_FTP_REQUIRED 为真且上传失败时抛出异常。
+    """
+    from ftp_store import try_upload_bytes
+
+    path, err = try_upload_bytes(data, remote_rel)
+    if path:
+        return path, None
+    if err is None:
+        return None, None
+    if _sign_ftp_required():
+        raise RuntimeError(err)
+    return None, err
+
+
 _mysql_init_lock = threading.Lock()
 _mysql_inited = False
 
@@ -290,6 +317,14 @@ def _ensure_sign_file_columns(conn) -> None:
                 cur.execute("ALTER TABLE sign_signed_output MODIFY COLUMN file_data LONGBLOB NULL")
             except Exception:
                 pass
+            for sql in (
+                "ALTER TABLE sign_uploaded_file ADD COLUMN ftp_last_error VARCHAR(512) NULL",
+                "ALTER TABLE sign_signed_output ADD COLUMN ftp_last_error VARCHAR(512) NULL",
+            ):
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -334,19 +369,25 @@ def list_files() -> List[dict]:
     with _conn_commit() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, original_name AS name, ext, created_at "
+                "SELECT id, original_name AS name, ext, created_at, ftp_path, ftp_last_error, "
+                " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob "
                 "FROM sign_uploaded_file ORDER BY created_at DESC"
             )
             rows = cur.fetchall()
     out = []
     for r in rows:
         ts = r.get("created_at")
+        ftp_path = (r.get("ftp_path") or "").strip()
+        fe = (r.get("ftp_last_error") or "").strip()
         out.append(
             {
                 "id": r["id"],
                 "name": r["name"],
                 "ext": r["ext"],
                 "created_at": ts.isoformat(sep=" ") if ts is not None else None,
+                "ftp_uploaded": bool(ftp_path),
+                "blob_stored": bool(r.get("has_blob")),
+                "ftp_last_error": fe or None,
             }
         )
     return out
@@ -363,24 +404,18 @@ def count_files() -> int:
 
 def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) -> None:
     ensure_sign_mysql()
-    ftp_path = None
-    sha = None
-    size = None
-    try:
-        size = int(len(file_data or b""))
-        sha = hashlib.sha256(file_data or b"").hexdigest()
-        from ftp_store import upload_bytes
-
-        safe_name = (original_name or "document")[:200]
-        remote_rel = f"sign/inbox/{file_id}/{safe_name}"
-        ftp_path = upload_bytes(file_data or b"", remote_rel)
-    except Exception:
-        ftp_path = None
+    size = int(len(file_data or b""))
+    sha = hashlib.sha256(file_data or b"").hexdigest()
+    safe_name = (original_name or "document")[:200]
+    remote_rel = f"sign/inbox/{file_id}/{safe_name}"
+    ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(file_data or b"", remote_rel)
+    err_s = (ftp_err or "")[:512] if ftp_err else None
     with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO sign_uploaded_file (id, original_name, ext, ftp_path, file_size, sha256, file_data) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                "INSERT INTO sign_uploaded_file (id, original_name, ext, ftp_path, file_size, sha256, file_data, ftp_last_error) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     file_id,
                     original_name,
@@ -389,6 +424,7 @@ def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) ->
                     size,
                     sha,
                     None if ftp_path else file_data,
+                    None if ftp_path else err_s,
                 ),
             )
 
@@ -425,7 +461,7 @@ def get_file_row(file_id: str) -> Optional[dict]:
     with _conn_commit() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, original_name AS name, ext, ftp_path, file_data "
+                "SELECT id, original_name AS name, ext, ftp_path, ftp_last_error, file_data "
                 "FROM sign_uploaded_file WHERE id=%s",
                 (file_id,),
             )
@@ -436,12 +472,25 @@ def get_file_row(file_id: str) -> Optional[dict]:
         return row
     p = (row.get("ftp_path") or "").strip()
     if p:
-        try:
-            from ftp_store import download_bytes
+        import time
 
-            row["file_data"] = download_bytes(p)
-        except Exception:
-            pass
+        from ftp_store import download_bytes
+
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                row["file_data"] = download_bytes(p)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+        if last_err is not None:
+            try:
+                print(f"[sign] get_file_row FTP retry exhausted id={file_id}: {last_err}")
+            except Exception:
+                pass
     return row
 
 
@@ -479,31 +528,73 @@ def count_signed_outputs() -> int:
             return int(row["c"]) if row else 0
 
 
-def list_signed_outputs() -> List[dict]:
+def _signed_output_row_to_item(r: dict) -> dict:
+    ts = r.get("created_at")
+    ftp_path = (r.get("ftp_path") or "").strip()
+    fe = (r.get("ftp_last_error") or "").strip()
+    return {
+        "id": r["id"],
+        "source_file_id": r.get("source_file_id"),
+        "source_name": r.get("source_name"),
+        "name": r.get("output_name"),
+        "ext": r.get("ext"),
+        "roles_json": r.get("roles_json"),
+        "ftp_uploaded": bool(ftp_path),
+        "ftp_path": ftp_path or None,
+        "blob_stored": bool(r.get("has_blob")),
+        "ftp_last_error": fe or None,
+        "created_at": ts.isoformat(sep=" ") if ts is not None else None,
+    }
+
+
+def list_signed_outputs_page(
+    *,
+    q: str = "",
+    page: int = 1,
+    page_size: int = 10,
+) -> Tuple[List[dict], int]:
+    """已签名文档列表：按输出文件名/源文件名模糊搜索，分页。"""
     ensure_sign_mysql()
+    q = (q or "").strip()
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 500))
+    offset = (page - 1) * page_size
     with _conn_commit() as conn:
         _ensure_signed_output_table(conn)
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, source_file_id, source_name, output_name, ext, roles_json, created_at "
-                "FROM sign_signed_output ORDER BY created_at DESC"
-            )
-            rows = cur.fetchall()
-    out: List[dict] = []
-    for r in rows:
-        ts = r.get("created_at")
-        out.append(
-            {
-                "id": r["id"],
-                "source_file_id": r.get("source_file_id"),
-                "source_name": r.get("source_name"),
-                "name": r.get("output_name"),
-                "ext": r.get("ext"),
-                "roles_json": r.get("roles_json"),
-                "created_at": ts.isoformat(sep=" ") if ts is not None else None,
-            }
-        )
-    return out
+            if q:
+                like = f"%{q}%"
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM sign_signed_output "
+                    "WHERE output_name LIKE %s OR source_name LIKE %s",
+                    (like, like),
+                )
+                total = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
+                    "FROM sign_signed_output "
+                    "WHERE output_name LIKE %s OR source_name LIKE %s "
+                    "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (like, like, page_size, offset),
+                )
+            else:
+                cur.execute("SELECT COUNT(*) AS c FROM sign_signed_output")
+                total = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
+                    "FROM sign_signed_output ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (page_size, offset),
+                )
+            rows = cur.fetchall() or []
+    out = [_signed_output_row_to_item(dict(r)) for r in rows]
+    return out, total
+
+
+def list_signed_outputs() -> List[dict]:
+    items, _ = list_signed_outputs_page(q="", page=1, page_size=500000)
+    return items
 
 
 def insert_signed_output(
@@ -516,26 +607,20 @@ def insert_signed_output(
     file_data: bytes,
 ) -> None:
     ensure_sign_mysql()
-    ftp_path = None
-    sha = None
-    size = None
-    try:
-        size = int(len(file_data or b""))
-        sha = hashlib.sha256(file_data or b"").hexdigest()
-        from ftp_store import upload_bytes
-
-        safe_name = (output_name or "signed")[:200]
-        remote_rel = f"sign/output/{signed_id}/{safe_name}"
-        ftp_path = upload_bytes(file_data or b"", remote_rel)
-    except Exception:
-        ftp_path = None
+    size = int(len(file_data or b""))
+    sha = hashlib.sha256(file_data or b"").hexdigest()
+    safe_name = (output_name or "signed")[:200]
+    remote_rel = f"sign/output/{signed_id}/{safe_name}"
+    ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(file_data or b"", remote_rel)
+    err_s = (ftp_err or "")[:512] if ftp_err else None
     with _conn_commit() as conn:
         _ensure_signed_output_table(conn)
+        _ensure_sign_file_columns(conn)
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO sign_signed_output "
-                "(id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, file_size, sha256, file_data) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "(id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, file_size, sha256, file_data, ftp_last_error) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     signed_id,
                     source_file_id,
@@ -547,6 +632,7 @@ def insert_signed_output(
                     size,
                     sha,
                     None if ftp_path else file_data,
+                    None if ftp_path else err_s,
                 ),
             )
 
@@ -604,12 +690,34 @@ def delete_signed_output(signed_id: str) -> int:
             return cur.rowcount
 
 
+def _emit_ftp_migration_abort(
+    stats: Dict[str, Any],
+    errs: List[dict],
+    *,
+    abort_cap: int,
+    phase: str,
+) -> None:
+    """失败次数达到上限时立即输出样例，便于排查，不等到整段跑完。"""
+    stats["aborted"] = True
+    print(
+        f"\n*** 已中止（{phase}）：失败次数达到 {abort_cap}，请先排查 FTP 连接、账号权限与系统设置中的 FTP_*。错误样例：",
+        flush=True,
+    )
+    for e in errs[:5]:
+        print(
+            f"    [{e.get('table')}] id={e.get('id')!r} {e.get('error')}",
+            flush=True,
+        )
+
+
 def migrate_mysql_blobs_to_ftp(
     *,
     batch_size: int = 2000,
     max_total: int = 200000,
     clear_blob: bool = True,
     error_samples: int = 20,
+    progress_log: bool = False,
+    abort_after_failures: Optional[int] = None,
 ) -> Dict[str, int]:
     """
     将历史遗留的 MySQL BLOB（sign_uploaded_file/sign_signed_output.file_data）迁移到 FTP。
@@ -625,11 +733,17 @@ def migrate_mysql_blobs_to_ftp(
     bs = max(1, min(int(batch_size or 0), 20000))
     mt = max(1, min(int(max_total or 0), 2000000))
     es = max(0, min(int(error_samples or 0), 200))
+    abort_cap: Optional[int] = None
+    if abort_after_failures is not None:
+        af = int(abort_after_failures)
+        if af > 0:
+            abort_cap = af
     stats = {"scanned": 0, "uploaded": 0, "skipped": 0, "failed": 0, "done": 0}
     errs = []
+    abort_early = False
 
     def _do_table(table: str, name_col: str, id_col: str, kind: str):
-        nonlocal stats, errs
+        nonlocal stats, errs, abort_early
         processed = 0
         while processed < mt:
             with _conn_commit() as conn:
@@ -644,6 +758,12 @@ def migrate_mysql_blobs_to_ftp(
                     rows = cur.fetchall() or []
             if not rows:
                 break
+            if progress_log:
+                print(
+                    f"  [{table}] 本批 {len(rows)} 条，累计 uploaded={stats['uploaded']} "
+                    f"failed={stats['failed']} scanned={stats['scanned']}",
+                    flush=True,
+                )
             for r in rows:
                 if processed >= mt:
                     break
@@ -680,9 +800,16 @@ def migrate_mysql_blobs_to_ftp(
                     stats["failed"] += 1
                     if es and len(errs) < es:
                         errs.append({"table": table, "id": fid, "error": str(e)[:300]})
+                    if abort_cap is not None and stats["failed"] >= abort_cap:
+                        _emit_ftp_migration_abort(stats, errs, abort_cap=abort_cap, phase=table)
+                        abort_early = True
+                        break
+            if abort_early:
+                break
 
     _do_table("sign_uploaded_file", "original_name", "id", "inbox")
-    _do_table("sign_signed_output", "output_name", "id", "output")
+    if not abort_early:
+        _do_table("sign_signed_output", "output_name", "id", "output")
     stats["done"] = stats["uploaded"] + stats["skipped"] + stats["failed"]
     if errs:
         stats["errors"] = errs
@@ -693,6 +820,8 @@ def verify_and_backfill_ftp_files(
     *,
     limit: int = 2000,
     error_samples: int = 20,
+    progress_log: bool = False,
+    abort_after_failures: Optional[int] = None,
 ) -> Dict[str, int]:
     """
     校验/补传：
@@ -704,8 +833,14 @@ def verify_and_backfill_ftp_files(
     ensure_sign_mysql()
     lim = max(1, min(int(limit or 0), 200000))
     es = max(0, min(int(error_samples or 0), 200))
+    abort_cap: Optional[int] = None
+    if abort_after_failures is not None:
+        af = int(abort_after_failures)
+        if af > 0:
+            abort_cap = af
     stats = {"checked": 0, "backfilled": 0, "missing_blob": 0, "failed": 0}
     errs = []
+    abort_early = False
 
     def _ftp_exists(ftp, path: str) -> bool:
         try:
@@ -715,7 +850,9 @@ def verify_and_backfill_ftp_files(
             return False
 
     def _check_table(table: str, name_col: str, id_col: str, kind: str):
-        nonlocal stats, errs
+        nonlocal stats, errs, abort_early
+        if progress_log:
+            print(f"[verify] 检查表 {table}（最多 {lim} 行）…", flush=True)
         with _conn_commit() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -772,9 +909,172 @@ def verify_and_backfill_ftp_files(
                     stats["failed"] += 1
                     if es and len(errs) < es:
                         errs.append({"table": table, "id": fid, "error": str(e)[:300]})
+                    if abort_cap is not None and stats["failed"] >= abort_cap:
+                        _emit_ftp_migration_abort(
+                            stats, errs, abort_cap=abort_cap, phase=f"verify {table}"
+                        )
+                        abort_early = True
+                        break
+
+    def _check_stroke_items():
+        nonlocal stats, errs, abort_early
+        if progress_log:
+            print(f"[verify] 检查表 sign_stroke_item（最多 {lim} 行）…", flush=True)
+        with _conn_commit() as conn:
+            _ensure_signer_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, signer_id, locale, kind, ftp_path, png "
+                    "FROM sign_stroke_item ORDER BY updated_at DESC LIMIT %s",
+                    (lim,),
+                )
+                rows = cur.fetchall() or []
+        from ftp_store import _ftp as _ftp_ctx, upload_bytes
+
+        with _ftp_ctx() as ftp:
+            for r in rows:
+                stats["checked"] += 1
+                item_id = (r.get("id") or "").strip()
+                ftp_path = (r.get("ftp_path") or "").strip()
+                blob = r.get("png") or b""
+                if not item_id:
+                    continue
+                try:
+                    target_rel = f"sign/strokeitem/{item_id}.png"
+                    if ftp_path:
+                        if _ftp_exists(ftp, ftp_path):
+                            continue
+                        if not blob:
+                            stats["missing_blob"] += 1
+                            continue
+                        new_path = upload_bytes(blob, target_rel)
+                        with _conn_commit() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s WHERE id=%s",
+                                    (new_path, int(len(blob)), item_id),
+                                )
+                        stats["backfilled"] += 1
+                        continue
+                    if blob:
+                        new_path = upload_bytes(blob, target_rel)
+                        with _conn_commit() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s WHERE id=%s",
+                                    (new_path, int(len(blob)), item_id),
+                                )
+                        stats["backfilled"] += 1
+                except Exception as e:
+                    stats["failed"] += 1
+                    if es and len(errs) < es:
+                        errs.append({"table": "sign_stroke_item", "id": item_id, "error": str(e)[:300]})
+                    if abort_cap is not None and stats["failed"] >= abort_cap:
+                        _emit_ftp_migration_abort(
+                            stats, errs, abort_cap=abort_cap, phase="verify sign_stroke_item"
+                        )
+                        abort_early = True
+                        break
 
     _check_table("sign_uploaded_file", "original_name", "id", "inbox")
+    if abort_early:
+        if errs:
+            stats["errors"] = errs
+        return stats
     _check_table("sign_signed_output", "output_name", "id", "output")
+    if abort_early:
+        if errs:
+            stats["errors"] = errs
+        return stats
+    _check_stroke_items()
+    if errs:
+        stats["errors"] = errs
+    return stats
+
+
+def migrate_stroke_items_blobs_to_ftp(
+    *,
+    batch_size: int = 2000,
+    max_total: int = 200000,
+    clear_blob: bool = True,
+    error_samples: int = 20,
+    progress_log: bool = False,
+    abort_after_failures: Optional[int] = None,
+) -> Dict[str, int]:
+    """
+    将 sign_stroke_item 里的 png BLOB 迁移到 FTP。
+    条件：ftp_path 为空且 png 非空。
+    """
+    ensure_sign_mysql()
+    bs = max(1, min(int(batch_size or 0), 20000))
+    mt = max(1, min(int(max_total or 0), 2000000))
+    es = max(0, min(int(error_samples or 0), 200))
+    abort_cap: Optional[int] = None
+    if abort_after_failures is not None:
+        af = int(abort_after_failures)
+        if af > 0:
+            abort_cap = af
+    stats = {"scanned": 0, "uploaded": 0, "skipped": 0, "failed": 0, "done": 0}
+    errs = []
+    processed = 0
+    while processed < mt:
+        with _conn_commit() as conn:
+            _ensure_signer_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, png FROM sign_stroke_item "
+                    "WHERE (ftp_path IS NULL OR ftp_path='') AND png IS NOT NULL AND LENGTH(png) > 0 "
+                    "ORDER BY updated_at DESC LIMIT %s",
+                    (bs,),
+                )
+                rows = cur.fetchall() or []
+        if not rows:
+            break
+        if progress_log:
+            print(
+                f"  [sign_stroke_item] 本批 {len(rows)} 条，累计 uploaded={stats['uploaded']} "
+                f"failed={stats['failed']} scanned={stats['scanned']}",
+                flush=True,
+            )
+        for r in rows:
+            if processed >= mt:
+                break
+            processed += 1
+            stats["scanned"] += 1
+            item_id = (r.get("id") or "").strip()
+            png_b = r.get("png") or b""
+            if not item_id or not png_b:
+                stats["skipped"] += 1
+                continue
+            try:
+                from ftp_store import upload_bytes
+
+                ftp_path = upload_bytes(png_b, f"sign/strokeitem/{item_id}.png")
+                with _conn_commit() as conn:
+                    with conn.cursor() as cur:
+                        if clear_blob:
+                            cur.execute(
+                                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s, png=NULL WHERE id=%s",
+                                (ftp_path, int(len(png_b)), item_id),
+                            )
+                        else:
+                            cur.execute(
+                                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s WHERE id=%s",
+                                (ftp_path, int(len(png_b)), item_id),
+                            )
+                stats["uploaded"] += 1
+            except Exception as e:
+                stats["failed"] += 1
+                if es and len(errs) < es:
+                    errs.append({"table": "sign_stroke_item", "id": item_id, "error": str(e)[:300]})
+                if abort_cap is not None and stats["failed"] >= abort_cap:
+                    _emit_ftp_migration_abort(
+                        stats, errs, abort_cap=abort_cap, phase="sign_stroke_item"
+                    )
+                    break
+        if stats.get("aborted"):
+            break
+    stats["done"] = stats["uploaded"] + stats["skipped"] + stats["failed"]
     if errs:
         stats["errors"] = errs
     return stats
@@ -786,6 +1086,8 @@ def migrate_signer_strokes_blobs_to_ftp(
     max_total: int = 200000,
     clear_blob: bool = True,
     error_samples: int = 20,
+    progress_log: bool = False,
+    abort_after_failures: Optional[int] = None,
 ) -> Dict[str, int]:
     """
     将 sign_signer_stroke 里的 sig_png/date_png 迁移到 FTP（可复用素材）。
@@ -795,6 +1097,11 @@ def migrate_signer_strokes_blobs_to_ftp(
     bs = max(1, min(int(batch_size or 0), 20000))
     mt = max(1, min(int(max_total or 0), 2000000))
     es = max(0, min(int(error_samples or 0), 200))
+    abort_cap: Optional[int] = None
+    if abort_after_failures is not None:
+        af = int(abort_after_failures)
+        if af > 0:
+            abort_cap = af
     stats = {"scanned": 0, "uploaded": 0, "skipped": 0, "failed": 0, "done": 0}
     errs = []
     processed = 0
@@ -815,6 +1122,12 @@ def migrate_signer_strokes_blobs_to_ftp(
                 rows = cur.fetchall() or []
         if not rows:
             break
+        if progress_log:
+            print(
+                f"  [sign_signer_stroke] 本批 {len(rows)} 条，累计 uploaded={stats['uploaded']} "
+                f"failed={stats['failed']} scanned={stats['scanned']}",
+                flush=True,
+            )
         for r in rows:
             if processed >= mt:
                 break
@@ -865,6 +1178,13 @@ def migrate_signer_strokes_blobs_to_ftp(
                 stats["failed"] += 1
                 if es and len(errs) < es:
                     errs.append({"table": "sign_signer_stroke", "id": sid, "error": str(e)[:300]})
+                if abort_cap is not None and stats["failed"] >= abort_cap:
+                    _emit_ftp_migration_abort(
+                        stats, errs, abort_cap=abort_cap, phase="sign_signer_stroke"
+                    )
+                    break
+        if stats.get("aborted"):
+            break
     stats["done"] = stats["uploaded"] + stats["skipped"] + stats["failed"]
     if errs:
         stats["errors"] = errs
@@ -1045,6 +1365,15 @@ def _ensure_signer_tables(conn) -> None:
                 cur.execute("ALTER TABLE sign_stroke_item ADD UNIQUE KEY uk_item (signer_id, locale, kind, sha256)")
             except Exception:
                 pass
+            for sql in (
+                "ALTER TABLE sign_stroke_item ADD COLUMN ftp_last_error VARCHAR(512) NULL",
+                "ALTER TABLE sign_signer_stroke ADD COLUMN ftp_last_error VARCHAR(512) NULL",
+                "ALTER TABLE sign_stroke_set ADD COLUMN ftp_last_error VARCHAR(512) NULL",
+            ):
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
     except Exception:
         pass
     try:
@@ -1114,28 +1443,37 @@ def _upsert_stroke_item_core(
         item_id = ex["id"] if ex else uuid.uuid4().hex
 
     ftp_path = None
+    ftp_err_note: Optional[str] = None
     if prefer_ftp_path:
         ftp_path = prefer_ftp_path
     else:
-        try:
-            from ftp_store import upload_bytes
-
-            ftp_path = upload_bytes(png_b, f"sign/strokeitem/{item_id}.png")
-        except Exception:
-            ftp_path = None
+        ftp_path, ftp_err_note = _ftp_upload_bytes_or_mysql(
+            png_b, f"sign/strokeitem/{item_id}.png"
+        )
+    err_s = ((ftp_err_note or "")[:512]) if ftp_err_note else None
 
     png_store = None if ftp_path else png_b
     with conn.cursor() as cur:
         if ex:
             cur.execute(
-                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s, png=%s WHERE id=%s",
-                (ftp_path, int(len(png_b)), png_store, item_id),
+                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s, png=%s, ftp_last_error=%s WHERE id=%s",
+                (ftp_path, int(len(png_b)), png_store, None if ftp_path else err_s, item_id),
             )
         else:
             cur.execute(
-                "INSERT INTO sign_stroke_item (id, signer_id, locale, kind, sha256, ftp_path, file_size, png) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                (item_id, signer_id, loc, k, sha, ftp_path, int(len(png_b)), png_store),
+                "INSERT INTO sign_stroke_item (id, signer_id, locale, kind, sha256, ftp_path, file_size, png, ftp_last_error) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    item_id,
+                    signer_id,
+                    loc,
+                    k,
+                    sha,
+                    ftp_path,
+                    int(len(png_b)),
+                    png_store,
+                    None if ftp_path else err_s,
+                ),
             )
     return {"stroke_item_id": item_id, "overwritten": overwrote, "sha256": sha, "kind": k, "locale": loc}
 
@@ -1146,7 +1484,7 @@ def get_stroke_item_row(item_id: str) -> Optional[dict]:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, signer_id, locale, kind, sha256, ftp_path, png FROM sign_stroke_item WHERE id=%s",
+                "SELECT id, signer_id, locale, kind, sha256, ftp_path, ftp_last_error, png FROM sign_stroke_item WHERE id=%s",
                 (item_id,),
             )
             row = cur.fetchone()
@@ -1161,6 +1499,112 @@ def get_stroke_item_row(item_id: str) -> Optional[dict]:
     except Exception:
         pass
     return row
+
+
+def list_stroke_items_page(
+    *,
+    q: str = "",
+    page: int = 1,
+    page_size: int = 10,
+) -> Tuple[List[dict], int]:
+    """已入库的签字 PNG 素材（sign_stroke_item），按签署人显示名或 ID 模糊搜索，分页。"""
+    ensure_sign_mysql()
+    q = (q or "").strip()
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 500))
+    offset = (page - 1) * page_size
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            if q:
+                like = f"%{q}%"
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM sign_stroke_item i "
+                    "INNER JOIN sign_signer s ON s.id = i.signer_id "
+                    "WHERE s.display_name LIKE %s OR i.signer_id LIKE %s",
+                    (like, like),
+                )
+                total = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT i.id, i.signer_id, i.locale, i.kind, i.sha256, i.ftp_path, i.ftp_last_error, i.file_size, "
+                    " (i.png IS NOT NULL AND LENGTH(i.png) > 0) AS has_blob, i.updated_at, "
+                    " s.display_name AS signer_name "
+                    "FROM sign_stroke_item i "
+                    "INNER JOIN sign_signer s ON s.id = i.signer_id "
+                    "WHERE s.display_name LIKE %s OR i.signer_id LIKE %s "
+                    "ORDER BY i.updated_at DESC LIMIT %s OFFSET %s",
+                    (like, like, page_size, offset),
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM sign_stroke_item i "
+                    "INNER JOIN sign_signer s ON s.id = i.signer_id"
+                )
+                total = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT i.id, i.signer_id, i.locale, i.kind, i.sha256, i.ftp_path, i.ftp_last_error, i.file_size, "
+                    " (i.png IS NOT NULL AND LENGTH(i.png) > 0) AS has_blob, i.updated_at, "
+                    " s.display_name AS signer_name "
+                    "FROM sign_stroke_item i "
+                    "INNER JOIN sign_signer s ON s.id = i.signer_id "
+                    "ORDER BY i.updated_at DESC LIMIT %s OFFSET %s",
+                    (page_size, offset),
+                )
+            rows = cur.fetchall() or []
+    out: List[dict] = []
+    for r in rows:
+        r = dict(r)
+        ts = r.get("updated_at")
+        k = (r.get("kind") or "").strip().lower()
+        fe = (r.get("ftp_last_error") or "").strip()
+        out.append(
+            {
+                "id": r["id"],
+                "signer_id": r.get("signer_id"),
+                "signer_name": r.get("signer_name") or "",
+                "locale": r.get("locale") or "zh",
+                "kind": k,
+                "kind_label": "日期" if k == "date" else "签名",
+                "sha256": r.get("sha256"),
+                "ftp_uploaded": bool((r.get("ftp_path") or "").strip()),
+                "blob_stored": bool(r.get("has_blob")),
+                "ftp_last_error": fe or None,
+                "updated_at": ts.isoformat(sep=" ") if ts is not None else None,
+            }
+        )
+    return out, total
+
+
+def delete_stroke_item(item_id: str) -> int:
+    """删除一条 sign_stroke_item，并解除角色映射中的引用。"""
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT ftp_path FROM sign_stroke_item WHERE id=%s", (item_id,))
+                row = cur.fetchone()
+            p = (row or {}).get("ftp_path")
+            if p:
+                try:
+                    from ftp_store import delete_path
+
+                    delete_path(p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sign_file_role_signer SET sig_item_id=NULL WHERE sig_item_id=%s",
+                (item_id,),
+            )
+            cur.execute(
+                "UPDATE sign_file_role_signer SET date_item_id=NULL WHERE date_item_id=%s",
+                (item_id,),
+            )
+            cur.execute("DELETE FROM sign_stroke_item WHERE id=%s", (item_id,))
+            return int(cur.rowcount or 0)
 
 
 def upsert_signer_stroke_item(signer_id: str, kind: str, png_b: bytes, locale: str = "zh") -> Dict[str, Any]:
@@ -1371,16 +1815,16 @@ def _upsert_stroke_set_core(
         ex = cur.fetchone()
         overwrote = bool(ex)
         set_id = ex["id"] if ex else uuid.uuid4().hex
-    sig_path = None
-    date_path = None
-    try:
-        from ftp_store import upload_bytes
-
-        sig_path = upload_bytes(sig_b, f"sign/strokeset/{set_id}/sig.png")
-        date_path = upload_bytes(date_b, f"sign/strokeset/{set_id}/date.png")
-    except Exception:
-        sig_path = None
-        date_path = None
+    sig_path, sig_err = _ftp_upload_bytes_or_mysql(sig_b, f"sign/strokeset/{set_id}/sig.png")
+    date_path, date_err = _ftp_upload_bytes_or_mysql(date_b, f"sign/strokeset/{set_id}/date.png")
+    ftp_row_err_parts: List[str] = []
+    if not sig_path and sig_err:
+        ftp_row_err_parts.append("签名:" + sig_err)
+    if not date_path and date_err:
+        ftp_row_err_parts.append("日期:" + date_err)
+    ftp_last_error = ("; ".join(ftp_row_err_parts))[:512] if ftp_row_err_parts else None
+    if sig_path and date_path:
+        ftp_last_error = None
     sig_b_store = None if sig_path else sig_b
     date_b_store = None if date_path else date_b
     with conn.cursor() as cur:
@@ -1388,7 +1832,7 @@ def _upsert_stroke_set_core(
             cur.execute(
                 "UPDATE sign_stroke_set SET "
                 "sig_ftp_path=%s, date_ftp_path=%s, sig_size=%s, date_size=%s, "
-                "sig_sha256=%s, date_sha256=%s, sig_png=%s, date_png=%s WHERE id=%s",
+                "sig_sha256=%s, date_sha256=%s, sig_png=%s, date_png=%s, ftp_last_error=%s WHERE id=%s",
                 (
                     sig_path,
                     date_path,
@@ -1398,6 +1842,7 @@ def _upsert_stroke_set_core(
                     date_sha,
                     sig_b_store,
                     date_b_store,
+                    ftp_last_error,
                     set_id,
                 ),
             )
@@ -1405,7 +1850,7 @@ def _upsert_stroke_set_core(
             cur.execute(
                 "INSERT INTO sign_stroke_set "
                 "(id, signer_id, locale, sig_sha256, date_sha256, sig_ftp_path, date_ftp_path, "
-                "sig_size, date_size, sig_png, date_png) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "sig_size, date_size, sig_png, date_png, ftp_last_error) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     set_id,
                     signer_id,
@@ -1418,6 +1863,7 @@ def _upsert_stroke_set_core(
                     date_size,
                     sig_b_store,
                     date_b_store,
+                    ftp_last_error,
                 ),
             )
     return {"stroke_set_id": set_id, "overwritten": overwrote}
@@ -1426,32 +1872,33 @@ def _upsert_stroke_set_core(
 def _sync_legacy_signer_stroke(
     conn, signer_id: str, sig_b: bytes, date_b: bytes
 ) -> None:
-    sig_path = None
-    date_path = None
     sig_sha = hashlib.sha256(sig_b).hexdigest()
     date_sha = hashlib.sha256(date_b).hexdigest()
     sig_size = int(len(sig_b))
     date_size = int(len(date_b))
-    try:
-        from ftp_store import upload_bytes
-
-        sig_path = upload_bytes(sig_b, f"sign/strokes/{signer_id}/sig.png")
-        date_path = upload_bytes(date_b, f"sign/strokes/{signer_id}/date.png")
-    except Exception:
-        sig_path = None
-        date_path = None
+    sig_path, sig_err = _ftp_upload_bytes_or_mysql(sig_b, f"sign/strokes/{signer_id}/sig.png")
+    date_path, date_err = _ftp_upload_bytes_or_mysql(date_b, f"sign/strokes/{signer_id}/date.png")
+    leg_parts: List[str] = []
+    if not sig_path and sig_err:
+        leg_parts.append("签名:" + sig_err)
+    if not date_path and date_err:
+        leg_parts.append("日期:" + date_err)
+    ftp_last_error = ("; ".join(leg_parts))[:512] if leg_parts else None
+    if sig_path and date_path:
+        ftp_last_error = None
     sig_b_store = None if sig_path else sig_b
     date_b_store = None if date_path else date_b
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO sign_signer_stroke "
-            "(signer_id, sig_ftp_path, date_ftp_path, sig_size, date_size, sig_sha256, date_sha256, sig_png, date_png) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "(signer_id, sig_ftp_path, date_ftp_path, sig_size, date_size, sig_sha256, date_sha256, sig_png, date_png, ftp_last_error) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
             "ON DUPLICATE KEY UPDATE "
             "sig_ftp_path=VALUES(sig_ftp_path), date_ftp_path=VALUES(date_ftp_path), "
             "sig_size=VALUES(sig_size), date_size=VALUES(date_size), "
             "sig_sha256=VALUES(sig_sha256), date_sha256=VALUES(date_sha256), "
-            "sig_png=VALUES(sig_png), date_png=VALUES(date_png)",
+            "sig_png=VALUES(sig_png), date_png=VALUES(date_png), "
+            "ftp_last_error=VALUES(ftp_last_error)",
             (
                 signer_id,
                 sig_path,
@@ -1462,6 +1909,7 @@ def _sync_legacy_signer_stroke(
                 date_sha,
                 sig_b_store,
                 date_b_store,
+                ftp_last_error,
             ),
         )
 
@@ -1492,6 +1940,7 @@ def list_signers() -> List[dict]:
             cur.execute(
                 """
                 SELECT id, signer_id, locale, kind, updated_at, sha256
+                , ftp_path, ftp_last_error, (png IS NOT NULL AND LENGTH(png) > 0) AS has_blob
                 FROM sign_stroke_item ORDER BY signer_id ASC, locale ASC, kind ASC, updated_at DESC
                 """
             )
@@ -1533,6 +1982,8 @@ def list_signers() -> List[dict]:
         date_items: List[dict] = []
         for i, it in enumerate(sig_items_raw):
             ut = it.get("updated_at")
+            ftp_path = (it.get("ftp_path") or "").strip()
+            fe = (it.get("ftp_last_error") or "").strip()
             sig_items.append(
                 {
                     "id": it["id"],
@@ -1541,11 +1992,17 @@ def list_signers() -> List[dict]:
                     "kind": "sig",
                     "updated_at": ut.isoformat(sep=" ") if ut is not None else None,
                     "sha256": it.get("sha256"),
+                    "ftp_uploaded": bool(ftp_path),
+                    "ftp_path": ftp_path or None,
+                    "blob_stored": bool(it.get("has_blob")),
+                    "ftp_last_error": fe or None,
                     "label": "第 %d 条" % (i + 1),
                 }
             )
         for i, it in enumerate(date_items_raw):
             ut = it.get("updated_at")
+            ftp_path = (it.get("ftp_path") or "").strip()
+            fe = (it.get("ftp_last_error") or "").strip()
             date_items.append(
                 {
                     "id": it["id"],
@@ -1554,6 +2011,10 @@ def list_signers() -> List[dict]:
                     "kind": "date",
                     "updated_at": ut.isoformat(sep=" ") if ut is not None else None,
                     "sha256": it.get("sha256"),
+                    "ftp_uploaded": bool(ftp_path),
+                    "ftp_path": ftp_path or None,
+                    "blob_stored": bool(it.get("has_blob")),
+                    "ftp_last_error": fe or None,
                     "label": "第 %d 条" % (i + 1),
                 }
             )

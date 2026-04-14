@@ -59,11 +59,36 @@ def enabled() -> bool:
     return mysql_sign_enabled()
 
 
+def _safe_ftp_err_text(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    return str(x).strip()
+
+
 def _summary_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     r = rec.get("result") or {}
+    if not isinstance(r, dict):
+        r = {}
     title = rec.get("display_title") or compute_display_title(
         rec.get("original_names"), r
     )
+    ze = _safe_ftp_err_text(r.get("zip_ftp_error")) or _safe_ftp_err_text(
+        rec.get("zip_ftp_error")
+    )
+    has_zip = bool(rec.get("download_token"))
+    zup = r.get("zip_ftp_uploaded")
+    if zup is None:
+        zup = rec.get("zip_ftp_uploaded")
+    if not has_zip:
+        zip_ftp: Optional[bool] = None
+    elif zup is True or zup == 1:
+        zip_ftp = True
+    elif zup is False or zup == 0:
+        zip_ftp = False
+    else:
+        zip_ftp = None
     return {
         "id": rec["id"],
         "created_at": rec.get("created_at", ""),
@@ -72,9 +97,11 @@ def _summary_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
         "total": int(r.get("total") or 0),
         "ok": int(r.get("ok") or 0),
         "failed": int(r.get("failed") or 0),
-        "has_zip": bool(rec.get("download_token")),
+        "has_zip": has_zip,
         "has_stash": bool(rec.get("has_stash")),
         "success": bool(rec.get("payload_ok")),
+        "zip_ftp": zip_ftp,
+        "zip_ftp_error": (ze or None) if has_zip else None,
     }
 
 
