@@ -31,7 +31,38 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pymysql
 from pymysql.cursors import DictCursor
 
+from sign_handlers.date_piece_compose import (
+    all_piece_kinds,
+    compose_png_horizontal,
+    kinds_en_dot_dmy,
+    kinds_en_dmy_space,
+    kinds_for_iso_date,
+    kinds_zh_ymd_dot,
+    normalize_piece_kind,
+    piece_kind_label,
+)
+
 _DB_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
+
+# 笔迹元件拼接日期：与前端 date_mode 一致
+_COMPOSITE_DATE_MODES = frozenset({"composite_en", "composite_zh_ymd", "composite_en_space"})
+
+
+def is_composite_date_mode(dm: Optional[str]) -> bool:
+    return (dm or "").strip().lower() in _COMPOSITE_DATE_MODES
+
+
+def composite_mode_to_layout(dm: Optional[str]) -> str:
+    """date_mode → compose_date_piece_png 的 layout 参数。"""
+    k = (dm or "").strip().lower()
+    if k == "composite_zh_ymd":
+        return "zh_ymd"
+    if k == "composite_en_space":
+        return "en_space"
+    # 兼容旧值 composite_en（原 15.April.2026）：统一为英文空格版
+    if k == "composite_en":
+        return "en_space"
+    return "en_space"
 
 
 def _sign_ftp_required() -> bool:
@@ -1374,6 +1405,20 @@ def _ensure_signer_tables(conn) -> None:
                     cur.execute(sql)
                 except Exception:
                     pass
+            try:
+                cur.execute("ALTER TABLE sign_stroke_item MODIFY COLUMN kind VARCHAR(32) NOT NULL")
+            except Exception:
+                pass
+            try:
+                cur.execute(
+                    "ALTER TABLE sign_file_role_signer ADD COLUMN date_mode VARCHAR(24) NULL"
+                )
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE sign_file_role_signer ADD COLUMN date_iso VARCHAR(32) NULL")
+            except Exception:
+                pass
     except Exception:
         pass
     try:
@@ -1426,22 +1471,42 @@ def _upsert_stroke_item_core(
     png_b: bytes,
     prefer_ftp_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    k = (kind or "").strip().lower()
-    if k not in ("sig", "date"):
-        raise ValueError("kind 须为 sig 或 date")
-    loc = (locale or "zh").strip().lower()
-    if loc not in ("zh", "en"):
-        loc = "zh"
-    sha = hashlib.sha256(png_b).hexdigest()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s AND sha256=%s",
-            (signer_id, loc, k, sha),
-        )
-        ex = cur.fetchone()
-        overwrote = bool(ex)
-        item_id = ex["id"] if ex else uuid.uuid4().hex
+    raw = (kind or "").strip().lower()
+    pk = normalize_piece_kind(raw)
+    piece_mode = bool(pk)
+    if piece_mode:
+        k = pk or ""
+        loc = "en"
+        overwrote = False
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s",
+                (signer_id, loc, k),
+            )
+            overwrote = bool(cur.fetchone())
+            cur.execute(
+                "DELETE FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s",
+                (signer_id, loc, k),
+            )
+        item_id = uuid.uuid4().hex
+    else:
+        k = raw
+        if k not in ("sig", "date"):
+            raise ValueError("kind 须为 sig、date 或日期元件（pd0..pd9 / pm01..pm12 / pdot）")
+        loc = (locale or "zh").strip().lower()
+        if loc not in ("zh", "en"):
+            loc = "zh"
+        sha = hashlib.sha256(png_b).hexdigest()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s AND sha256=%s",
+                (signer_id, loc, k, sha),
+            )
+            ex = cur.fetchone()
+            overwrote = bool(ex)
+            item_id = ex["id"] if ex else uuid.uuid4().hex
 
+    sha = hashlib.sha256(png_b).hexdigest()
     ftp_path = None
     ftp_err_note: Optional[str] = None
     if prefer_ftp_path:
@@ -1454,10 +1519,10 @@ def _upsert_stroke_item_core(
 
     png_store = None if ftp_path else png_b
     with conn.cursor() as cur:
-        if ex:
+        if not piece_mode and overwrote:
             cur.execute(
-                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s, png=%s, ftp_last_error=%s WHERE id=%s",
-                (ftp_path, int(len(png_b)), png_store, None if ftp_path else err_s, item_id),
+                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s, png=%s, ftp_last_error=%s, sha256=%s WHERE id=%s",
+                (ftp_path, int(len(png_b)), png_store, None if ftp_path else err_s, sha, item_id),
             )
         else:
             cur.execute(
@@ -1476,6 +1541,111 @@ def _upsert_stroke_item_core(
                 ),
             )
     return {"stroke_item_id": item_id, "overwritten": overwrote, "sha256": sha, "kind": k, "locale": loc}
+
+
+def upsert_signer_stroke_piece(signer_id: str, piece_kind: str, png_b: bytes) -> Dict[str, Any]:
+    """录入英文点分日期笔迹元件（locale 固定为 en，同槽位覆盖）。"""
+    ensure_sign_mysql()
+    if not normalize_piece_kind(piece_kind):
+        raise ValueError("无效的 piece_kind（pd0..pd9 / pm01..pm12 / pma01..pma12 / pdot）")
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM sign_signer WHERE id=%s", (signer_id,))
+            if not cur.fetchone():
+                raise ValueError("签署人不存在")
+        return _upsert_stroke_item_core(conn, signer_id, "en", piece_kind, png_b)
+
+
+def get_stroke_item_row_by_signer_kind(signer_id: str, locale: str, kind: str) -> Optional[dict]:
+    ensure_sign_mysql()
+    loc = (locale or "zh").strip().lower()
+    k = (kind or "").strip().lower()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, signer_id, locale, kind, sha256, ftp_path, ftp_last_error, png FROM sign_stroke_item "
+                "WHERE signer_id=%s AND locale=%s AND kind=%s ORDER BY updated_at DESC LIMIT 1",
+                (signer_id, loc, k),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    row = dict(row)
+    try:
+        from ftp_store import download_bytes
+
+        if (not row.get("png")) and row.get("ftp_path"):
+            row["png"] = download_bytes(row["ftp_path"])
+    except Exception:
+        pass
+    return row
+
+
+def get_piece_png_for_date_compose(signer_id: str, slot: str) -> Optional[bytes]:
+    """拼接用：先取该槽位；若为月份整词 pmXX 且无图，则回退到简称 pmaXX。"""
+    sk = (slot or "").strip().lower()
+    row = get_stroke_item_row_by_signer_kind(signer_id, "en", sk)
+    b = (row or {}).get("png")
+    if b:
+        return b
+    if re.fullmatch(r"pm(0[1-9]|1[0-2])", sk):
+        alt = "pma" + sk[2:]
+        row2 = get_stroke_item_row_by_signer_kind(signer_id, "en", alt)
+        return (row2 or {}).get("png")
+    return None
+
+
+def compose_date_piece_png(signer_id: str, iso: str, layout: str) -> Tuple[bytes, str]:
+    """
+    按 YYYY-MM-DD 与版式生成横向拼接 PNG（locale=en 的 pd*/pm*/pdot 笔迹元件）。
+    layout: zh_ymd → 2026.04.15；en_space → 15 April 2026；en_dot → 15.April.2026（兼容旧布局）。
+    """
+    lay = (layout or "en_dot").strip().lower()
+    gaps: Optional[List[int]] = None
+    if lay == "zh_ymd":
+        kinds, label = kinds_zh_ymd_dot(iso)
+    elif lay == "en_space":
+        kinds, label, gaps = kinds_en_dmy_space(iso)
+    elif lay in ("en_dot", "dot_dmy"):
+        kinds, label = kinds_en_dot_dmy(iso)
+    else:
+        kinds, label = kinds_for_iso_date(iso)
+    pngs: List[bytes] = []
+    missing: List[str] = []
+    for slot in kinds:
+        b = get_piece_png_for_date_compose(signer_id, slot)
+        if not b:
+            sk = (slot or "").strip().lower()
+            try:
+                from sign_handlers.date_piece_compose import piece_kind_label
+
+                human = piece_kind_label(sk)
+            except Exception:
+                human = sk
+            # 兼容：若仍有人录入了整词 pmXX，缺失提示里也说明可用简称
+            if re.fullmatch(r"pm(0[1-9]|1[0-2])", sk):
+                missing.append(f"{human}（{sk}；也可录入简称 pma{sk[2:]}）")
+            else:
+                missing.append(f"{human}（{sk}）" if human and human != sk else sk)
+        else:
+            pngs.append(b)
+    if missing:
+        lay_h = "中文 2026.04.15" if lay == "zh_ymd" else ("英文 15 Apr 2026" if lay == "en_space" else lay)
+        raise ValueError(
+            "无法拼接预览：" + lay_h + " 所需的笔迹元件尚未录入。缺少："
+            + "，".join(missing)
+            + "。请先到「英文点分日期笔迹元件」为该签署人录入对应元件后再预览。"
+        )
+    # 默认字间距收紧（英文空格版可通过 gaps 单独放大“空格”）
+    out = compose_png_horizontal(pngs, gap=3, gaps=gaps, target_h=360)
+    return out, label
+
+
+def compose_en_dot_date_png(signer_id: str, iso: str) -> Tuple[bytes, str]:
+    """兼容：等同 en_dot 版式。"""
+    return compose_date_piece_png(signer_id, iso, "en_dot")
 
 
 def get_stroke_item_row(item_id: str) -> Optional[dict]:
@@ -1506,13 +1676,26 @@ def list_stroke_items_page(
     q: str = "",
     page: int = 1,
     page_size: int = 10,
+    cat: str = "",
 ) -> Tuple[List[dict], int]:
     """已入库的签字 PNG 素材（sign_stroke_item），按签署人显示名或 ID 模糊搜索，分页。"""
     ensure_sign_mysql()
     q = (q or "").strip()
+    cat = (cat or "").strip().lower()
     page = max(1, int(page))
     page_size = max(1, min(int(page_size), 500))
     offset = (page - 1) * page_size
+    where_cat = ""
+    cat_args: List[Any] = []
+    if cat in ("sig", "signature"):
+        where_cat = " AND i.kind='sig' "
+    elif cat in ("digit", "digits"):
+        where_cat = " AND i.locale='en' AND i.kind REGEXP '^(pd[0-9])$' "
+    elif cat in ("en_date", "en", "month", "months"):
+        # 英文日期：月份简称元件（pma01..pma12）；兼容旧整词 pm01..pm12
+        where_cat = " AND i.locale='en' AND i.kind REGEXP '^(pma(0[1-9]|1[0-2])|pm(0[1-9]|1[0-2]))$' "
+    elif cat in ("connector", "dot", "pdot"):
+        where_cat = " AND i.locale='en' AND i.kind='pdot' "
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
@@ -1521,8 +1704,9 @@ def list_stroke_items_page(
                 cur.execute(
                     "SELECT COUNT(*) AS c FROM sign_stroke_item i "
                     "INNER JOIN sign_signer s ON s.id = i.signer_id "
-                    "WHERE s.display_name LIKE %s OR i.signer_id LIKE %s",
-                    (like, like),
+                    "WHERE (s.display_name LIKE %s OR i.signer_id LIKE %s) "
+                    + where_cat,
+                    tuple([like, like] + cat_args),
                 )
                 total = int((cur.fetchone() or {}).get("c") or 0)
                 cur.execute(
@@ -1531,14 +1715,17 @@ def list_stroke_items_page(
                     " s.display_name AS signer_name "
                     "FROM sign_stroke_item i "
                     "INNER JOIN sign_signer s ON s.id = i.signer_id "
-                    "WHERE s.display_name LIKE %s OR i.signer_id LIKE %s "
+                    "WHERE (s.display_name LIKE %s OR i.signer_id LIKE %s) "
+                    + where_cat +
                     "ORDER BY i.updated_at DESC LIMIT %s OFFSET %s",
-                    (like, like, page_size, offset),
+                    tuple([like, like] + cat_args + [page_size, offset]),
                 )
             else:
                 cur.execute(
                     "SELECT COUNT(*) AS c FROM sign_stroke_item i "
-                    "INNER JOIN sign_signer s ON s.id = i.signer_id"
+                    "INNER JOIN sign_signer s ON s.id = i.signer_id WHERE 1=1 "
+                    + where_cat,
+                    tuple(cat_args),
                 )
                 total = int((cur.fetchone() or {}).get("c") or 0)
                 cur.execute(
@@ -1547,8 +1734,9 @@ def list_stroke_items_page(
                     " s.display_name AS signer_name "
                     "FROM sign_stroke_item i "
                     "INNER JOIN sign_signer s ON s.id = i.signer_id "
+                    "WHERE 1=1 " + where_cat +
                     "ORDER BY i.updated_at DESC LIMIT %s OFFSET %s",
-                    (page_size, offset),
+                    tuple(cat_args + [page_size, offset]),
                 )
             rows = cur.fetchall() or []
     out: List[dict] = []
@@ -1557,6 +1745,10 @@ def list_stroke_items_page(
         ts = r.get("updated_at")
         k = (r.get("kind") or "").strip().lower()
         fe = (r.get("ftp_last_error") or "").strip()
+        if normalize_piece_kind(k):
+            kl = piece_kind_label(k)
+        else:
+            kl = "日期" if k == "date" else "签名"
         out.append(
             {
                 "id": r["id"],
@@ -1564,7 +1756,7 @@ def list_stroke_items_page(
                 "signer_name": r.get("signer_name") or "",
                 "locale": r.get("locale") or "zh",
                 "kind": k,
-                "kind_label": "日期" if k == "date" else "签名",
+                "kind_label": kl,
                 "sha256": r.get("sha256"),
                 "ftp_uploaded": bool((r.get("ftp_path") or "").strip()),
                 "blob_stored": bool(r.get("has_blob")),
@@ -1950,9 +2142,16 @@ def list_signers() -> List[dict]:
         sid = sr["signer_id"]
         sets_by_signer.setdefault(sid, []).append(sr)
     items_by_signer: Dict[str, Dict[str, List[dict]]] = {}
+    pieces_by_signer: Dict[str, Dict[str, bool]] = {}
     for ir in item_rows:
         sid = ir["signer_id"]
         k = (ir.get("kind") or "").strip().lower()
+        pk = normalize_piece_kind(k)
+        if pk:
+            if sid not in pieces_by_signer:
+                pieces_by_signer[sid] = {x: False for x in all_piece_kinds()}
+            pieces_by_signer[sid][pk] = True
+            continue
         if k not in ("sig", "date"):
             continue
         items_by_signer.setdefault(sid, {}).setdefault(k, []).append(ir)
@@ -2020,6 +2219,7 @@ def list_signers() -> List[dict]:
             )
         has_sig = bool(sig_items) or has_from_sets or bool(r.get("leg_sig"))
         has_date = bool(date_items) or has_from_sets or bool(r.get("leg_date"))
+        pie = pieces_by_signer.get(signer_id) or {x: False for x in all_piece_kinds()}
         out.append(
             {
                 "id": signer_id,
@@ -2030,6 +2230,7 @@ def list_signers() -> List[dict]:
                 "stroke_sets": stroke_sets,
                 "sig_items": sig_items,
                 "date_items": date_items,
+                "date_piece_en": pie,
             }
         )
     return out
@@ -2123,15 +2324,15 @@ def upsert_signer_strokes(
     return res
 
 
-def get_file_role_signer_map(file_id: str) -> Dict[str, str]:
-    """返回 role -> {sig, date}（笔迹素材 id）。兼容旧 stroke_set_id / signer_id。"""
+def get_file_role_signer_map(file_id: str) -> Dict[str, Any]:
+    """返回 role -> {sig, date, date_mode, date_iso}（笔迹素材 id）。兼容旧 stroke_set_id / signer_id。"""
     ensure_sign_mysql()
     out: Dict[str, dict] = {}
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT role_id, signer_id, stroke_set_id, sig_item_id, date_item_id "
+                "SELECT role_id, signer_id, stroke_set_id, sig_item_id, date_item_id, date_mode, date_iso "
                 "FROM sign_file_role_signer WHERE file_id=%s",
                 (file_id,),
             )
@@ -2140,8 +2341,15 @@ def get_file_role_signer_map(file_id: str) -> Dict[str, str]:
             rid = r["role_id"]
             sig_id = (r.get("sig_item_id") or "").strip()
             date_id = (r.get("date_item_id") or "").strip()
-            if sig_id or date_id:
-                out[rid] = {"sig": sig_id or None, "date": date_id or None}
+            dm = (r.get("date_mode") or "").strip() or None
+            diso = (r.get("date_iso") or "").strip() or None
+            if sig_id or date_id or is_composite_date_mode(dm):
+                out[rid] = {
+                    "sig": sig_id or None,
+                    "date": date_id or None,
+                    "date_mode": dm,
+                    "date_iso": diso or None,
+                }
                 continue
             ssid = (r.get("stroke_set_id") or "").strip()
             if ssid:
@@ -2159,9 +2367,9 @@ def get_file_role_signer_map(file_id: str) -> Dict[str, str]:
                             "WHERE file_id=%s AND role_id=%s",
                             (sig_id, date_id, file_id, rid),
                         )
-                    out[rid] = {"sig": sig_id, "date": date_id}
+                    out[rid] = {"sig": sig_id, "date": date_id, "date_mode": None, "date_iso": None}
                 else:
-                    out[rid] = {"sig": None, "date": None}
+                    out[rid] = {"sig": None, "date": None, "date_mode": None, "date_iso": None}
                 continue
             signer_id = (r.get("signer_id") or "").strip()
             if signer_id:
@@ -2186,7 +2394,7 @@ def get_file_role_signer_map(file_id: str) -> Dict[str, str]:
                             "WHERE file_id=%s AND role_id=%s",
                             (sig_id, date_id, file_id, rid),
                         )
-                out[rid] = {"sig": sig_id, "date": date_id}
+                out[rid] = {"sig": sig_id, "date": date_id, "date_mode": None, "date_iso": None}
     return out
 
 
@@ -2202,9 +2410,29 @@ def set_file_role_signer_map(file_id: str, mapping: Dict[str, Any]) -> None:
                 rid = str(role_id)[:64]
                 sig_item_id = None
                 date_item_id = None
+                date_mode_v: Optional[str] = None
+                date_iso_v: Optional[str] = None
                 if isinstance(val, dict):
-                    sig_item_id = str(val.get("sig") or "").strip() or None
-                    date_item_id = str(val.get("date") or "").strip() or None
+                    dm_raw = (val.get("date_mode") or "").strip().lower()
+                    if dm_raw in _COMPOSITE_DATE_MODES:
+                        sig_item_id = str(val.get("sig") or "").strip() or None
+                        date_item_id = None
+                        date_iso_v = (val.get("date_iso") or "").strip() or None
+                        date_mode_v = dm_raw
+                        if not sig_item_id or not date_iso_v:
+                            raise ValueError("笔迹拼接日期：请绑定签名素材并选择日历日期（YYYY-MM-DD）")
+                        try:
+                            if dm_raw == "composite_zh_ymd":
+                                kinds_zh_ymd_dot(date_iso_v)
+                            elif dm_raw == "composite_en_space":
+                                kinds_en_dmy_space(date_iso_v)
+                            else:
+                                kinds_for_iso_date(date_iso_v)
+                        except Exception as e:
+                            raise ValueError("日期无效，需为 YYYY-MM-DD") from e
+                    else:
+                        sig_item_id = str(val.get("sig") or "").strip() or None
+                        date_item_id = str(val.get("date") or "").strip() or None
                 else:
                     # 兼容：传 stroke_set_id / signer_id
                     ssid = _resolve_map_val_to_stroke_set_id(conn, str(val).strip())
@@ -2218,8 +2446,9 @@ def set_file_role_signer_map(file_id: str, mapping: Dict[str, Any]) -> None:
                             date_item_id = _upsert_stroke_item_core(conn, ss["signer_id"], loc, "date", ss["date_png"]).get(
                                 "stroke_item_id"
                             )
-                if not sig_item_id and not date_item_id:
-                    continue
+                if not is_composite_date_mode(date_mode_v):
+                    if not sig_item_id and not date_item_id:
+                        continue
                 signer_id = None
                 with conn.cursor() as cur2:
                     if sig_item_id:
@@ -2233,7 +2462,7 @@ def set_file_role_signer_map(file_id: str, mapping: Dict[str, Any]) -> None:
                 if not signer_id:
                     continue
                 cur.execute(
-                    "INSERT INTO sign_file_role_signer (file_id, role_id, signer_id, sig_item_id, date_item_id) "
-                    "VALUES (%s, %s, %s, %s, %s)",
-                    (file_id, rid, signer_id, sig_item_id, date_item_id),
+                    "INSERT INTO sign_file_role_signer (file_id, role_id, signer_id, sig_item_id, date_item_id, date_mode, date_iso) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (file_id, rid, signer_id, sig_item_id, date_item_id, date_mode_v, date_iso_v),
                 )

@@ -2731,6 +2731,7 @@ def api_sign():
 
     sig_map = {}
     date_map = {}
+    apply_report = {"applied": [], "skipped": []}
     if sign_source == "library":
         if not file_id:
             return jsonify({"ok": False, "error": "库映射模式仅支持对“已保存到列表”的文件生成"}), 400
@@ -2749,16 +2750,104 @@ def api_sign():
                 pair = mapping.get(rid) or {}
                 sig_id = (pair.get("sig") if isinstance(pair, dict) else None) or None
                 date_id = (pair.get("date") if isinstance(pair, dict) else None) or None
-                if not sig_id or not date_id:
-                    return jsonify(
-                        {"ok": False, "error": f"角色 {role_display_name(rid)} 未同时绑定签名与日期素材"}
-                    ), 400
-                srow = mysql_store.get_stroke_item_row(sig_id)
-                drow = mysql_store.get_stroke_item_row(date_id)
-                if not srow or not srow.get("png") or not drow or not drow.get("png"):
-                    return jsonify({"ok": False, "error": f"角色 {role_display_name(rid)} 对应素材缺失"}), 400
-                sig_map[rid] = srow["png"]
-                date_map[rid] = drow["png"]
+                dm = (pair.get("date_mode") if isinstance(pair, dict) else None) or None
+                diso = (pair.get("date_iso") if isinstance(pair, dict) else None) or None
+                if mysql_store.is_composite_date_mode(dm):
+                    # 拼接日期模式需要：签名素材 + 日历日期；若条件不齐，退回“能签就签”的普通素材模式
+                    if not sig_id or not diso:
+                        apply_report["skipped"].append(
+                            {
+                                "role_id": rid,
+                                "role": role_display_name(rid),
+                                "what": "composite_date",
+                                "reason": "拼接日期条件不齐（需绑定签名并选择日历日期），已退回普通素材模式",
+                            }
+                        )
+                        dm = None
+                    if dm:
+                        srow = mysql_store.get_stroke_item_row(sig_id)
+                        if not srow or not srow.get("png"):
+                            apply_report["skipped"].append(
+                                {
+                                    "role_id": rid,
+                                    "role": role_display_name(rid),
+                                    "what": "sig",
+                                    "reason": "签名素材缺失",
+                                }
+                            )
+                            dm = None
+                    if dm:
+                        sid0 = (srow.get("signer_id") or "").strip()
+                        if not sid0:
+                            apply_report["skipped"].append(
+                                {
+                                    "role_id": rid,
+                                    "role": role_display_name(rid),
+                                    "what": "composite_date",
+                                    "reason": "无法解析签署人",
+                                }
+                            )
+                            dm = None
+                    if dm:
+                        try:
+                            lay = mysql_store.composite_mode_to_layout(dm)
+                            dbytes, _lbl = mysql_store.compose_date_piece_png(
+                                sid0, str(diso).strip(), lay
+                            )
+                        except Exception as e:
+                            apply_report["skipped"].append(
+                                {
+                                    "role_id": rid,
+                                    "role": role_display_name(rid),
+                                    "what": "composite_date",
+                                    "reason": f"日期拼接失败：{e}",
+                                }
+                            )
+                            dm = None
+                    if dm:
+                        sig_map[rid] = srow["png"]
+                        date_map[rid] = dbytes
+                        apply_report["applied"].append(
+                            {
+                                "role_id": rid,
+                                "role": role_display_name(rid),
+                                "sig": True,
+                                "date": True,
+                                "date_mode": "composite",
+                            }
+                        )
+                        continue
+                applied_sig = False
+                applied_date = False
+                if sig_id:
+                    srow = mysql_store.get_stroke_item_row(sig_id)
+                    if srow and srow.get("png"):
+                        sig_map[rid] = srow["png"]
+                        applied_sig = True
+                if date_id:
+                    drow = mysql_store.get_stroke_item_row(date_id)
+                    if drow and drow.get("png"):
+                        date_map[rid] = drow["png"]
+                        applied_date = True
+                if applied_sig or applied_date:
+                    apply_report["applied"].append(
+                        {
+                            "role_id": rid,
+                            "role": role_display_name(rid),
+                            "sig": applied_sig,
+                            "date": applied_date,
+                            "date_mode": "item",
+                        }
+                    )
+                else:
+                    apply_report["skipped"].append(
+                        {
+                            "role_id": rid,
+                            "role": role_display_name(rid),
+                            "what": "sig_date",
+                            "reason": "未绑定或素材缺失（签名/日期均无可用数据）",
+                        }
+                    )
         except Exception as e:
             return jsonify({"ok": False, "error": f"库映射读取失败: {e}"}), 500
     else:
@@ -2769,12 +2858,45 @@ def api_sign():
             date_raw = request.form.get(f"date_{rid}") or ""
             sig_bytes = _decode_png_data_url_or_b64(sig_raw)
             date_bytes = _decode_png_data_url_or_b64(date_raw)
-            if not sig_bytes or not date_bytes:
-                return jsonify(
-                    {"ok": False, "error": f"请为“{role_display_name(rid)}”完成签名与日期手写"}
-                ), 400
-            sig_map[rid] = sig_bytes
-            date_map[rid] = date_bytes
+            applied_sig = False
+            applied_date = False
+            if sig_bytes:
+                sig_map[rid] = sig_bytes
+                applied_sig = True
+            if date_bytes:
+                date_map[rid] = date_bytes
+                applied_date = True
+            if applied_sig or applied_date:
+                apply_report["applied"].append(
+                    {
+                        "role_id": rid,
+                        "role": role_display_name(rid),
+                        "sig": applied_sig,
+                        "date": applied_date,
+                        "date_mode": "canvas",
+                    }
+                )
+            else:
+                apply_report["skipped"].append(
+                    {
+                        "role_id": rid,
+                        "role": role_display_name(rid),
+                        "what": "sig_date",
+                        "reason": "该角色签名与日期画布均为空，已跳过",
+                    }
+                )
+
+    # 至少要有一个角色提供签名或日期；否则不生成（避免输出与原文档一致却误以为“已签”）
+    if (not sig_map) and (not date_map):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "未选择任何可用素材：请至少为一个角色提供签名或日期（画布手写/库映射二选一）。",
+                }
+            ),
+            400,
+        )
 
     if _sign_using_mysql():
         try:
@@ -2841,6 +2963,39 @@ def api_sign():
     sid_hdr = res.get("signed_id")
     if sid_hdr:
         resp.headers["X-Signed-Record-Id"] = sid_hdr
+    try:
+        # 更短更稳：只回传摘要（避免头部过大/截断导致前端解码失败）
+        ap = apply_report.get("applied") or []
+        sk = apply_report.get("skipped") or []
+        ap_txt = "；".join(
+            [
+                f"{x.get('role') or x.get('role_id')}："
+                + ("签名" if x.get("sig") else "")
+                + ("+" if x.get("sig") and x.get("date") else "")
+                + ("日期" if x.get("date") else "")
+                + ("（拼接）" if x.get("date_mode") == "composite" else "")
+                for x in ap
+                if isinstance(x, dict)
+            ]
+        )
+        sk_txt = "；".join(
+            [
+                f"{x.get('role') or x.get('role_id')}：{x.get('reason') or '跳过'}"
+                for x in sk
+                if isinstance(x, dict)
+            ]
+        )
+        summary = {
+            "applied_n": len(ap) if isinstance(ap, list) else 0,
+            "skipped_n": len(sk) if isinstance(sk, list) else 0,
+            "applied": ap_txt[:1200],
+            "skipped": sk_txt[:1200],
+        }
+        rep_s = json.dumps(summary, ensure_ascii=False)
+        rep_b64 = base64.b64encode(rep_s.encode("utf-8")).decode("ascii")
+        resp.headers["X-Sign-Apply-Summary-B64"] = rep_b64
+    except Exception:
+        pass
     return resp
 
 
@@ -3037,6 +3192,108 @@ def api_sign_signers_strokes_put(signer_id):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/sign/signers/<signer_id>/stroke-piece", methods=["PUT"])
+def api_sign_signer_stroke_piece_put(signer_id):
+    """录入英文点分日期笔迹元件：数字 0-9、月份 pm01..pm12、连接符 pdot（locale 固定 en）。"""
+    if not _SIGN_FILE_ID_RE.match(signer_id or ""):
+        return jsonify({"ok": False, "error": "无效的签署人 id"}), 400
+    if not _sign_using_mysql():
+        return jsonify({"ok": False, "error": "笔迹元件需启用 MySQL（MYSQL_HOST）"}), 400
+    piece_kind = (request.form.get("piece_kind") or request.form.get("kind") or "").strip()
+    png_raw = request.form.get("png") or ""
+    png_b = _decode_png_data_url_or_b64(png_raw) if str(png_raw).strip() else None
+    if not png_b:
+        return jsonify({"ok": False, "error": "请提交 png 笔迹图"}), 400
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        res = mysql_store.upsert_signer_stroke_piece(signer_id, piece_kind, png_b)
+        return jsonify({"ok": True, **res})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/signers/<signer_id>/stroke-pieces", methods=["PUT"])
+def api_sign_signer_stroke_pieces_batch_put(signer_id):
+    """批量录入笔迹元件：JSON body { items: [ { piece_kind, png }, ... ] }。"""
+    if not _SIGN_FILE_ID_RE.match(signer_id or ""):
+        return jsonify({"ok": False, "error": "无效的签署人 id"}), 400
+    if not _sign_using_mysql():
+        return jsonify({"ok": False, "error": "笔迹元件需启用 MySQL（MYSQL_HOST）"}), 400
+    data = request.get_json(silent=True) or {}
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False, "error": "请求体需包含非空 items 数组"}), 400
+    if len(items) > 80:
+        return jsonify({"ok": False, "error": "单次最多提交 80 条元件"}), 400
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        overwrite = True
+        try:
+            overwrite = bool(data.get("overwrite", True))
+        except Exception:
+            overwrite = True
+        results = []
+        for it in items:
+            if not isinstance(it, dict):
+                results.append({"piece_kind": "", "ok": False, "error": "条目须为 JSON 对象"})
+                continue
+            pk = (it.get("piece_kind") or it.get("kind") or "").strip()
+            png_raw = it.get("png") or ""
+            png_b = _decode_png_data_url_or_b64(png_raw) if str(png_raw).strip() else None
+            if not png_b:
+                results.append({"piece_kind": pk, "ok": False, "error": "缺少 png"})
+                continue
+            try:
+                r = mysql_store.upsert_signer_stroke_piece(signer_id, pk, png_b)
+                if (not overwrite) and r and r.get("overwritten"):
+                    results.append(
+                        {
+                            "piece_kind": pk,
+                            "ok": False,
+                            "error_code": "exists",
+                            "error": "该元件已存在，请确认是否覆盖",
+                        }
+                    )
+                else:
+                    results.append({"piece_kind": pk, "ok": True, **r})
+            except ValueError as e:
+                results.append({"piece_kind": pk, "ok": False, "error": str(e)})
+            except Exception as e:
+                results.append({"piece_kind": pk, "ok": False, "error": str(e) or type(e).__name__})
+        return jsonify({"ok": True, "results": results})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/signers/<signer_id>/composite-date-preview", methods=["GET"])
+def api_sign_composite_date_preview(signer_id):
+    """按签署人笔迹元件预览拼接 PNG。iso=YYYY-MM-DD；layout=zh_ymd|en_space|en_dot（默认 en_dot）。"""
+    if not _SIGN_FILE_ID_RE.match(signer_id or ""):
+        return jsonify({"ok": False, "error": "无效的签署人 id"}), 400
+    if not _sign_using_mysql():
+        return jsonify({"ok": False, "error": "需启用 MySQL"}), 400
+    iso = (request.args.get("iso") or "").strip()
+    layout = (request.args.get("layout") or "en_dot").strip().lower()
+    if layout not in ("zh_ymd", "en_space", "en_dot"):
+        return jsonify({"ok": False, "error": "layout 须为 zh_ymd / en_space / en_dot"}), 400
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        png_b, label = mysql_store.compose_date_piece_png(signer_id, iso, layout)
+        resp = send_file(io.BytesIO(png_b), mimetype="image/png")
+        resp.headers["X-Composite-Date-Label"] = label
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @app.route("/api/sign/signers/<signer_id>/stroke/<kind>", methods=["GET"])
 def api_sign_signer_stroke_get(signer_id, kind):
     if not _SIGN_FILE_ID_RE.match(signer_id or ""):
@@ -3152,7 +3409,12 @@ def api_sign_file_role_map_put(file_id):
         if not k or not v:
             continue
         if isinstance(v, dict):
-            clean[str(k)] = {"sig": v.get("sig"), "date": v.get("date")}
+            clean[str(k)] = {
+                "sig": v.get("sig"),
+                "date": v.get("date"),
+                "date_mode": v.get("date_mode"),
+                "date_iso": v.get("date_iso"),
+            }
         else:
             clean[str(k)] = str(v)
     try:
@@ -3273,44 +3535,180 @@ def api_sign_batch():
                 continue
             sig_map = {}
             date_map = {}
-            miss = None
+            applied = []
+            skipped = []
             if source == "canvas":
                 for rid in roles:
-                    if rid not in canvas_sig_map or rid not in canvas_date_map:
-                        miss = f"角色 {rid} 缺少画布签名或日期"
-                        break
-                    sig_map[rid] = canvas_sig_map[rid]
-                    date_map[rid] = canvas_date_map[rid]
+                    sb = canvas_sig_map.get(rid)
+                    db = canvas_date_map.get(rid)
+                    if sb:
+                        sig_map[rid] = sb
+                    if db:
+                        date_map[rid] = db
+                    if sb or db:
+                        applied.append(
+                            {
+                                "role_id": rid,
+                                "sig": bool(sb),
+                                "date": bool(db),
+                                "date_mode": "canvas",
+                            }
+                        )
+                    else:
+                        skipped.append(
+                            {
+                                "role_id": rid,
+                                "reason": "该角色签名与日期画布均为空，已跳过",
+                            }
+                        )
             else:
                 for rid in roles:
                     pair = mapping.get(rid) or {}
                     sig_id = (pair.get("sig") if isinstance(pair, dict) else None) or None
                     date_id = (pair.get("date") if isinstance(pair, dict) else None) or None
-                    if not sig_id or not date_id:
-                        miss = f"角色 {rid} 未同时绑定签名与日期素材"
-                        break
-                    srow = mysql_store.get_stroke_item_row(sig_id)
-                    drow = mysql_store.get_stroke_item_row(date_id)
-                    if not srow or not srow.get("png") or not drow or not drow.get("png"):
-                        miss = f"角色 {rid} 对应素材缺失"
-                        break
-                    sig_map[rid] = srow["png"]
-                    date_map[rid] = drow["png"]
-            if miss:
-                results.append({"file_id": fid, "ok": False, "error": miss})
+                    dm = (pair.get("date_mode") if isinstance(pair, dict) else None) or None
+                    diso = (pair.get("date_iso") if isinstance(pair, dict) else None) or None
+                    if mysql_store.is_composite_date_mode(dm):
+                        if not sig_id or not diso:
+                            # 拼接日期需要签名确定 signer_id；缺条件则跳过该角色
+                            skipped.append(
+                                {
+                                    "role_id": rid,
+                                    "reason": "拼接日期需绑定签名并选择日历日期",
+                                }
+                            )
+                            continue
+                        srow = mysql_store.get_stroke_item_row(sig_id)
+                        if not srow or not srow.get("png"):
+                            skipped.append(
+                                {
+                                    "role_id": rid,
+                                    "reason": "签名素材缺失",
+                                }
+                            )
+                            continue
+                        sid0 = (srow.get("signer_id") or "").strip()
+                        if not sid0:
+                            skipped.append(
+                                {
+                                    "role_id": rid,
+                                    "reason": "无法解析签署人",
+                                }
+                            )
+                            continue
+                        try:
+                            lay = mysql_store.composite_mode_to_layout(dm)
+                            dbytes, _lbl = mysql_store.compose_date_piece_png(
+                                sid0, str(diso).strip(), lay
+                            )
+                        except Exception as e:
+                            skipped.append(
+                                {
+                                    "role_id": rid,
+                                    "reason": f"日期拼接失败：{e}",
+                                }
+                            )
+                            continue
+                        sig_map[rid] = srow["png"]
+                        date_map[rid] = dbytes
+                        applied.append(
+                            {
+                                "role_id": rid,
+                                "sig": True,
+                                "date": True,
+                                "date_mode": "composite",
+                            }
+                        )
+                        continue
+                    sb = None
+                    if sig_id:
+                        srow = mysql_store.get_stroke_item_row(sig_id)
+                        if srow and srow.get("png"):
+                            sb = srow["png"]
+                            sig_map[rid] = sb
+                    db = None
+                    if date_id:
+                        drow = mysql_store.get_stroke_item_row(date_id)
+                        if drow and drow.get("png"):
+                            db = drow["png"]
+                            date_map[rid] = db
+                    if sb or db:
+                        applied.append(
+                            {
+                                "role_id": rid,
+                                "sig": bool(sb),
+                                "date": bool(db),
+                                "date_mode": "item",
+                            }
+                        )
+                    else:
+                        skipped.append(
+                            {
+                                "role_id": rid,
+                                "reason": "未绑定或素材缺失（签名/日期均无可用数据）",
+                            }
+                        )
+            # 至少要有一个角色提供签名或日期；否则该文件不生成
+            if (not sig_map) and (not date_map):
+                results.append(
+                    {
+                        "file_id": fid,
+                        "ok": False,
+                        "error": "未选择任何可用素材：请至少为一个角色提供签名或日期后再生成",
+                        "applied_n": 0,
+                        "skipped_n": len(skipped),
+                        "skipped": "；".join(
+                            [
+                                f"{x.get('role_id')}：{x.get('reason') or '跳过'}"
+                                for x in skipped
+                                if isinstance(x, dict)
+                            ]
+                        )[:1200],
+                    }
+                )
                 continue
             res = _sign_process_document_bytes(
                 row["file_data"], ext, base_name, roles, sig_map, date_map, fid
             )
             if not res.get("ok"):
-                results.append({"file_id": fid, "ok": False, "error": res.get("error", "失败")})
+                results.append(
+                    {
+                        "file_id": fid,
+                        "ok": False,
+                        "error": res.get("error", "失败"),
+                        "applied_n": len(applied),
+                        "skipped_n": len(skipped),
+                    }
+                )
             else:
+                ap_txt = "；".join(
+                    [
+                        f"{x.get('role_id')}："
+                        + ("签名" if x.get("sig") else "")
+                        + ("+" if x.get("sig") and x.get("date") else "")
+                        + ("日期" if x.get("date") else "")
+                        + ("（拼接）" if x.get("date_mode") == "composite" else "")
+                        for x in applied
+                        if isinstance(x, dict)
+                    ]
+                )
+                sk_txt = "；".join(
+                    [
+                        f"{x.get('role_id')}：{x.get('reason') or '跳过'}"
+                        for x in skipped
+                        if isinstance(x, dict)
+                    ]
+                )
                 results.append(
                     {
                         "file_id": fid,
                         "ok": True,
                         "signed_id": res.get("signed_id"),
                         "name": res.get("dl_name"),
+                        "applied_n": len(applied),
+                        "skipped_n": len(skipped),
+                        "applied": ap_txt[:1200],
+                        "skipped": sk_txt[:1200],
                     }
                 )
         except Exception as e:
@@ -3422,10 +3820,11 @@ def api_sign_stroke_items_list():
 
         mysql_store.ensure_sign_mysql()
         q = (request.args.get("q") or "").strip()
+        cat = (request.args.get("cat") or "").strip()
         page = max(1, int(request.args.get("page") or 1))
         page_size = max(1, min(100, int(request.args.get("page_size") or 10)))
         items, total = mysql_store.list_stroke_items_page(
-            q=q, page=page, page_size=page_size
+            q=q, page=page, page_size=page_size, cat=cat
         )
         return jsonify(
             {

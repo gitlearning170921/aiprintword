@@ -104,10 +104,16 @@ def _clear_runs_after_offset(p: Paragraph, start_char_offset: int) -> None:
             r.text = ""
 
 
-def _insert_pictures_in_paragraph(p: Paragraph, sig_png: bytes, date_png: bytes) -> None:
-    p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
-    p.add_run(" ")
-    p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+def _insert_pictures_in_paragraph(
+    p: Paragraph, sig_png: Optional[bytes], date_png: Optional[bytes]
+) -> None:
+    """在同一段落中按需插入签名/日期（可只插入其一）。"""
+    if sig_png:
+        p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+    if sig_png and date_png:
+        p.add_run(" ")
+    if date_png:
+        p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
 
 
 def _cell_looks_like_date_header_cell(text: str) -> bool:
@@ -206,8 +212,8 @@ def _insert_sig_only_in_empty_cell(cell, sig_png: bytes) -> None:
 def _try_table_adjacent_date_column(
     table: Table,
     keyword: str,
-    sig_png: bytes,
-    date_png: bytes,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
 ) -> bool:
     """
     常见审批表：
@@ -230,27 +236,35 @@ def _try_table_adjacent_date_column(
             if date_idx is None:
                 continue
             date_cell = cells[date_idx]
-            if date_idx == ci + 1:
-                if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
-                    continue
-            else:
-                mid = cells[ci + 1]
-                if not _is_emptyish_text(_cell_text(mid)):
-                    continue
-                # 优先贴近“角色/姓名”字段标记插入，避免落到 tab leader/占位末端导致距离过远
-                if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
-                    _insert_sig_only_in_empty_cell(mid, sig_png)
-            if not _insert_date_only_in_date_cell(date_cell, date_png):
-                continue
-            return True
+            placed_any = False
+            if sig_png:
+                if date_idx == ci + 1:
+                    if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
+                        continue
+                else:
+                    mid = cells[ci + 1]
+                    if not _is_emptyish_text(_cell_text(mid)):
+                        continue
+                    # 优先贴近“角色/姓名”字段标记插入，避免落到 tab leader/占位末端导致距离过远
+                    if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
+                        _insert_sig_only_in_empty_cell(mid, sig_png)
+                placed_any = True
+            if date_png:
+                if not _insert_date_only_in_date_cell(date_cell, date_png):
+                    # 仅有日期时若没能插入（极少），继续找其它匹配
+                    if not placed_any:
+                        continue
+                placed_any = True
+            if placed_any:
+                return True
     return False
 
 
 def _try_paragraph_inline(
     p: Paragraph,
     keyword: str,
-    sig_png: bytes,
-    date_png: bytes,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
 ) -> bool:
     """段落内：关键词后占位符清除并插图，或下划线 run 后插图，否则关键词后追加。"""
     off = _find_keyword_in_paragraph(p, keyword)
@@ -297,8 +311,8 @@ def _try_paragraph_inline(
 def _try_table_role(
     table: Table,
     keyword: str,
-    sig_png: bytes,
-    date_png: bytes,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
 ) -> bool:
     if _try_table_adjacent_date_column(table, keyword, sig_png, date_png):
         return True
@@ -334,20 +348,31 @@ def _try_table_role(
                     date_cell = nc[ci + 1]
                 elif ci < len(nc) and _is_emptyish_text(_cell_text(nc[ci])):
                     date_cell = nc[ci]
-            sig_cell.text = ""
-            p0 = sig_cell.paragraphs[0] if sig_cell.paragraphs else sig_cell.add_paragraph()
-            for r in list(p0.runs):
-                r.text = ""
-            if date_cell is None:
-                _insert_pictures_in_paragraph(p0, sig_png, date_png)
+            placed_any = False
+            if sig_png:
+                sig_cell.text = ""
+                p0 = sig_cell.paragraphs[0] if sig_cell.paragraphs else sig_cell.add_paragraph()
+                for r in list(p0.runs):
+                    r.text = ""
+                p0.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+                placed_any = True
+            if date_png and date_cell is not None:
+                date_cell.text = ""
+                p2 = date_cell.paragraphs[0] if date_cell.paragraphs else date_cell.add_paragraph()
+                for r in list(p2.runs):
+                    r.text = ""
+                p2.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+                placed_any = True
+            if date_png and date_cell is None and (not sig_png):
+                # 只有日期但没找到日期单元格时，退化为写入 sig_cell（至少能落在该角色附近）
+                sig_cell.text = ""
+                p0 = sig_cell.paragraphs[0] if sig_cell.paragraphs else sig_cell.add_paragraph()
+                for r in list(p0.runs):
+                    r.text = ""
+                _insert_pictures_in_paragraph(p0, None, date_png)
+                placed_any = True
+            if placed_any:
                 return True
-            p0.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
-            date_cell.text = ""
-            p2 = date_cell.paragraphs[0] if date_cell.paragraphs else date_cell.add_paragraph()
-            for r in list(p2.runs):
-                r.text = ""
-            p2.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
-            return True
     return False
 
 
@@ -380,7 +405,7 @@ def sign_docx(
     for role_id in ROLE_ID_TO_KEYWORD:
         sig = role_to_signature_png.get(role_id)
         dt = role_to_date_png.get(role_id)
-        if not sig or not dt:
+        if not sig and not dt:
             continue
         done = False
         for kw in role_keywords(role_id):

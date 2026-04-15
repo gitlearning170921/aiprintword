@@ -66,7 +66,7 @@ def sign_xlsx(
     for role_id in ROLE_ID_TO_KEYWORD:
         sig = role_to_signature_png.get(role_id)
         dt = role_to_date_png.get(role_id)
-        if not sig or not dt:
+        if not sig and not dt:
             continue
         placed = False
         for kw in role_keywords(role_id):
@@ -83,7 +83,8 @@ def sign_xlsx(
                             continue
                         r, c = cell.row, cell.column
                         sig_cell = ws.cell(row=r, column=c + 1)
-                        if not _is_emptyish(sig_cell.value):
+                        # 若要贴签名，签名格必须为空；若只贴日期，则不强制要求签名格为空
+                        if sig and (not _is_emptyish(sig_cell.value)):
                             continue
                         date_cell = _find_date_cell_same_row(ws, r, c)
                         if date_cell is None:
@@ -98,14 +99,22 @@ def sign_xlsx(
                                     d0 = ws.cell(row=r + 1, column=c)
                                     if _is_emptyish(d0.value):
                                         date_cell = d0
-                        sig_cell.value = None
-                        _add_png(ws, sig, sig_cell.coordinate)
-                        if date_cell is not None:
-                            date_cell.value = None
-                            _add_png(ws, dt, date_cell.coordinate, max_w=180)
-                        else:
-                            below = f"{get_column_letter(c + 1)}{r + 1}"
-                            _add_png(ws, dt, below, max_w=180)
+                        placed_any = False
+                        if sig:
+                            sig_cell.value = None
+                            _add_png(ws, sig, sig_cell.coordinate)
+                            placed_any = True
+                        if dt:
+                            if date_cell is not None:
+                                date_cell.value = None
+                                _add_png(ws, dt, date_cell.coordinate, max_w=180)
+                            else:
+                                # 找不到日期单元格时：放到签名格下方
+                                below = f"{get_column_letter(c + 1)}{r + 1}"
+                                _add_png(ws, dt, below, max_w=180)
+                            placed_any = True
+                        if not placed_any:
+                            continue
                         placed = True
                         break
     wb.save(out_path)
