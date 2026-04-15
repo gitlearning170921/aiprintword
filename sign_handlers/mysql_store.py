@@ -1630,7 +1630,16 @@ def compose_date_piece_png(signer_id: str, iso: str, layout: str) -> Tuple[bytes
             else:
                 missing.append(f"{human}（{sk}）" if human and human != sk else sk)
         else:
-            pngs.append(b)
+            if lay == "zh_ymd" and (slot or "").strip().lower() == "pdot":
+                # 中文点分日期：句点单独占一格，但点贴在格子的右下角（视觉上靠近前一位数字）
+                try:
+                    from sign_handlers.date_piece_compose import render_dot_cell_right_bottom
+
+                    pngs.append(render_dot_cell_right_bottom(b, target_h=360, cell_w=110, dot_scale=0.28, margin=2))
+                except Exception:
+                    pngs.append(b)
+            else:
+                pngs.append(b)
     if missing:
         lay_h = "中文 2026.04.15" if lay == "zh_ymd" else ("英文 15 Apr 2026" if lay == "en_space" else lay)
         raise ValueError(

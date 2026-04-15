@@ -232,8 +232,136 @@ def compose_png_horizontal(
     for i, im in enumerate(imgs):
         if i > 0:
             x += gap_list[i - 1]
-        out.paste(im, (x, 0), im)
+        # 底对齐：连接符/字母/数字裁剪后高度不同，顶对齐会导致「.」浮在中间或偏上；
+        # 底对齐能让基线更一致，中文日期中的连接符更自然（靠右下）。
+        y = max(0, h - im.size[1])
+        out.paste(im, (x, y), im)
         x += im.size[0]
+    buf = io.BytesIO()
+    out.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def overlay_dot_on_right_bottom(
+    base_png: bytes,
+    dot_png: bytes,
+    *,
+    target_h: int = 360,
+    dot_scale: float = 0.28,
+    margin: int = 2,
+) -> bytes:
+    """将句点笔迹叠加到 base 的右下角（用于中文 2026.04.15，使 . 贴近前一位数字）。"""
+    if not base_png or not dot_png:
+        return base_png or dot_png
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError("需要安装 Pillow 才能拼接日期笔迹（pip install Pillow）") from e
+
+    def _prep(b: bytes) -> Any:
+        im = Image.open(io.BytesIO(b)).convert("RGBA")
+        im = _scale_to_height(im, target_h)
+        # 与 compose_png_horizontal 一致的“去空白边”裁剪逻辑（简化复用）
+        try:
+            px = im.load()
+            w, h = im.size
+            minx, miny, maxx, maxy = w, h, -1, -1
+            for y in range(h):
+                for x in range(w):
+                    r, g, b2, a = px[x, y]
+                    if a > 8 and (r + g + b2) < 740:
+                        if x < minx:
+                            minx = x
+                        if y < miny:
+                            miny = y
+                        if x > maxx:
+                            maxx = x
+                        if y > maxy:
+                            maxy = y
+            if maxx >= 0 and maxy >= 0:
+                pad = 8
+                minx = max(0, minx - pad)
+                miny = max(0, miny - pad)
+                maxx = min(w - 1, maxx + pad)
+                maxy = min(h - 1, maxy + pad)
+                im = im.crop((minx, miny, maxx + 1, maxy + 1))
+        except Exception:
+            pass
+        return im
+
+    base = _prep(base_png)
+    dot = _prep(dot_png)
+    bw, bh = base.size
+    if bw < 2 or bh < 2:
+        return base_png
+    # 缩小句点并贴到右下角
+    dh = max(1, int(round(bh * float(dot_scale))))
+    dot = _scale_to_height(dot, dh)
+    dw, dh2 = dot.size
+    x = max(0, bw - dw - margin)
+    y = max(0, bh - dh2 - margin)
+    out = Image.new("RGBA", (bw, bh), (255, 255, 255, 0))
+    out.paste(base, (0, 0), base)
+    out.paste(dot, (x, y), dot)
+    buf = io.BytesIO()
+    out.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def render_dot_cell_right_bottom(
+    dot_png: bytes,
+    *,
+    target_h: int = 360,
+    cell_w: int = 110,
+    dot_scale: float = 0.28,
+    margin: int = 2,
+) -> bytes:
+    """把句点渲染为“单独一格”，但点落在该格的右下角（视觉上贴近前一位数字的右下角）。"""
+    if not dot_png:
+        raise ValueError("dot_png 为空")
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError("需要安装 Pillow 才能拼接日期笔迹（pip install Pillow）") from e
+
+    im = Image.open(io.BytesIO(dot_png)).convert("RGBA")
+    im = _scale_to_height(im, target_h)
+    # 复用与拼接一致的裁剪逻辑，避免 dot 自带大空白
+    try:
+        px = im.load()
+        w, h = im.size
+        minx, miny, maxx, maxy = w, h, -1, -1
+        for y in range(h):
+            for x in range(w):
+                r, g, b2, a = px[x, y]
+                if a > 8 and (r + g + b2) < 740:
+                    if x < minx:
+                        minx = x
+                    if y < miny:
+                        miny = y
+                    if x > maxx:
+                        maxx = x
+                    if y > maxy:
+                        maxy = y
+        if maxx >= 0 and maxy >= 0:
+            pad = 8
+            minx = max(0, minx - pad)
+            miny = max(0, miny - pad)
+            maxx = min(w - 1, maxx + pad)
+            maxy = min(h - 1, maxy + pad)
+            im = im.crop((minx, miny, maxx + 1, maxy + 1))
+    except Exception:
+        pass
+
+    # 缩小 dot
+    dh = max(1, int(round(target_h * float(dot_scale))))
+    im = _scale_to_height(im, dh)
+    dw, dh2 = im.size
+    cw = max(int(cell_w), dw + margin * 2)
+    out = Image.new("RGBA", (cw, target_h), (255, 255, 255, 255))
+    x = max(0, cw - dw - margin)
+    y = max(0, target_h - dh2 - margin)
+    out.paste(im, (x, y), im)
     buf = io.BytesIO()
     out.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
