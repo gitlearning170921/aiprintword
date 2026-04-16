@@ -58,15 +58,14 @@
     btn.disabled = true;
     btn.innerHTML =
       '<span class="spinner" aria-hidden="true"></span> ' + (busyLabel || '处理中…');
-    return Promise.resolve()
-      .then(fn)
-      .finally(function () {
-        btn.removeAttribute('aria-busy');
-        btn.innerHTML = prevHtml;
-        if (!opt.skipRestoreDisabled) {
-          btn.disabled = wasDisabled;
-        }
-      });
+    function restoreBtn() {
+      btn.removeAttribute('aria-busy');
+      btn.innerHTML = prevHtml;
+      if (!opt.skipRestoreDisabled) {
+        btn.disabled = wasDisabled;
+      }
+    }
+    return Promise.resolve().then(fn).then(restoreBtn, restoreBtn);
   }
 
   if (typeof window !== 'undefined' && window.location.protocol === 'file:') {
@@ -97,10 +96,15 @@
   var signerNextBtn = document.getElementById('signerNextBtn');
   var needSignTable = document.getElementById('needSignTable');
   var redetectRolesBtn = document.getElementById('redetectRolesBtn');
+  var batchApplyRoleMapBtn = document.getElementById('batchApplyRoleMapBtn');
   var batchSelectAll = document.getElementById('batchSelectAll');
   var batchModeCb = document.getElementById('batchModeCb');
   var batchResultMsg = document.getElementById('batchResultMsg');
+  var needSignActionMsg = document.getElementById('needSignActionMsg');
+  var saveUploadFeedback = document.getElementById('saveUploadFeedback');
   var signSourceMode = document.getElementById('signSourceMode');
+  var libraryRolesModeRow = document.getElementById('libraryRolesModeRow');
+  var libraryRolesUseChecksCb = document.getElementById('libraryRolesUseChecksCb');
   var signerErrMsg = document.getElementById('signerErrMsg');
   var libSignerSelect = document.getElementById('libSignerSelect');
   var libSignerFilter = document.getElementById('libSignerFilter');
@@ -115,7 +119,13 @@
   var strokeItemCatSelect = document.getElementById('strokeItemCatSelect');
   var strokeItemsActionMsg = document.getElementById('strokeItemsActionMsg');
   var strokeItemSearchInput = document.getElementById('strokeItemSearchInput');
+  // 页面拆分：文件签名页 / 素材录入页（两页复用同一脚本；按 DOM 存在与否决定绑定哪些交互）
+  var pageFileSign = document.getElementById('pageFileSign');
+  var pageMaterials = document.getElementById('pageMaterials');
+  var IS_FILE_SIGN_PAGE = !!pageFileSign;
+  var IS_MATERIALS_PAGE = !!pageMaterials;
   var strokeItemSearchBtn = document.getElementById('strokeItemSearchBtn');
+  var strokeItemPager = document.getElementById('strokeItemPager');
   var strokeItemPagerInfo = document.getElementById('strokeItemPagerInfo');
   var strokeItemPrevBtn = document.getElementById('strokeItemPrevBtn');
   var strokeItemNextBtn = document.getElementById('strokeItemNextBtn');
@@ -145,77 +155,212 @@
   var pieceBatchCancelBtn = document.getElementById('pieceBatchCancelBtn');
   var pieceBatchStatus = document.getElementById('pieceBatchStatus');
 
-  if (
-    !fileInput ||
-    !fileHint ||
-    !saveBtn ||
-    !fileListEl ||
-    !listHint ||
-    !roleChecks ||
-    !rolePanels ||
-    !submitBtn ||
-    !errMsg ||
-    !signedListEl ||
-    !signedHint ||
-    !signerLibHint ||
-    !newSignerName ||
-    !addSignerBtn ||
-    !signerListEl ||
-    !signerPagerInfo ||
-    !signerPrevBtn ||
-    !signerNextBtn ||
-    !needSignTable ||
-    !redetectRolesBtn ||
-    !batchSelectAll ||
-    !batchModeCb ||
-    !batchResultMsg ||
-    !signSourceMode ||
-    !signerErrMsg ||
-    !libSignerSelect ||
-    !libSignerFilter ||
-    !libStrokeSetSelect ||
-    !libLocaleSelect ||
-    !libClearSigBtn ||
-    !libClearDateBtn ||
-    !libLoadStrokesBtn ||
-    !libSaveStrokesBtn ||
-    !strokeItemsHint ||
-    !strokeItemCatSelect ||
-    !strokeItemSearchInput ||
-    !strokeItemSearchBtn ||
-    !strokeItemPagerInfo ||
-    !strokeItemPrevBtn ||
-    !strokeItemNextBtn ||
-    !strokeItemListEl ||
-    !signedSearchRow ||
-    !signedSearchInput ||
-    !signedSearchBtn ||
-    !signedPagerInfo ||
-    !signedPrevBtn ||
-    !signedNextBtn ||
-    !pieceDateCard ||
-    !pieceClearBtn ||
-    !pieceCanvasEl ||
-    !pieceHint ||
-    !currentSignerName ||
-    !pieceCurrentSignerName ||
-    !pieceDigitChecks ||
-    !pieceMonthChecks ||
-    !pieceBatchStartBtn ||
-    !pieceBatchNextBtn ||
-    !pieceBatchUploadBtn ||
-    !pieceBatchCancelBtn ||
-    !pieceBatchStatus
-  ) {
+  // 页面拆分后：仅校验“当前页面需要的 DOM”。避免提示“请用完整 sign.html 覆盖”。
+  var _signDomRequired = [];
+  function _req(id, el) {
+    _signDomRequired.push([id, el]);
+  }
+  // 两页共用（脚本运行与告警用）
+  _req('signBootstrapBanner', document.getElementById('signBootstrapBanner'));
+  if (IS_FILE_SIGN_PAGE) {
+    _req('fileInput', fileInput);
+    _req('fileHint', fileHint);
+    _req('saveBtn', saveBtn);
+    _req('fileListEl', fileListEl);
+    _req('listHint', listHint);
+    _req('roleChecks', roleChecks);
+    _req('rolePanels', rolePanels);
+    _req('submitBtn', submitBtn);
+    _req('errMsg', errMsg);
+    _req('signedListEl', signedListEl);
+    _req('signedHint', signedHint);
+    _req('needSignTable', needSignTable);
+    _req('redetectRolesBtn', redetectRolesBtn);
+    _req('batchSelectAll', batchSelectAll);
+    _req('batchModeCb', batchModeCb);
+    _req('batchResultMsg', batchResultMsg);
+    _req('needSignActionMsg', needSignActionMsg);
+    _req('saveUploadFeedback', saveUploadFeedback);
+    _req('signSourceMode', signSourceMode);
+    _req('signedSearchRow', signedSearchRow);
+    _req('signedSearchInput', signedSearchInput);
+    _req('signedSearchBtn', signedSearchBtn);
+    _req('signedPagerInfo', signedPagerInfo);
+    _req('signedPrevBtn', signedPrevBtn);
+    _req('signedNextBtn', signedNextBtn);
+  }
+  if (IS_MATERIALS_PAGE) {
+    _req('signerLibHint', signerLibHint);
+    _req('newSignerName', newSignerName);
+    _req('addSignerBtn', addSignerBtn);
+    _req('signerListEl', signerListEl);
+    _req('signerPagerInfo', signerPagerInfo);
+    _req('signerPrevBtn', signerPrevBtn);
+    _req('signerNextBtn', signerNextBtn);
+    _req('signerErrMsg', signerErrMsg);
+    _req('libSignerSelect', libSignerSelect);
+    _req('libSignerFilter', libSignerFilter);
+    _req('libStrokeSetSelect', libStrokeSetSelect);
+    _req('libLocaleSelect', libLocaleSelect);
+    _req('libClearSigBtn', libClearSigBtn);
+    _req('libClearDateBtn', libClearDateBtn);
+    _req('libLoadStrokesBtn', libLoadStrokesBtn);
+    _req('libSaveStrokesBtn', libSaveStrokesBtn);
+    _req('strokeItemsHint', strokeItemsHint);
+    _req('strokeItemCatSelect', strokeItemCatSelect);
+    _req('strokeItemSearchInput', strokeItemSearchInput);
+    _req('strokeItemSearchBtn', strokeItemSearchBtn);
+    _req('strokeItemPagerInfo', strokeItemPagerInfo);
+    _req('strokeItemPrevBtn', strokeItemPrevBtn);
+    _req('strokeItemNextBtn', strokeItemNextBtn);
+    _req('strokeItemListEl', strokeItemListEl);
+    _req('pieceDateCard', pieceDateCard);
+    _req('pieceClearBtn', pieceClearBtn);
+    _req('pieceCanvasEl', pieceCanvasEl);
+    _req('pieceHint', pieceHint);
+    _req('currentSignerName', currentSignerName);
+    _req('pieceCurrentSignerName', pieceCurrentSignerName);
+    _req('pieceDigitChecks', pieceDigitChecks);
+    _req('pieceMonthChecks', pieceMonthChecks);
+    _req('pieceBatchStartBtn', pieceBatchStartBtn);
+    _req('pieceBatchNextBtn', pieceBatchNextBtn);
+    _req('pieceBatchUploadBtn', pieceBatchUploadBtn);
+    _req('pieceBatchCancelBtn', pieceBatchCancelBtn);
+    _req('pieceBatchStatus', pieceBatchStatus);
+  }
+  var _signDomMissing = [];
+  for (var _di = 0; _di < _signDomRequired.length; _di++) {
+    if (!_signDomRequired[_di][1]) _signDomMissing.push(_signDomRequired[_di][0]);
+  }
+  if (_signDomMissing.length) {
+    var _failMsg =
+      '签名脚本未启动：页面缺少 id 为 ' +
+      _signDomMissing.slice(0, 14).join(', ') +
+      (_signDomMissing.length > 14 ? '…（共 ' + _signDomMissing.length + ' 项）' : ' 的节点');
+    window.__SIGN_PAGE_BOOT_FAIL_MSG = _failMsg;
+    try {
+      window.__SIGN_PAGE_BOOT_HALTED = true;
+    } catch (_) {}
+    try {
+      var _ban = document.getElementById('signBootstrapBanner');
+      if (_ban) {
+        _ban.style.display = 'block';
+        _ban.textContent = _failMsg + '。请 Ctrl+F5 强刷；确认页面文件与 static/js/sign-page.js 已同步部署，并已重启 python app.py。';
+      }
+      var ph = document.getElementById('signerLibHint');
+      if (ph) ph.textContent = _failMsg;
+      var lh = document.getElementById('listHint');
+      if (lh) lh.textContent = _failMsg;
+    } catch (_) {}
     return;
   }
 
-  var redetectRolesBtnDefaultHtml = redetectRolesBtn.innerHTML;
+  /** 清除「需签角色」表内行反馈、重新识别旁、上传保存旁等非「生成文档」区提示 */
+  function clearNeedSignScopedFeedbacks() {
+    try {
+      if (needSignActionMsg) {
+        needSignActionMsg.style.display = 'none';
+        needSignActionMsg.textContent = '';
+        needSignActionMsg.className = 'btn-inline-feedback is-error';
+      }
+      if (saveUploadFeedback) {
+        saveUploadFeedback.style.display = 'none';
+        saveUploadFeedback.textContent = '';
+        saveUploadFeedback.className = 'btn-inline-feedback is-error';
+      }
+      if (needSignTable) {
+        var nodes = needSignTable.querySelectorAll('[id^="needSignRowMsg_"]');
+        for (var ni = 0; ni < nodes.length; ni++) {
+          nodes[ni].style.display = 'none';
+          nodes[ni].textContent = '';
+          nodes[ni].className = 'btn-inline-feedback';
+        }
+      }
+    } catch (_) {}
+  }
+
+  function setNeedSignActionFeedback(s) {
+    if (!needSignActionMsg) return;
+    if (!s) {
+      needSignActionMsg.style.display = 'none';
+      needSignActionMsg.textContent = '';
+      needSignActionMsg.className = 'btn-inline-feedback is-error';
+      return;
+    }
+    clearFileRegionErr();
+    if (signerErrMsg) {
+      signerErrMsg.style.display = 'none';
+      signerErrMsg.textContent = '';
+    }
+    needSignActionMsg.style.display = 'block';
+    needSignActionMsg.textContent = s;
+    needSignActionMsg.className = 'btn-inline-feedback is-error';
+  }
+
+  function setSaveUploadFeedback(s) {
+    if (!saveUploadFeedback) return;
+    if (!s) {
+      saveUploadFeedback.style.display = 'none';
+      saveUploadFeedback.textContent = '';
+      saveUploadFeedback.className = 'btn-inline-feedback is-error';
+      return;
+    }
+    clearFileRegionErr();
+    if (signerErrMsg) {
+      signerErrMsg.style.display = 'none';
+      signerErrMsg.textContent = '';
+    }
+    saveUploadFeedback.style.display = 'block';
+    saveUploadFeedback.textContent = s;
+    saveUploadFeedback.className = 'btn-inline-feedback is-error';
+  }
+
+  function setRoleRowFeedback(rid, s) {
+    var el = document.getElementById('needSignRowMsg_' + rid);
+    if (!el) return;
+    if (!s) {
+      el.style.display = 'none';
+      el.textContent = '';
+      el.className = 'btn-inline-feedback';
+      return;
+    }
+    clearFileRegionErr();
+    if (signerErrMsg) {
+      signerErrMsg.style.display = 'none';
+      signerErrMsg.textContent = '';
+    }
+    el.style.display = 'block';
+    el.textContent = s;
+    el.className = 'btn-inline-feedback is-error';
+  }
+
+  function setPanelSaveFeedback(el, s, isErr) {
+    if (!el) return;
+    if (!s) {
+      el.style.display = 'none';
+      el.textContent = '';
+      el.className = 'btn-inline-feedback';
+      return;
+    }
+    clearFileRegionErr();
+    if (signerErrMsg) {
+      signerErrMsg.style.display = 'none';
+      signerErrMsg.textContent = '';
+    }
+    el.style.display = 'block';
+    el.textContent = s;
+    el.className = 'btn-inline-feedback' + (isErr ? ' is-error' : ' is-ok');
+  }
+
+  // 页面拆分后：素材录入页没有该按钮
+  var redetectRolesBtnDefaultHtml = redetectRolesBtn ? redetectRolesBtn.innerHTML : '重新识别需签字角色';
 
   var canvases = {};
   var selectedFileId = null;
   var savedFiles = [];
   var pendingSignFiles = [];
+  // 每个文件的 UI/检测缓存：避免切换文件清空选择；避免反复自动识别
+  var fileUiCache = {}; // fileId -> { detectedOnce, lastDetectData, lastDetectError, checkedRoleIds, roleItemFilterQ, roleSaveSigner, currentRoleMap }
   var lastDetectData = null;
   /** 与 lastDetectData 对应的 file_id，用于避免列表重绘时误判“已检测”而跳过 /api/sign/detect */
   var lastDetectFileId = null;
@@ -248,6 +393,92 @@
   // 本文件角色映射：把“画布签名/日期”入库到哪个签署人（每个角色、每个 kind 可不同）
   var roleSaveSigner = {};
 
+  function _deepCloneJsonish(x) {
+    try {
+      return JSON.parse(JSON.stringify(x || {}));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function saveCurrentFileUiToCache(fileId) {
+    if (!fileId) return;
+    fileUiCache[fileId] = fileUiCache[fileId] || {};
+    fileUiCache[fileId].detectedOnce = !!(
+      (fileUiCache[fileId] && fileUiCache[fileId].detectedOnce) ||
+      (lastDetectData && lastDetectData.ok && String(lastDetectFileId) === String(fileId))
+    );
+    fileUiCache[fileId].lastDetectData =
+      lastDetectData && String(lastDetectFileId) === String(fileId) ? lastDetectData : (fileUiCache[fileId].lastDetectData || null);
+    fileUiCache[fileId].lastDetectError =
+      String(lastDetectFileId) === String(fileId) ? (lastDetectError || '') : (fileUiCache[fileId].lastDetectError || '');
+    fileUiCache[fileId].checkedRoleIds = selectedRoleIds();
+    fileUiCache[fileId].roleItemFilterQ = _deepCloneJsonish(roleItemFilterQ);
+    fileUiCache[fileId].roleSaveSigner = _deepCloneJsonish(roleSaveSigner);
+    fileUiCache[fileId].currentRoleMap = _deepCloneJsonish(currentRoleMap);
+  }
+
+  function restoreFileUiFromCache(fileId) {
+    var st = fileId ? fileUiCache[fileId] : null;
+    if (!st) return false;
+    // 检测结果
+    lastDetectData = st.lastDetectData || null;
+    lastDetectFileId = st.lastDetectData ? fileId : null;
+    lastDetectError = st.lastDetectError || '';
+    // 勾选角色（不强制要求 detect 成功）
+    resetAllRoleChecks();
+    (st.checkedRoleIds || []).forEach(function (rid) {
+      if (rid) setRoleChecked(rid, true);
+    });
+    // 表格筛选/入库绑定等（体验：切回来不丢输入）
+    roleItemFilterQ = _deepCloneJsonish(st.roleItemFilterQ);
+    roleSaveSigner = _deepCloneJsonish(st.roleSaveSigner);
+    currentRoleMap = _deepCloneJsonish(st.currentRoleMap);
+    renderNeedSignTable();
+    updateSubmitState();
+    showNeedSignNoticeForSelectedFile();
+    return true;
+  }
+
+  function cachePatchCurrentRoleMap(fileId, newMap) {
+    if (!fileId) return;
+    fileUiCache[fileId] = fileUiCache[fileId] || {};
+    fileUiCache[fileId].currentRoleMap = _deepCloneJsonish(newMap || {});
+  }
+
+  function cacheSetNeedSignNotice(fileId, msg, isErr) {
+    if (!fileId) return;
+    fileUiCache[fileId] = fileUiCache[fileId] || {};
+    fileUiCache[fileId].needSignNotice = msg || '';
+    fileUiCache[fileId].needSignNoticeErr = !!isErr;
+  }
+
+  function showNeedSignNoticeForSelectedFile() {
+    try {
+      if (!selectedFileId) return;
+      var st = fileUiCache[selectedFileId] || {};
+      var msg = st.needSignNotice || '';
+      if (!msg) {
+        setNeedSignActionFeedback('');
+        return;
+      }
+      setNeedSignActionFeedback(msg, !!st.needSignNoticeErr);
+    } catch (_) {}
+  }
+
+  function cacheMarkDetected(fileId) {
+    if (!fileId) return;
+    fileUiCache[fileId] = fileUiCache[fileId] || {};
+    fileUiCache[fileId].detectedOnce = true;
+    if (lastDetectData && lastDetectData.ok) {
+      fileUiCache[fileId].lastDetectData = lastDetectData;
+      fileUiCache[fileId].lastDetectError = '';
+    } else if (lastDetectError) {
+      fileUiCache[fileId].lastDetectError = lastDetectError;
+    }
+    fileUiCache[fileId].checkedRoleIds = selectedRoleIds();
+  }
+
   function isCompositeDateMode(dm) {
     var d = String(dm || '').toLowerCase();
     return (
@@ -267,9 +498,44 @@
   function roleMapEntryNonEmpty(p) {
     if (!p || typeof p !== 'object') return false;
     if (isCompositeDateMode(p.date_mode)) {
-      return !!(p.sig && p.date_iso);
+      // 拼接日期是“配置型”选项：允许先选 date_mode/date_iso，后续再补选签名素材。
+      // 否则 putRoleMap 会把该角色从 map 删除，表格重绘（如点“批量映射”）时看起来像“被清空”。
+      return !!(p.date_iso || p.sig);
     }
     return !!(p.sig || p.date);
+  }
+
+  /** 库映射自动模式：映射表中已绑定且结构满足生成条件的角色（顺序与 ROLES 一致） */
+  function libraryBoundSignableRoleIds(map) {
+    var m = map && typeof map === 'object' ? map : {};
+    var out = [];
+    ROLES.forEach(function (r) {
+      var p = m[r.id];
+      if (p && typeof p === 'object' && roleMapEntryNonEmpty(p)) {
+        out.push(r.id);
+      }
+    });
+    return out;
+  }
+
+  function signSourceValue() {
+    return (signSourceMode && signSourceMode.value ? signSourceMode.value : 'canvas').trim().toLowerCase();
+  }
+
+  function libraryRolesRestrictedToChecks() {
+    return !!(libraryRolesUseChecksCb && libraryRolesUseChecksCb.checked);
+  }
+
+  /** 单文件生成：画布始终用勾选角色；库映射默认用表绑定，高级选项用勾选 */
+  function effectiveRolesForSingleSign() {
+    if (signSourceValue() === 'canvas') return selectedRoleIds();
+    if (libraryRolesRestrictedToChecks()) return selectedRoleIds();
+    return libraryBoundSignableRoleIds(currentRoleMap);
+  }
+
+  function syncLibraryRolesModeRow() {
+    if (!libraryRolesModeRow || !signSourceMode) return;
+    libraryRolesModeRow.style.display = signSourceValue() === 'library' ? 'block' : 'none';
   }
 
   function todayIsoLocal() {
@@ -295,9 +561,10 @@
   }
 
   function showSignerErr(s) {
+    if (!signerErrMsg) return;
     if (s) {
-      errMsg.style.display = 'none';
-      errMsg.textContent = '';
+      clearFileRegionErr();
+      clearNeedSignScopedFeedbacks();
     }
     signerErrMsg.style.display = s ? 'block' : 'none';
     signerErrMsg.textContent = s || '';
@@ -356,7 +623,6 @@
       pieceBatchStatus.className = 'btn-inline-feedback is-ok';
       return;
     }
-    if (isErr) clearFileRegionErr();
     pieceBatchStatus.textContent = s;
     pieceBatchStatus.className =
       'btn-inline-feedback' + (isErr ? ' is-error' : ' is-ok');
@@ -376,7 +642,6 @@
       pieceHint.className = 'btn-inline-feedback is-ok';
       return;
     }
-    if (isErr) clearFileRegionErr();
     pieceHint.textContent = s;
     pieceHint.className =
       'btn-inline-feedback' + (isErr ? ' is-error' : ' is-ok');
@@ -691,6 +956,7 @@
   }
 
   function refreshRoleSaveSignerControls() {
+    if (!IS_FILE_SIGN_PAGE) return;
     // 角色画布旁的“保存到签署人”控件在 buildUI 时创建；需要在 signersList 更新后回填选项
     try {
       document.querySelectorAll('.role-save-signer').forEach(function (wrap) {
@@ -750,6 +1016,7 @@
   }
 
   function showSignerListLoading() {
+    if (!signerListEl) return;
     signerListEl.innerHTML = '';
     var li = document.createElement('li');
     li.textContent = '正在加载签署人列表…';
@@ -759,6 +1026,7 @@
   }
 
   function showFileListLoading() {
+    if (!fileListEl || !listHint) return;
     fileListEl.innerHTML = '';
     listHint.style.display = 'block';
     listHint.textContent = '正在加载文件列表…';
@@ -766,6 +1034,7 @@
   }
 
   function showSignedListLoading() {
+    if (!signedListEl || !signedHint) return;
     signedListEl.innerHTML = '';
     signedHint.style.display = 'block';
     signedHint.textContent = '正在加载已签名列表…';
@@ -773,6 +1042,7 @@
   }
 
   function showStrokeItemsLoading() {
+    if (!strokeItemListEl || !strokeItemsHint) return;
     strokeItemListEl.innerHTML = '';
     strokeItemsHint.style.display = 'block';
     strokeItemsHint.textContent = '正在加载已存储签字图片…';
@@ -955,7 +1225,8 @@
     // 统一导出尺寸，避免不同设备/横竖屏导致 PNG 宽高比漂移，进而在 Word/展示中观感不一致
     if (!canvas) return '';
     kind = (kind || 'sig').toLowerCase();
-    var targetW = kind === 'date' ? 900 : 1200;
+    // 日期与签名使用同一目标宽度，避免入库 PNG 分辨率不同 → Word 同宽缩放时笔画粗细/墨色观感不一致
+    var targetW = 1200;
     var targetH = 360;
     try {
       var srcW = canvas.width || 0;
@@ -968,7 +1239,10 @@
       out.height = targetH;
       var octx = out.getContext('2d');
       octx.setTransform(1, 0, 0, 1, 0, 0);
-      octx.clearRect(0, 0, targetW, targetH);
+      // 白底：透明 PNG 在 Word 里叠在表格底纹上时，抗锯齿边缘会被看成「发灰变淡」
+      octx.imageSmoothingEnabled = false;
+      octx.fillStyle = '#ffffff';
+      octx.fillRect(0, 0, targetW, targetH);
       var sx = targetW / srcW;
       var sy = targetH / srcH;
       var s = Math.min(sx, sy);
@@ -1010,7 +1284,9 @@
     var ctx = canvas.getContext('2d');
     return new Promise(function (resolve) {
       var img = new Image();
-      img.crossOrigin = 'anonymous';
+      if (url && String(url).indexOf('blob:') !== 0) {
+        img.crossOrigin = 'anonymous';
+      }
       img.onload = function () {
         try {
           if (canvases[canvasId] && canvases[canvasId].resize) {
@@ -1052,41 +1328,55 @@
         var j = result.data || {};
         if (!j.ok) {
           signersList = [];
-          signerListEl.innerHTML = '';
-          signerLibHint.textContent =
+          if (signerListEl) signerListEl.innerHTML = '';
+          if (signerLibHint) signerLibHint.textContent =
             '签署人列表加载失败：' + (j.error || '请确认服务已重启。');
-          renderNeedSignTable();
-          updateBatchUi();
-          updateSubmitState();
+          if (IS_FILE_SIGN_PAGE) {
+            renderNeedSignTable();
+            updateBatchUi();
+            updateSubmitState();
+          }
+          if (IS_MATERIALS_PAGE) {
+            refreshStrokeItemList();
+          }
           return;
         }
         signersDbShare = !!j.db_share;
         signersList = Array.isArray(j.signers) ? j.signers : [];
-        signerLibHint.textContent = signersDbShare
+        if (signerLibHint) signerLibHint.textContent = signersDbShare
           ? '已启用 MySQL：签署人笔迹可在多台电脑复用。'
           : '当前为会话目录存储：笔迹仅保存在本浏览器对应会话目录，换浏览器需重新添加。';
         if (pieceDateCard) pieceDateCard.style.display = signersDbShare ? 'block' : 'none';
         renderSignerLib();
-        renderNeedSignTable();
-        refreshRoleSaveSignerControls();
-        updateBatchUi();
-        updateSubmitState();
-        refreshStrokeItemList();
+        if (IS_FILE_SIGN_PAGE) {
+          renderNeedSignTable();
+          refreshRoleSaveSignerControls();
+          updateBatchUi();
+          updateSubmitState();
+        }
+        if (IS_MATERIALS_PAGE) {
+          refreshStrokeItemList();
+        }
       })
       .catch(function (e) {
         signersList = [];
-        signerListEl.innerHTML = '';
-        signerLibHint.textContent =
+        if (signerListEl) signerListEl.innerHTML = '';
+        if (signerLibHint) signerLibHint.textContent =
           '无法加载签署人列表：' + (e && e.message ? e.message : String(e));
-        renderNeedSignTable();
-        refreshRoleSaveSignerControls();
-        updateBatchUi();
-        updateSubmitState();
-        refreshStrokeItemList();
+        if (IS_FILE_SIGN_PAGE) {
+          renderNeedSignTable();
+          refreshRoleSaveSignerControls();
+          updateBatchUi();
+          updateSubmitState();
+        }
+        if (IS_MATERIALS_PAGE) {
+          refreshStrokeItemList();
+        }
       });
   }
 
   function renderSignerLib() {
+    if (!signerListEl) return;
     signerListEl.innerHTML = '';
     if (!signersList.length) {
       var empty = document.createElement('li');
@@ -1101,10 +1391,10 @@
     if (signerPageIndex < 0) signerPageIndex = 0;
     var start = signerPageIndex * signerPageSize;
     var end = Math.min(total, start + signerPageSize);
-    signerPagerInfo.textContent =
+    if (signerPagerInfo) signerPagerInfo.textContent =
       '已录入 ' + total + ' 位签署人 · 第 ' + (signerPageIndex + 1) + ' / ' + pageCount + ' 页（默认仅显示 3 位）';
-    signerPrevBtn.disabled = signerPageIndex <= 0;
-    signerNextBtn.disabled = signerPageIndex >= pageCount - 1;
+    if (signerPrevBtn) signerPrevBtn.disabled = signerPageIndex <= 0;
+    if (signerNextBtn) signerNextBtn.disabled = signerPageIndex >= pageCount - 1;
     signersList.slice(start, end).forEach(function (s) {
       var li = document.createElement('li');
       var wrap = document.createElement('div');
@@ -1241,6 +1531,7 @@
   }
 
   function renderNeedSignTable() {
+    if (!IS_FILE_SIGN_PAGE || !needSignTable) return;
     needSignTable.innerHTML = '';
     if (!selectedFileId) {
       needSignTable.textContent = '请先选择列表中的文件。';
@@ -1348,14 +1639,18 @@
           .then(function (r) {
             var jj = r.data;
             if (!jj.ok) {
-              showErr(jj.error || '保存映射失败');
+              setRoleRowFeedback(rid, jj.error || '保存映射失败');
               return;
             }
             currentRoleMap = jj.map || m;
-            showErr('');
+            cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+            setRoleRowFeedback(rid, '');
           })
           .catch(function (e) {
-            showErr(e.message || String(e));
+            setRoleRowFeedback(rid, e.message || String(e));
+          })
+          .then(function () {
+            updateSubmitState();
           });
 
         // 选择签名后：自动把日期下拉框切换到同一签署人的日期素材（仅 item 模式时有意义）
@@ -1440,14 +1735,18 @@
           .then(function (r) {
             var jj = r.data;
             if (!jj.ok) {
-              showErr(jj.error || '保存映射失败');
+              setRoleRowFeedback(rid, jj.error || '保存映射失败');
               return;
             }
             currentRoleMap = jj.map || m;
-            showErr('');
+            cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+            setRoleRowFeedback(rid, '');
           })
           .catch(function (e) {
-            showErr(e.message || String(e));
+            setRoleRowFeedback(rid, e.message || String(e));
+          })
+          .then(function () {
+            updateSubmitState();
           });
       });
       dateItemBox.appendChild(dateFilter);
@@ -1519,15 +1818,23 @@
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ map: m }),
-        }).then(function (r) {
-          var jj = r.data;
-          if (!jj.ok) {
-            showErr(jj.error || '保存映射失败');
-            return;
-          }
-          currentRoleMap = jj.map || m;
-          showErr('');
-        });
+        })
+          .then(function (r) {
+            var jj = r.data;
+            if (!jj.ok) {
+              setRoleRowFeedback(rid, jj.error || '保存映射失败');
+              return;
+            }
+            currentRoleMap = jj.map || m;
+            cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+            setRoleRowFeedback(rid, '');
+          })
+          .catch(function (e) {
+            setRoleRowFeedback(rid, e.message || String(e));
+          })
+          .then(function () {
+            updateSubmitState();
+          });
       }
 
       dateCompBox.appendChild(dateIsoInp);
@@ -1560,12 +1867,12 @@
         } catch (_) {}
         if (!sid && libSignerSelect && libSignerSelect.value) sid = libSignerSelect.value;
         if (!sid) {
-          showErr('请先选择签署人（或先选择签名素材以自动确定签署人）');
+          setRoleRowFeedback(rid, '请先选择签署人（或先选择签名素材以自动确定签署人）');
           return;
         }
         var iso = (dateIsoInp.value || '').trim();
         if (!iso) {
-          showErr('请先选择日期');
+          setRoleRowFeedback(rid, '请先选择日期');
           return;
         }
         var lay = compositeModeToLayout(dateModeSel.value);
@@ -1631,7 +1938,7 @@
         p.date = null;
         p.date_iso = dateIsoInp.value || null;
         putRoleMap(p).catch(function (e) {
-          showErr(e.message || String(e));
+          setRoleRowFeedback(rid, e.message || String(e));
         });
       });
 
@@ -1649,7 +1956,7 @@
         }
         applyDateModeVisibility(v);
         putRoleMap(p).catch(function (e) {
-          showErr(e.message || String(e));
+          setRoleRowFeedback(rid, e.message || String(e));
         });
       }
       dateModeSel.addEventListener('change', syncModeFromSelect);
@@ -1703,12 +2010,12 @@
       bLoad.addEventListener('click', function () {
         var itemId = sigSel.value;
         if (!itemId) {
-          showErr('请先选择签名素材');
+          setRoleRowFeedback(rid, '请先选择签名素材');
           return;
         }
         withButtonBusy(bLoad, '载入中…', function () {
           return new Promise(function (resolve) {
-            showErr('');
+            setRoleRowFeedback(rid, '');
             var ts = '?t=' + Date.now();
             setRoleChecked(rid, true);
             requestAnimationFrame(function () {
@@ -1716,7 +2023,10 @@
                 resizeCanvasesForRoles([rid]);
                 drawUrlToCanvas(
                   'sig_' + rid,
-                  apiUrl('/api/sign/stroke-items/' + itemId + '/png') + ts
+                  apiUrl('/api/sign/stroke-items/' + itemId + '/png') + ts,
+                  function (msg) {
+                    setRoleRowFeedback(rid, msg);
+                  }
                 ).then(function () {
                   resolve();
                 });
@@ -1734,20 +2044,95 @@
       bLoadDate.style.marginRight = '6px';
       bLoadDate.addEventListener('click', function () {
         var pr = currentRoleMap[rid];
-        if (pr && isCompositeDateMode(pr.date_mode)) {
-          showErr(
-            '当前为笔迹拼接模式：日期由日历与版式自动生成；请用「预览拼接」查看，或改回「整张日期手写图」载入素材。'
-          );
+        var dmRow = (dateModeSel && dateModeSel.value) || (pr && pr.date_mode) || 'item';
+        if (isCompositeDateMode(dmRow)) {
+          if (!signersDbShare) {
+            setRoleRowFeedback(rid, '拼接日期需启用 MySQL。');
+            return;
+          }
+          var sidC = '';
+          try {
+            var optSigC = sigSel.options[sigSel.selectedIndex];
+            sidC = optSigC ? (optSigC.getAttribute('data-signer-id') || '') : '';
+          } catch (_) {}
+          if (!sidC && libSignerSelect && libSignerSelect.value) sidC = libSignerSelect.value;
+          if (!sidC) {
+            setRoleRowFeedback(
+              rid,
+              '请先选择签名素材（用于确定签署人），或在上方的「当前签署人」中选择。'
+            );
+            return;
+          }
+          var isoC = (dateIsoInp.value || '').trim();
+          if (!isoC) {
+            setRoleRowFeedback(rid, '请先选择日历日期');
+            return;
+          }
+          var layC = compositeModeToLayout(dmRow);
+          var uC =
+            apiUrl('/api/sign/signers/' + sidC + '/composite-date-preview') +
+            '?iso=' +
+            encodeURIComponent(isoC) +
+            '&layout=' +
+            encodeURIComponent(layC) +
+            '&_=' +
+            Date.now();
+          withButtonBusy(bLoadDate, '载入中…', function () {
+            return fetch(uC, { credentials: 'include' }).then(function (res) {
+              if (!res.ok) {
+                return res.text().then(function (text) {
+                  var msg = '载入拼接日期失败（HTTP ' + res.status + '）';
+                  var t = (text || '').trim();
+                  if (t && t.charAt(0) !== '<') {
+                    try {
+                      var jce = JSON.parse(t);
+                      if (jce && jce.error) msg = String(jce.error);
+                    } catch (_) {}
+                  }
+                  setRoleRowFeedback(rid, msg);
+                  return Promise.reject(new Error(msg));
+                });
+              }
+              return res.blob().then(function (blob) {
+                var ourl = '';
+                try {
+                  ourl = URL.createObjectURL(blob);
+                } catch (e0) {
+                  setRoleRowFeedback(rid, '无法在浏览器中生成本地图片地址');
+                  return Promise.reject(e0);
+                }
+                setRoleRowFeedback(rid, '');
+                setRoleChecked(rid, true);
+                return new Promise(function (resolve) {
+                  requestAnimationFrame(function () {
+                    requestAnimationFrame(function () {
+                      resizeCanvasesForRoles([rid]);
+                      drawUrlToCanvas('date_' + rid, ourl, function (m) {
+                        setRoleRowFeedback(rid, m || '拼接图无法绘制到画布');
+                      }).then(function () {
+                        try {
+                          URL.revokeObjectURL(ourl);
+                        } catch (_) {}
+                        resolve();
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          }).then(function () {
+            updateSubmitState();
+          });
           return;
         }
         var itemId = dateSel.value;
         if (!itemId) {
-          showErr('请先选择日期素材');
+          setRoleRowFeedback(rid, '请先选择日期素材');
           return;
         }
         withButtonBusy(bLoadDate, '载入中…', function () {
           return new Promise(function (resolve) {
-            showErr('');
+            setRoleRowFeedback(rid, '');
             var ts = '?t=' + Date.now();
             setRoleChecked(rid, true);
             requestAnimationFrame(function () {
@@ -1755,7 +2140,10 @@
                 resizeCanvasesForRoles([rid]);
                 drawUrlToCanvas(
                   'date_' + rid,
-                  apiUrl('/api/sign/stroke-items/' + itemId + '/png') + ts
+                  apiUrl('/api/sign/stroke-items/' + itemId + '/png') + ts,
+                  function (msg) {
+                    setRoleRowFeedback(rid, msg);
+                  }
                 ).then(function () {
                   resolve();
                 });
@@ -1770,6 +2158,14 @@
       td4.appendChild(locSel);
       td4.appendChild(bLoad);
       td4.appendChild(bLoadDate);
+      var rowInlineMsg = document.createElement('p');
+      rowInlineMsg.id = 'needSignRowMsg_' + rid;
+      rowInlineMsg.className = 'btn-inline-feedback';
+      rowInlineMsg.style.display = 'none';
+      rowInlineMsg.style.marginTop = '8px';
+      rowInlineMsg.style.maxWidth = '100%';
+      rowInlineMsg.setAttribute('role', 'status');
+      td4.appendChild(rowInlineMsg);
       tr.appendChild(td1);
       tr.appendChild(td2);
       tr.appendChild(td3);
@@ -1791,19 +2187,33 @@
     updateSubmitState();
   }
 
-  batchSelectAll.addEventListener('change', function () {
-    document.querySelectorAll('.batch-pick').forEach(function (cb) {
-      cb.checked = batchSelectAll.checked;
+  if (batchSelectAll) {
+    batchSelectAll.addEventListener('change', function () {
+      document.querySelectorAll('.batch-pick').forEach(function (cb) {
+        cb.checked = batchSelectAll.checked;
+      });
+      updateBatchUi();
     });
-    updateBatchUi();
-  });
+  }
 
-  batchModeCb.addEventListener('change', function () {
-    showErr('');
-    updateSubmitState();
-  });
+  if (batchModeCb) {
+    batchModeCb.addEventListener('change', function () {
+      showErr('');
+      updateSubmitState();
+    });
+  }
 
-  addSignerBtn.addEventListener('click', function () {
+  if (signSourceMode) {
+    signSourceMode.addEventListener('change', function () {
+      syncLibraryRolesModeRow();
+      updateSubmitState();
+    });
+  }
+  if (libraryRolesUseChecksCb) {
+    libraryRolesUseChecksCb.addEventListener('change', updateSubmitState);
+  }
+
+  if (addSignerBtn && newSignerName) addSignerBtn.addEventListener('click', function () {
     var raw = newSignerName.value.trim();
     if (!raw) {
       showSignerErr('请填写至少一个签署人名称');
@@ -1838,41 +2248,41 @@
     });
   });
 
-  libSignerSelect.addEventListener('change', function () {
+  if (libSignerSelect) libSignerSelect.addEventListener('change', function () {
     showSignerErr('');
     syncLibStrokeSetSelect();
     syncCurrentSignerBanners();
   });
 
-  libSignerFilter.addEventListener('input', function () {
+  if (libSignerFilter) libSignerFilter.addEventListener('input', function () {
     showSignerErr('');
     syncLibSignerSelect();
     syncCurrentSignerBanners();
   });
 
-  signerPrevBtn.addEventListener('click', function () {
+  if (signerPrevBtn) signerPrevBtn.addEventListener('click', function () {
     signerPageIndex = Math.max(0, signerPageIndex - 1);
     renderSignerLib();
   });
 
-  signerNextBtn.addEventListener('click', function () {
+  if (signerNextBtn) signerNextBtn.addEventListener('click', function () {
     signerPageIndex = signerPageIndex + 1;
     renderSignerLib();
   });
 
-  libClearSigBtn.addEventListener('click', function () {
+  if (libClearSigBtn) libClearSigBtn.addEventListener('click', function () {
     if (canvases['lib_sig_canvas'] && canvases['lib_sig_canvas'].clear) {
       canvases['lib_sig_canvas'].clear();
     }
   });
 
-  libClearDateBtn.addEventListener('click', function () {
+  if (libClearDateBtn) libClearDateBtn.addEventListener('click', function () {
     if (canvases['lib_date_canvas'] && canvases['lib_date_canvas'].clear) {
       canvases['lib_date_canvas'].clear();
     }
   });
 
-  libLoadStrokesBtn.addEventListener('click', function () {
+  if (libLoadStrokesBtn) libLoadStrokesBtn.addEventListener('click', function () {
     if (!libSignerSelect.value) {
       setLibStrokeFeedback('请先在「当前签署人」中选择一位', true);
       return;
@@ -1885,7 +2295,7 @@
     });
   });
 
-  libSaveStrokesBtn.addEventListener('click', function () {
+  if (libSaveStrokesBtn) libSaveStrokesBtn.addEventListener('click', function () {
     var sid = libSignerSelect.value;
     if (!sid) {
       setLibStrokeFeedback('请先选择签署人', true);
@@ -1984,13 +2394,22 @@
       showErr('批量签名需要启用 MySQL（MYSQL_HOST）');
       return;
     }
-    var source = (signSourceMode.value || 'canvas').trim().toLowerCase();
-    var rolesForBatch = selectedRoleIds();
-    if (!rolesForBatch.length) {
-      showErr('请至少勾选一个角色（用于批量签）');
-      return;
+    var source = signSourceValue();
+    var libRestrict = libraryRolesRestrictedToChecks();
+    var rolesForBatch = null;
+    if (source === 'library' && !libRestrict) {
+      rolesForBatch = null;
+    } else {
+      rolesForBatch = selectedRoleIds();
+      if (!rolesForBatch.length) {
+        showErr('请至少勾选一个角色（用于批量签）');
+        return;
+      }
     }
-    var payload = { file_ids: ids, source: source, roles: rolesForBatch };
+    var payload = { file_ids: ids, source: source };
+    if (rolesForBatch != null) {
+      payload.roles = rolesForBatch;
+    }
     if (source === 'canvas') {
       resizeCanvasesForRoles(rolesForBatch);
       payload.sig_map = {};
@@ -2047,7 +2466,7 @@
       .catch(function (e) {
         showErr(e.message || String(e));
       })
-      .finally(function () {
+      .then(function () {
         submitBtn.disabled = false;
         updateSubmitState();
         updateBatchUi();
@@ -2055,7 +2474,10 @@
   }
 
   function buildUI() {
-    ROLES.forEach(function (r) {
+    // 两个页面复用同一脚本：按页面类型只初始化各自需要的 UI
+    if (!IS_FILE_SIGN_PAGE && !IS_MATERIALS_PAGE) return;
+
+    if (IS_FILE_SIGN_PAGE) ROLES.forEach(function (r) {
       var row = document.createElement('div');
       row.className = 'role-row';
       var chk = document.createElement('input');
@@ -2142,10 +2564,15 @@
         saveBtn.className = 'btn btn-secondary';
         saveBtn.style.marginTop = '6px';
         saveBtn.textContent = (kind === 'date' ? '入库日期并绑定本角色' : '入库签名并绑定本角色');
+        var panelSaveFb = document.createElement('p');
+        panelSaveFb.className = 'btn-inline-feedback';
+        panelSaveFb.style.display = 'none';
+        panelSaveFb.style.marginTop = '6px';
+        panelSaveFb.setAttribute('role', 'status');
         saveBtn.addEventListener('click', function () {
           var signerForSave = sel.value || state.id || '';
           if (!signerForSave) {
-            showErr('请先选择要保存到的签署人（可在上方添加新签署人）');
+            setPanelSaveFeedback(panelSaveFb, '请先选择要保存到的签署人（可在上方添加新签署人）', true);
             return;
           }
           var finalLoc = _roleFinalLocale(rid);
@@ -2166,7 +2593,11 @@
               resizeCanvasesForRoles([rid]);
               var c = document.getElementById(canvasId);
               if (isCanvasBlank(c)) {
-                showErr('请先在「' + roleLabel(rid) + '」' + (kind === 'date' ? '日期' : '签名') + '画布上手写');
+                setPanelSaveFeedback(
+                  panelSaveFb,
+                  '请先在「' + roleLabel(rid) + '」' + (kind === 'date' ? '日期' : '签名') + '画布上手写',
+                  true
+                );
                 return;
               }
               var fd = new FormData();
@@ -2179,10 +2610,10 @@
                 }).then(function (rr) {
                   var jj = rr.data || {};
                   if (!jj.ok) {
-                    showErr(jj.error || '保存失败');
+                    setPanelSaveFeedback(panelSaveFb, jj.error || '保存失败', true);
                     return;
                   }
-                  showErr('');
+                  setPanelSaveFeedback(panelSaveFb, '', false);
                   var newId = (kind === 'date') ? jj.date_item_id : jj.sig_item_id;
                   if (newId && selectedFileId) {
                     var m = Object.assign({}, currentRoleMap);
@@ -2197,17 +2628,25 @@
                     }).then(function (r2) {
                       var j2 = r2.data;
                       if (j2 && j2.ok) currentRoleMap = j2.map || m;
-                      showBatchResult((kind === 'date' ? '日期' : '签名') + '已入库并已绑定本角色。', false);
+                      setPanelSaveFeedback(
+                        panelSaveFb,
+                        (kind === 'date' ? '日期' : '签名') + '已入库并已绑定本角色。',
+                        false
+                      );
                       return refreshSigners();
                     }).then(function () {
                       renderNeedSignTable();
                     });
                   }
-                  showBatchResult((kind === 'date' ? '日期' : '签名') + '已保存到所选签署人。', false);
+                  setPanelSaveFeedback(
+                    panelSaveFb,
+                    (kind === 'date' ? '日期' : '签名') + '已保存到所选签署人。',
+                    false
+                  );
                   return refreshSigners();
                 });
               }).catch(function (e) {
-                showErr(e.message || String(e));
+                setPanelSaveFeedback(panelSaveFb, e.message || String(e), true);
               });
             });
           });
@@ -2216,6 +2655,7 @@
         saveWrap.appendChild(filter);
         saveWrap.appendChild(sel);
         saveWrap.appendChild(saveBtn);
+        saveWrap.appendChild(panelSaveFb);
         wrap.appendChild(saveWrap);
         panel.appendChild(wrap);
       }
@@ -2241,14 +2681,14 @@
       });
     });
 
-    rolePanels.querySelectorAll('[data-clear]').forEach(function (btn) {
+    if (IS_FILE_SIGN_PAGE) rolePanels.querySelectorAll('[data-clear]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var id = btn.getAttribute('data-clear');
         if (canvases[id]) canvases[id].clear();
       });
     });
 
-    ROLES.forEach(function (r) {
+    if (IS_FILE_SIGN_PAGE) ROLES.forEach(function (r) {
       canvases['sig_' + r.id] = setupCanvas(document.getElementById('sig_' + r.id), {
         lineWidth: 4.35,
         shadowBlur: 0.7,
@@ -2259,16 +2699,16 @@
       });
     });
 
-    canvases['lib_sig_canvas'] = setupCanvas(document.getElementById('lib_sig_canvas'), {
+    if (IS_MATERIALS_PAGE) canvases['lib_sig_canvas'] = setupCanvas(document.getElementById('lib_sig_canvas'), {
       lineWidth: 4.35,
       shadowBlur: 0.7,
     });
-    canvases['lib_date_canvas'] = setupCanvas(document.getElementById('lib_date_canvas'), {
+    if (IS_MATERIALS_PAGE) canvases['lib_date_canvas'] = setupCanvas(document.getElementById('lib_date_canvas'), {
       lineWidth: 3.55,
       shadowBlur: 0.55,
     });
 
-    (function initPieceDateUi() {
+    if (IS_MATERIALS_PAGE) (function initPieceDateUi() {
       var MONTHS_EN = [
         'January',
         'February',
@@ -2572,49 +3012,53 @@
       });
     })();
 
-    signedSearchBtn.addEventListener('click', function () {
-      signedListQ = signedSearchInput.value ? String(signedSearchInput.value).trim() : '';
-      signedListPage = 1;
-      refreshSignedList();
-    });
-    signedSearchInput.addEventListener('keydown', function (ev) {
-      if (ev.key === 'Enter') {
-        ev.preventDefault();
-        signedSearchBtn.click();
-      }
-    });
-    signedPrevBtn.addEventListener('click', function () {
+    if (IS_FILE_SIGN_PAGE && signedSearchBtn && signedSearchInput) {
+      signedSearchBtn.addEventListener('click', function () {
+        signedListQ = signedSearchInput.value ? String(signedSearchInput.value).trim() : '';
+        signedListPage = 1;
+        refreshSignedList();
+      });
+      signedSearchInput.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          signedSearchBtn.click();
+        }
+      });
+    }
+    if (IS_FILE_SIGN_PAGE && signedPrevBtn) signedPrevBtn.addEventListener('click', function () {
       if (signedListPage <= 1) return;
       signedListPage -= 1;
       refreshSignedList();
     });
-    signedNextBtn.addEventListener('click', function () {
+    if (IS_FILE_SIGN_PAGE && signedNextBtn) signedNextBtn.addEventListener('click', function () {
       signedListPage += 1;
       refreshSignedList();
     });
 
-    strokeItemSearchBtn.addEventListener('click', function () {
-      strokeItemQ = strokeItemSearchInput.value ? String(strokeItemSearchInput.value).trim() : '';
-      strokeItemPage = 1;
-      refreshStrokeItemList();
-    });
-    strokeItemSearchInput.addEventListener('keydown', function (ev) {
-      if (ev.key === 'Enter') {
-        ev.preventDefault();
-        strokeItemSearchBtn.click();
-      }
-    });
-    strokeItemCatSelect.addEventListener('change', function () {
+    if (IS_MATERIALS_PAGE && strokeItemSearchBtn && strokeItemSearchInput) {
+      strokeItemSearchBtn.addEventListener('click', function () {
+        strokeItemQ = strokeItemSearchInput.value ? String(strokeItemSearchInput.value).trim() : '';
+        strokeItemPage = 1;
+        refreshStrokeItemList();
+      });
+      strokeItemSearchInput.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          strokeItemSearchBtn.click();
+        }
+      });
+    }
+    if (IS_MATERIALS_PAGE && strokeItemCatSelect) strokeItemCatSelect.addEventListener('change', function () {
       strokeItemCat = strokeItemCatSelect.value || '';
       strokeItemPage = 1;
       refreshStrokeItemList();
     });
-    strokeItemPrevBtn.addEventListener('click', function () {
+    if (IS_MATERIALS_PAGE && strokeItemPrevBtn) strokeItemPrevBtn.addEventListener('click', function () {
       if (strokeItemPage <= 1) return;
       strokeItemPage -= 1;
       refreshStrokeItemList();
     });
-    strokeItemNextBtn.addEventListener('click', function () {
+    if (IS_MATERIALS_PAGE && strokeItemNextBtn) strokeItemNextBtn.addEventListener('click', function () {
       strokeItemPage += 1;
       refreshStrokeItemList();
     });
@@ -2630,15 +3074,28 @@
   }
 
   function updateSubmitState() {
-    var roles = selectedRoleIds();
+    // 素材录入页没有「生成已签名文档」按钮；避免空指针导致脚本中断
+    if (!submitBtn) return;
     var batchMode = !!(batchModeCb && batchModeCb.checked);
     var picked = document.querySelectorAll('.batch-pick:checked').length;
+    var src = signSourceValue();
+    var libRestrict = libraryRolesRestrictedToChecks();
     var ok = false;
     if (batchMode) {
-      // 批量模式：只要勾选了文件即可点击；角色为空时由点击后提示（避免按钮“置灰无法操作”）
       ok = !!(signersDbShare && picked > 0);
+      if (ok && src === 'library' && libRestrict && !selectedRoleIds().length) {
+        ok = false;
+      }
+    } else if (!selectedFileId) {
+      ok = false;
+    } else if (src === 'canvas') {
+      ok = selectedRoleIds().length > 0;
+    } else if (!signersDbShare) {
+      ok = false;
+    } else if (libRestrict) {
+      ok = selectedRoleIds().length > 0;
     } else {
-      ok = !!(selectedFileId && roles.length > 0);
+      ok = libraryBoundSignableRoleIds(currentRoleMap).length > 0;
     }
     submitBtn.disabled = !ok;
     submitBtn.textContent = batchMode ? '批量生成已签名文档' : '生成已签名文档';
@@ -2656,6 +3113,7 @@
   }
 
   function renderFileList() {
+    if (!IS_FILE_SIGN_PAGE || !fileListEl || !listHint || !needSignTable) return;
     fileListEl.innerHTML = '';
     if (!savedFiles.length) {
       listHint.style.display = 'block';
@@ -2715,16 +3173,44 @@
       delBtn.textContent = '删除';
 
       radio.addEventListener('change', function () {
+        // 切换前：保存当前文件的 UI 状态（已选角色/筛选输入等），避免切回丢失
+        saveCurrentFileUiToCache(selectedFileId);
         selectedFileId = rec.id;
-        lastDetectData = null;
-        lastDetectFileId = null;
-        lastDetectError = '';
         document.querySelectorAll('.file-list li').forEach(function (el) {
           el.classList.remove('selected');
         });
         li.classList.add('selected');
-        detectAndAutoSelectRoles(selectedFileId);
-        updateSubmitState();
+        // 切换后：若之前已识别过该文件，则直接恢复，不再自动识别；首次切换才自动识别
+        if (!restoreFileUiFromCache(selectedFileId)) {
+          var st0 = fileUiCache[selectedFileId] || {};
+          if (!st0.detectedOnce) {
+            detectAndAutoSelectRoles(selectedFileId);
+          } else {
+            // 仅加载 role-map，确保表格可编辑
+            fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'))
+              .then(function (r) {
+                var jj = r.data || {};
+                if (jj.ok) currentRoleMap = jj.map || {};
+                cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+                renderNeedSignTable();
+                updateSubmitState();
+              })
+              .catch(function () {});
+          }
+        } else {
+          // 已恢复：仍从服务端刷新一次 role-map（防止多端修改）
+          fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'))
+            .then(function (r) {
+              var jj = r.data || {};
+              if (jj.ok) currentRoleMap = jj.map || {};
+              cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+              renderNeedSignTable();
+              updateSubmitState();
+            })
+            .catch(function () {});
+        }
+        // 若该文件属于“批量映射目标”，才显示提示；否则清空提示
+        showNeedSignNoticeForSelectedFile();
       });
       delBtn.addEventListener('click', function () {
         withButtonBusy(delBtn, '删除中…', function () {
@@ -2762,21 +3248,23 @@
     updateSubmitState();
     updateBatchUi();
     var sid = selectedFileId;
-    var hasValidDetect =
-      sid &&
-      lastDetectData &&
-      lastDetectData.ok &&
-      String(lastDetectFileId) === String(sid);
-    if (sid && !hasValidDetect) {
-      detectAndAutoSelectRoles(sid);
-    } else if (sid) {
-      fetchJson(apiUrl('/api/sign/files/' + sid + '/role-map'))
-        .then(function (r) {
-          var jj = r.data || {};
-          if (jj.ok) currentRoleMap = jj.map || {};
-          renderNeedSignTable();
-        })
-        .catch(function () {});
+    // 首次进入页面：仅首次选中时自动识别；若曾识别过（缓存里有标记），不再自动识别
+    if (sid) {
+      var st = fileUiCache[sid] || {};
+      if (!st.detectedOnce) {
+        detectAndAutoSelectRoles(sid);
+      } else {
+        // 有缓存则恢复；并刷新 role-map
+        restoreFileUiFromCache(sid);
+        fetchJson(apiUrl('/api/sign/files/' + sid + '/role-map'))
+          .then(function (r) {
+            var jj = r.data || {};
+            if (jj.ok) currentRoleMap = jj.map || {};
+            cachePatchCurrentRoleMap(sid, currentRoleMap);
+            renderNeedSignTable();
+          })
+          .catch(function () {});
+      }
     }
   }
 
@@ -2799,9 +3287,11 @@
   }
 
   function renderSignedList(j) {
+    if (!IS_FILE_SIGN_PAGE || !signedListEl || !signedHint) return;
+    var batches = (j && j.batches) || [];
     var items = (j && j.items) || [];
     var dbShare = !!(j && j.db_share);
-    var total = typeof (j && j.total) === 'number' ? j.total : items.length;
+    var total = typeof (j && j.total) === 'number' ? j.total : (batches.length ? batches.length : items.length);
     var page = typeof (j && j.page) === 'number' ? j.page : 1;
     var pageSize = typeof (j && j.page_size) === 'number' ? j.page_size : signedListPageSize;
     var pageCountEarly = Math.max(1, Math.ceil(total / pageSize) || 1);
@@ -2819,7 +3309,7 @@
       return;
     }
     signedSearchRow.style.display = 'block';
-    if (!items.length) {
+    if (!batches.length && !items.length) {
       signedHint.style.display = 'block';
       signedHint.textContent = signedListQ
         ? '无匹配的已签名记录，请尝试其它关键字或清空搜索。'
@@ -2840,7 +3330,7 @@
       ' 条）';
     signedPrevBtn.disabled = page <= 1;
     signedNextBtn.disabled = page >= pageCount;
-    items.forEach(function (it) {
+    function renderSignedItemRow(it, parent) {
       var li = document.createElement('li');
       var wrap = document.createElement('div');
       wrap.style.flex = '1';
@@ -2896,14 +3386,350 @@
       li.appendChild(wrap);
       li.appendChild(dl);
       li.appendChild(delBtn);
-      signedListEl.appendChild(li);
+      parent.appendChild(li);
+    }
+
+    // 历史记录（未分批）分组：旧数据 batch_id 为空（即使当前没有任何新批次，也要展示）
+    var legacyTotal = typeof (j && j.legacy_total) === 'number' ? j.legacy_total : 0;
+    if (legacyTotal > 0) {
+      (function () {
+        var li = document.createElement('li');
+        var wrap = document.createElement('div');
+        wrap.style.flex = '1';
+        wrap.style.minWidth = '0';
+        var title = document.createElement('div');
+        title.style.fontWeight = '600';
+        title.style.wordBreak = 'break-all';
+        title.textContent = '历史记录（未分批）（' + legacyTotal + ' 个）';
+        var meta = document.createElement('div');
+        meta.className = 'signed-meta';
+        meta.textContent = '旧版生成的已签名记录（无批次号）。可展开查看/搜索/下载 zip。';
+        wrap.appendChild(title);
+        wrap.appendChild(meta);
+
+        var toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'btn btn-secondary';
+        toggle.textContent = '展开';
+
+        var zipA = document.createElement('a');
+        zipA.className = 'btn btn-secondary';
+        zipA.textContent = '下载历史包';
+        zipA.href = apiUrl('/api/sign/signed-legacy/zip?q=' + encodeURIComponent(signedListQ || ''));
+        zipA.setAttribute('download', '');
+
+        var box = document.createElement('div');
+        box.style.display = 'none';
+        box.style.width = '100%';
+        box.style.marginTop = '10px';
+        box.style.paddingTop = '10px';
+        box.style.borderTop = '1px solid var(--border)';
+
+        var searchRow = document.createElement('div');
+        searchRow.className = 'btn-row';
+        searchRow.style.margin = '0 0 10px';
+        var bi = document.createElement('input');
+        bi.type = 'search';
+        bi.placeholder = '在历史记录内搜索文件名…';
+        bi.style.flex = '1';
+        bi.style.minWidth = '140px';
+        bi.style.padding = '8px 12px';
+        bi.style.border = '1px solid var(--border)';
+        bi.style.borderRadius = '8px';
+        var bs = document.createElement('button');
+        bs.type = 'button';
+        bs.className = 'btn btn-secondary';
+        bs.textContent = '搜索';
+        searchRow.appendChild(bi);
+        searchRow.appendChild(bs);
+
+        var pager = document.createElement('div');
+        pager.className = 'btn-row';
+        pager.style.margin = '0 0 10px';
+        pager.style.alignItems = 'center';
+        var pi = document.createElement('span');
+        pi.className = 'hint';
+        pi.style.margin = '0';
+        var pprev = document.createElement('button');
+        pprev.type = 'button';
+        pprev.className = 'btn btn-secondary';
+        pprev.textContent = '上一页';
+        var pnext = document.createElement('button');
+        pnext.type = 'button';
+        pnext.className = 'btn btn-secondary';
+        pnext.textContent = '下一页';
+        pager.appendChild(pi);
+        pager.appendChild(pprev);
+        pager.appendChild(pnext);
+
+        var innerList = document.createElement('ul');
+        innerList.className = 'file-list';
+        innerList.style.marginTop = '0';
+
+        var legacyPage = 1;
+        var legacyPageSize = 20;
+        var legacyQ = '';
+
+        function loadLegacy() {
+          innerList.innerHTML = '';
+          var h = document.createElement('li');
+          h.textContent = '正在加载历史记录…';
+          h.style.border = 'none';
+          h.style.background = 'transparent';
+          innerList.appendChild(h);
+          fetchJson(
+            apiUrl(
+              '/api/sign/signed-legacy?q=' +
+                encodeURIComponent(legacyQ || '') +
+                '&page=' +
+                legacyPage +
+                '&page_size=' +
+                legacyPageSize +
+                '&_=' +
+                Date.now()
+            )
+          )
+            .then(function (r) {
+              var jj = r.data || {};
+              if (!jj.ok) {
+                innerList.innerHTML = '';
+                var e = document.createElement('li');
+                e.textContent = '加载失败：' + (jj.error || '未知错误');
+                e.style.border = 'none';
+                e.style.background = 'transparent';
+                innerList.appendChild(e);
+                return;
+              }
+              var arr = jj.items || [];
+              var total2 = typeof jj.total === 'number' ? jj.total : arr.length;
+              var page2 = typeof jj.page === 'number' ? jj.page : legacyPage;
+              var ps2 = typeof jj.page_size === 'number' ? jj.page_size : legacyPageSize;
+              var pc = Math.max(1, Math.ceil(total2 / ps2) || 1);
+              pi.textContent = '共 ' + total2 + ' 条 · 第 ' + page2 + ' / ' + pc + ' 页';
+              pprev.disabled = page2 <= 1;
+              pnext.disabled = page2 >= pc;
+              innerList.innerHTML = '';
+              if (!arr.length) {
+                var e2 = document.createElement('li');
+                e2.textContent = legacyQ ? '无匹配文件。' : '暂无历史记录。';
+                e2.style.border = 'none';
+                e2.style.background = 'transparent';
+                innerList.appendChild(e2);
+                return;
+              }
+              arr.forEach(function (it) {
+                renderSignedItemRow(it, innerList);
+              });
+            })
+            .catch(function (e) {
+              innerList.innerHTML = '';
+              var e3 = document.createElement('li');
+              e3.textContent = '加载失败：' + (e && e.message ? e.message : String(e));
+              e3.style.border = 'none';
+              e3.style.background = 'transparent';
+              innerList.appendChild(e3);
+            });
+        }
+
+        bs.addEventListener('click', function () {
+          legacyQ = bi.value ? String(bi.value).trim() : '';
+          legacyPage = 1;
+          zipA.href = apiUrl('/api/sign/signed-legacy/zip?q=' + encodeURIComponent(legacyQ || ''));
+          loadLegacy();
+        });
+        bi.addEventListener('keydown', function (ev) {
+          if (ev && ev.key === 'Enter') {
+            ev.preventDefault();
+            legacyQ = bi.value ? String(bi.value).trim() : '';
+            legacyPage = 1;
+            zipA.href = apiUrl('/api/sign/signed-legacy/zip?q=' + encodeURIComponent(legacyQ || ''));
+            loadLegacy();
+          }
+        });
+        pprev.addEventListener('click', function () {
+          if (legacyPage <= 1) return;
+          legacyPage -= 1;
+          loadLegacy();
+        });
+        pnext.addEventListener('click', function () {
+          legacyPage += 1;
+          loadLegacy();
+        });
+
+        box.appendChild(searchRow);
+        box.appendChild(pager);
+        box.appendChild(innerList);
+
+        var opened = false;
+        toggle.addEventListener('click', function () {
+          opened = !opened;
+          box.style.display = opened ? 'block' : 'none';
+          toggle.textContent = opened ? '收起' : '展开';
+          if (opened) loadLegacy();
+        });
+
+        li.appendChild(wrap);
+        li.appendChild(toggle);
+        li.appendChild(zipA);
+        li.appendChild(box);
+        signedListEl.appendChild(li);
+      })();
+    }
+
+    if (batches && batches.length) {
+      batches.forEach(function (b) {
+        var li = document.createElement('li');
+        var wrap = document.createElement('div');
+        wrap.style.flex = '1';
+        wrap.style.minWidth = '0';
+        var title = document.createElement('div');
+        title.style.fontWeight = '600';
+        title.style.wordBreak = 'break-all';
+        title.textContent =
+          '批次 ' +
+          String(b.batch_id || '').slice(0, 8) +
+          (b.created_at ? (' · ' + b.created_at) : '') +
+          '（' +
+          (b.n || 0) +
+          ' 个）';
+        var meta = document.createElement('div');
+        meta.className = 'signed-meta';
+        meta.textContent = '可展开查看文件；可下载该批次 zip；批次内支持搜索。';
+        wrap.appendChild(title);
+        wrap.appendChild(meta);
+
+        var toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'btn btn-secondary';
+        toggle.textContent = '展开';
+
+        var zipA = document.createElement('a');
+        zipA.className = 'btn btn-secondary';
+        zipA.textContent = '下载批次包';
+        zipA.href = apiUrl('/api/sign/signed-batch/' + b.batch_id + '/zip');
+        zipA.setAttribute('download', '');
+
+        var box = document.createElement('div');
+        box.style.display = 'none';
+        box.style.width = '100%';
+        box.style.marginTop = '10px';
+        box.style.paddingTop = '10px';
+        box.style.borderTop = '1px solid var(--border)';
+
+        var searchRow = document.createElement('div');
+        searchRow.className = 'btn-row';
+        searchRow.style.margin = '0 0 10px';
+        var bi = document.createElement('input');
+        bi.type = 'search';
+        bi.placeholder = '在该批次内搜索文件名…';
+        bi.style.flex = '1';
+        bi.style.minWidth = '140px';
+        bi.style.padding = '8px 12px';
+        bi.style.border = '1px solid var(--border)';
+        bi.style.borderRadius = '8px';
+        var bs = document.createElement('button');
+        bs.type = 'button';
+        bs.className = 'btn btn-secondary';
+        bs.textContent = '搜索';
+        searchRow.appendChild(bi);
+        searchRow.appendChild(bs);
+
+        var innerList = document.createElement('ul');
+        innerList.className = 'file-list';
+        innerList.style.marginTop = '0';
+
+        function loadBatchItems(q2) {
+          innerList.innerHTML = '';
+          var h = document.createElement('li');
+          h.textContent = '正在加载批次文件…';
+          h.style.border = 'none';
+          h.style.background = 'transparent';
+          innerList.appendChild(h);
+          fetchJson(
+            apiUrl(
+              '/api/sign/signed-batch/' +
+                b.batch_id +
+                '?q=' +
+                encodeURIComponent(q2 || '') +
+                '&_=' +
+                Date.now()
+            )
+          )
+            .then(function (r) {
+              var jj = r.data || {};
+              if (!jj.ok) {
+                innerList.innerHTML = '';
+                var e = document.createElement('li');
+                e.textContent = '加载失败：' + (jj.error || '未知错误');
+                e.style.border = 'none';
+                e.style.background = 'transparent';
+                innerList.appendChild(e);
+                return;
+              }
+              var arr = jj.items || [];
+              innerList.innerHTML = '';
+              if (!arr.length) {
+                var e2 = document.createElement('li');
+                e2.textContent = q2 ? '无匹配文件。' : '该批次暂无文件。';
+                e2.style.border = 'none';
+                e2.style.background = 'transparent';
+                innerList.appendChild(e2);
+                return;
+              }
+              arr.forEach(function (it) {
+                renderSignedItemRow(it, innerList);
+              });
+            })
+            .catch(function (e) {
+              innerList.innerHTML = '';
+              var e3 = document.createElement('li');
+              e3.textContent = '加载失败：' + (e && e.message ? e.message : String(e));
+              e3.style.border = 'none';
+              e3.style.background = 'transparent';
+              innerList.appendChild(e3);
+            });
+        }
+
+        bs.addEventListener('click', function () {
+          loadBatchItems(bi.value ? String(bi.value).trim() : '');
+        });
+        bi.addEventListener('keydown', function (ev) {
+          if (ev && ev.key === 'Enter') {
+            ev.preventDefault();
+            loadBatchItems(bi.value ? String(bi.value).trim() : '');
+          }
+        });
+
+        box.appendChild(searchRow);
+        box.appendChild(innerList);
+
+        var opened = false;
+        toggle.addEventListener('click', function () {
+          opened = !opened;
+          box.style.display = opened ? 'block' : 'none';
+          toggle.textContent = opened ? '收起' : '展开';
+          if (opened) loadBatchItems('');
+        });
+
+        li.appendChild(wrap);
+        li.appendChild(toggle);
+        li.appendChild(zipA);
+        li.appendChild(box);
+        signedListEl.appendChild(li);
+      });
+      return;
+    }
+
+    items.forEach(function (it) {
+      renderSignedItemRow(it, signedListEl);
     });
   }
 
   function refreshSignedList() {
+    if (!IS_FILE_SIGN_PAGE || !signedListEl || !signedHint) return;
     showSignedListLoading();
     var u =
-      apiUrl('/api/sign/signed') +
+      apiUrl('/api/sign/signed-batches') +
       '?q=' +
       encodeURIComponent(signedListQ) +
       '&page=' +
@@ -2951,10 +3777,10 @@
       strokeItemsHint.style.display = 'block';
       strokeItemsHint.textContent =
         '当前未配置 MySQL 时，签字素材仅保存在会话目录，此列表不可用。配置 MYSQL_HOST 并保存笔迹后可在此检索与下载。';
-      strokeItemPager.style.display = 'none';
+      if (strokeItemPager) strokeItemPager.style.display = 'none';
       return;
     }
-    strokeItemPager.style.display = '';
+    if (strokeItemPager) strokeItemPager.style.display = '';
     if (!items.length) {
       strokeItemsHint.style.display = 'block';
       strokeItemsHint.textContent = strokeItemQ
@@ -3055,7 +3881,7 @@
         if (!j.ok) {
           strokeItemListEl.innerHTML = '';
           strokeItemsHint.style.display = 'block';
-          strokeItemPager.style.display = 'none';
+          if (strokeItemPager) strokeItemPager.style.display = 'none';
           strokeItemsHint.textContent =
             '签字素材列表加载失败：' + (j.error || '请稍后重试。');
           return;
@@ -3065,13 +3891,14 @@
       .catch(function (e) {
         strokeItemListEl.innerHTML = '';
         strokeItemsHint.style.display = 'block';
-        strokeItemPager.style.display = 'none';
+        if (strokeItemPager) strokeItemPager.style.display = 'none';
         strokeItemsHint.textContent =
           '签字素材列表加载失败：' + (e && e.message ? e.message : String(e));
       });
   }
 
   function refreshFileList() {
+    if (!IS_FILE_SIGN_PAGE || !fileListEl || !listHint) return;
     showFileListLoading();
     fetchJson(apiUrl('/api/sign/files'))
       .then(function (result) {
@@ -3148,6 +3975,8 @@
           lastDetectFileId = null;
           lastDetectError = (j && j.error) || '识别接口返回失败';
         }
+        // 标记：该文件已执行过识别（不论成功/失败），后续切换不再自动识别
+        cacheMarkDetected(fileId);
         if (j.ok) {
           var roles = mergeDetectedRolesForUi();
           if (roles.length) {
@@ -3173,6 +4002,7 @@
           }
           if (rm && rm.data && rm.data.ok) {
             currentRoleMap = rm.data.map || {};
+            cachePatchCurrentRoleMap(fileId, currentRoleMap);
           }
           return { __abort: false };
         });
@@ -3193,7 +4023,7 @@
           updateSubmitState();
         }
       })
-      .finally(function () {
+      .then(function () {
         if (myEpoch === detectEpoch) {
           detectInFlightFor = null;
         }
@@ -3206,13 +4036,13 @@
   }
 
   function manualRedetectNeedSignRoles() {
-    showErr('');
+    setNeedSignActionFeedback('');
     if (!selectedFileId) {
-      showErr('请先在上方的文件列表中选择一项。');
+      setNeedSignActionFeedback('请先在上方的文件列表中选择一项。');
       return;
     }
     if (String(detectInFlightFor) === String(selectedFileId)) {
-      showErr('正在分析当前文件，请稍候再试。');
+      setNeedSignActionFeedback('正在分析当前文件，请稍候再试。');
       return;
     }
     lastDetectData = null;
@@ -3221,15 +4051,157 @@
     detectAndAutoSelectRoles(selectedFileId);
   }
 
-  redetectRolesBtn.addEventListener('click', function () {
-    manualRedetectNeedSignRoles();
-  });
+  if (redetectRolesBtn) {
+    redetectRolesBtn.addEventListener('click', function () {
+      manualRedetectNeedSignRoles();
+    });
+  }
 
+  function ensureBatchApplyRoleMapBtn() {
+    if (batchApplyRoleMapBtn) return batchApplyRoleMapBtn;
+    if (!IS_FILE_SIGN_PAGE) return null;
+    if (!redetectRolesBtn || !redetectRolesBtn.parentNode) return null;
+    // 插到“重新识别”按钮左侧（同一按钮组）
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn btn-secondary';
+    b.id = 'batchApplyRoleMapBtn';
+    b.textContent = '将本文件映射批量应用到已勾选文件';
+    try {
+      redetectRolesBtn.parentNode.insertBefore(b, redetectRolesBtn);
+    } catch (_) {
+      redetectRolesBtn.parentNode.appendChild(b);
+    }
+    batchApplyRoleMapBtn = b;
+    return b;
+  }
+
+  function _checkedBatchFileIds() {
+    return Array.from(document.querySelectorAll('.batch-pick:checked')).map(function (el) {
+      return el.getAttribute('data-id');
+    }).filter(Boolean);
+  }
+
+  function batchApplyCurrentRoleMapToPickedFiles() {
+    setNeedSignActionFeedback('');
+    if (!selectedFileId) {
+      setNeedSignActionFeedback('请先选择一个文件（作为映射来源）。');
+      return;
+    }
+    var ids = _checkedBatchFileIds();
+    if (!ids.length) {
+      setNeedSignActionFeedback('请先在文件列表勾选要批量应用的文件。');
+      return;
+    }
+    // 不包含自己也没关系；包含则相当于重新保存一次
+    if (!window.confirm('将“当前文件”的角色→素材映射，批量覆盖到已勾选的 ' + ids.length + ' 个文件？')) {
+      return;
+    }
+    var m0 = _deepCloneJsonish(currentRoleMap || {});
+    if (!Object.keys(m0).length) {
+      setNeedSignActionFeedback('当前文件尚未绑定任何映射（表格里未选择签名/日期素材）。');
+      return;
+    }
+    var srcRec = savedFiles.find(function (x) {
+      return x && String(x.id) === String(selectedFileId);
+    });
+    var srcName = (srcRec && (srcRec.name || srcRec.id)) ? String(srcRec.name || srcRec.id) : String(selectedFileId);
+    if (batchApplyRoleMapBtn) {
+      batchApplyRoleMapBtn.disabled = true;
+      batchApplyRoleMapBtn.innerHTML = '<span class="spinner" aria-hidden="true"></span> 应用中…';
+    }
+    // 逐个 PUT（避免后端新增接口；同时可在失败时精确提示文件）
+    var okN = 0;
+    var fail = [];
+    var chain = Promise.resolve();
+    ids.forEach(function (fid) {
+      chain = chain.then(function () {
+        return fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ map: m0 }),
+        }).then(function (r) {
+          var jj = r.data || {};
+          if (jj.ok) {
+            okN += 1;
+            cachePatchCurrentRoleMap(fid, jj.map || m0);
+          } else {
+            fail.push((fid || '') + '：' + (jj.error || '失败'));
+          }
+        }).catch(function (e) {
+          fail.push((fid || '') + '：' + (e && e.message ? e.message : String(e)));
+        });
+      });
+    });
+    chain.then(function () {
+      var okMsg = '已将“' + srcName + '”文件角色配置批量映射到 ' + okN + ' 个文件。';
+      // 只给“映射目标文件”写入提示；其它文件不提示
+      ids.forEach(function (fid2) {
+        if (!fid2) return;
+        // 如果该文件失败了，不写成功提示
+        var isFailed = fail.some(function (x) {
+          return String(x || '').indexOf(String(fid2) + '：') === 0;
+        });
+        if (!isFailed) cacheSetNeedSignNotice(fid2, okMsg, false);
+      });
+      // 若当前选中的不是映射目标（极少：用户切走了），则不显示成功提示
+      if (ids.indexOf(String(selectedFileId)) < 0) {
+        cacheSetNeedSignNotice(selectedFileId, '', false);
+      }
+      if (fail.length) {
+        setNeedSignActionFeedback(
+          '批量映射完成：成功 ' +
+            okN +
+            ' 个；失败 ' +
+            fail.length +
+            ' 个：' +
+            fail.slice(0, 3).join('；') +
+            (fail.length > 3 ? '…' : ''),
+          true
+        );
+      } else {
+        if (ids.indexOf(String(selectedFileId)) >= 0) {
+          setNeedSignActionFeedback(okMsg, false);
+        } else {
+          setNeedSignActionFeedback('');
+        }
+      }
+      // 若当前选中文档也在列表里，刷新表格显示
+      renderNeedSignTable();
+      updateSubmitState();
+    }).then(function () {
+      if (batchApplyRoleMapBtn) {
+        batchApplyRoleMapBtn.disabled = false;
+        batchApplyRoleMapBtn.textContent = '将本文件映射批量应用到已勾选文件';
+      }
+    });
+  }
+
+  if (batchApplyRoleMapBtn) {
+    batchApplyRoleMapBtn.addEventListener('click', function () {
+      batchApplyCurrentRoleMapToPickedFiles();
+    });
+  }
+
+  // 兼容旧版 sign.html：若缺少按钮节点，自动插入并启用
+  ensureBatchApplyRoleMapBtn();
+  if (batchApplyRoleMapBtn && !batchApplyRoleMapBtn.__boundApplyRoleMap) {
+    batchApplyRoleMapBtn.__boundApplyRoleMap = true;
+    batchApplyRoleMapBtn.addEventListener('click', function () {
+      batchApplyCurrentRoleMapToPickedFiles();
+    });
+  }
+
+  /** 「生成已签名文档 / 批量签」错误（#errMsg，在「签名来源」区块下方）；其它操作请用 setNeedSignActionFeedback / setRoleRowFeedback 等 */
   function showErr(s) {
     if (s) {
-      signerErrMsg.style.display = 'none';
-      signerErrMsg.textContent = '';
+      if (signerErrMsg) {
+        signerErrMsg.style.display = 'none';
+        signerErrMsg.textContent = '';
+      }
+      clearNeedSignScopedFeedbacks();
     }
+    if (!errMsg) return;
     errMsg.style.display = s ? 'block' : 'none';
     errMsg.textContent = s || '';
   }
@@ -3258,11 +4230,13 @@
     return true;
   }
 
-  fileInput.addEventListener('change', function () {
-    mergePendingSignFiles(filterSignFiles(Array.from(fileInput.files || [])));
-    fileInput.value = '';
-    updatePendingHint();
-  });
+  if (fileInput) {
+    fileInput.addEventListener('change', function () {
+      mergePendingSignFiles(filterSignFiles(Array.from(fileInput.files || [])));
+      fileInput.value = '';
+      updatePendingHint();
+    });
+  }
 
   if (dirInput) {
     dirInput.addEventListener('change', function () {
@@ -3272,8 +4246,9 @@
     });
   }
 
-  saveBtn.addEventListener('click', function () {
-    showErr('');
+  if (saveBtn) saveBtn.addEventListener('click', function () {
+    clearFileRegionErr();
+    setSaveUploadFeedback('');
     if (!pendingSignFiles.length) return;
     var form = new FormData();
     pendingSignFiles.forEach(function (f) {
@@ -3288,9 +4263,10 @@
         function (result) {
           var j = result.data;
           if (!j.ok) {
-            showErr(j.error || '保存失败');
+            setSaveUploadFeedback(j.error || '保存失败');
             return;
           }
+          setSaveUploadFeedback('');
           savedFiles = j.files || [];
           selectedFileId =
             (j.file && j.file.id) ||
@@ -3305,14 +4281,14 @@
       );
     }, { skipRestoreDisabled: true })
       .catch(function (e) {
-        showErr(e.message || String(e));
+        setSaveUploadFeedback(e.message || String(e));
       })
-      .finally(function () {
+      .then(function () {
         saveBtn.disabled = !pendingSignFiles.length;
       });
   });
 
-  submitBtn.addEventListener('click', function () {
+  if (submitBtn) submitBtn.addEventListener('click', function () {
     showErr('');
     var batchMode = !!(batchModeCb && batchModeCb.checked);
     if (batchMode) {
@@ -3330,12 +4306,16 @@
       showErr('未找到所选文件，请刷新页面后重试');
       return;
     }
-    var roles = selectedRoleIds();
+    var source2 = signSourceValue();
+    var roles = effectiveRolesForSingleSign();
     if (!roles.length) {
-      showErr('请至少勾选一个角色');
+      showErr(
+        source2 === 'library' && !libraryRolesRestrictedToChecks()
+          ? '请在本文件需签角色表中至少绑定一项可生成的签名或日期；或在上方「签字角色（可多选）」卡片勾选要套打的角色，并勾选本处「与上方该卡片勾选一致」高级选项。'
+          : '请至少勾选一个角色'
+      );
       return;
     }
-    var source2 = (signSourceMode.value || 'canvas').trim().toLowerCase();
     if (source2 === 'canvas') {
       resizeCanvasesForRoles(roles);
     }
@@ -3458,9 +4438,40 @@
       });
   });
 
-  buildUI();
-  refreshSigners();
-  refreshFileList();
-  refreshSignedList();
-  updateSubmitState();
+  try {
+    buildUI();
+    // 两页复用：按容器存在决定拉取哪些数据与同步哪些 UI
+    if (IS_FILE_SIGN_PAGE || IS_MATERIALS_PAGE) {
+      // 文件签名页和素材页都需要「签署人/素材」数据（文件页用于 role→素材下拉选择）
+      refreshSigners();
+    }
+    if (IS_FILE_SIGN_PAGE) {
+      refreshFileList();
+      refreshSignedList();
+      syncLibraryRolesModeRow();
+      updateSubmitState();
+    }
+    if (IS_MATERIALS_PAGE) {
+      // 素材页：仅同步本页相关的按钮状态
+      updateSubmitState();
+    }
+    try {
+      window.__SIGN_PAGE_BOOT_OK = true;
+    } catch (_) {}
+  } catch (bootEx) {
+    var _em = bootEx && bootEx.message ? bootEx.message : String(bootEx);
+    window.__SIGN_PAGE_BOOT_FAIL_MSG = '脚本运行异常：' + _em;
+    try {
+      window.__SIGN_PAGE_BOOT_HALTED = true;
+    } catch (_) {}
+    try {
+      var _ban2 = document.getElementById('signBootstrapBanner');
+      if (_ban2) {
+        _ban2.style.display = 'block';
+        _ban2.textContent = window.__SIGN_PAGE_BOOT_FAIL_MSG;
+      }
+      var ph2 = document.getElementById('signerLibHint');
+      if (ph2) ph2.textContent = window.__SIGN_PAGE_BOOT_FAIL_MSG;
+    } catch (_) {}
+  }
 })();

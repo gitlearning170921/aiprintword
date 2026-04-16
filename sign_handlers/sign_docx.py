@@ -25,6 +25,10 @@ from sign_handlers.label_match import (
     paragraph_text_keyword_end_offset,
     xlsx_cell_has_leading_role_keyword,
 )
+from sign_handlers.png_word_compat import (
+    prepare_png_for_word,
+    prepare_signature_date_pair_for_word,
+)
 
 # 可见占位字符（作者：____ 等）
 _PLACEHOLDER_CHARS = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·]+$")
@@ -32,7 +36,8 @@ _PLACEHOLDER_CHARS = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·]+$")
 _DATE_HEADER_CELL = re.compile(r"^\s*(日期|Date)\s*[:：]?\s*", re.IGNORECASE)
 
 _PIC_WIDTH = Cm(2.8)
-_PIC_WIDTH_SMALL = Cm(2.0)
+# 日期与签名使用同一显示宽度，避免缩放后笔画变细、观感不一致
+_PIC_WIDTH_DATE = _PIC_WIDTH
 
 
 def _is_emptyish_text(s: str) -> bool:
@@ -81,7 +86,9 @@ def _clear_runs_after_offset(p: Paragraph, start_char_offset: int) -> None:
     full = _paragraph_full_text(p)
     if start_char_offset <= 0 or start_char_offset >= len(full):
         return
-    if not full[start_char_offset:].strip():
+    # 勿用 strip() 判断「无内容」：关键词后常见仅 Tab/全角空格/制表符前导点线，
+    # strip 后为空会误判并跳过删除，导致后续 add_run 把图片追加到段末（离标签很远、易换行）。
+    if not full[start_char_offset:]:
         return
     acc = 0
     truncate_after = None
@@ -104,51 +111,137 @@ def _clear_runs_after_offset(p: Paragraph, start_char_offset: int) -> None:
             r.text = ""
 
 
+def _truncate_after_offset_and_get_anchor_run_idx(
+    p: Paragraph, start_char_offset: int
+) -> int:
+    """
+    从 start_char_offset 起清空文本，并返回“插入锚点 run”的索引：
+    - 若 offset 落在某个 run 内：该 run 被截断到 offset，返回该 run idx
+    - 若 offset 正好在 run 边界：返回 offset 前的 run idx（最靠近标题的那个）
+    - 若无法定位：返回最后一个 run idx（或 -1 表示无 run）
+    """
+    full = _paragraph_full_text(p)
+    if not p.runs:
+        return -1
+    if start_char_offset <= 0:
+        # 标题在段首：锚点设为第一个 run（图片插在它后）
+        return 0
+    if start_char_offset >= len(full):
+        return len(p.runs) - 1
+
+    def _run_is_placeholder(r) -> bool:
+        rt = r.text or ""
+        # 下划线/边框 run 通常是“__ / 点线”占位；直接当作占位清空
+        if _run_has_underline_or_border(r):
+            return True
+        # 仅包含空白/下划线/横线/点线等字符：当作占位清空
+        try:
+            if _PLACEHOLDER_CHARS.match(rt):
+                return True
+        except Exception:
+            pass
+        # 兜底：全空白也当作占位
+        if not rt or not str(rt).strip():
+            return True
+        return False
+
+    acc = 0
+    last_nonempty_idx = 0
+    for i, r in enumerate(list(p.runs)):
+        rt = r.text or ""
+        ln = len(rt)
+        if rt:
+            last_nonempty_idx = i
+        seg = acc + ln
+        if seg < start_char_offset:
+            acc = seg
+            continue
+        if seg == start_char_offset:
+            # offset 恰好在 run 边界：只清空“占位类”的后续 run
+            for rr in list(p.runs)[i + 1 :]:
+                if _run_is_placeholder(rr):
+                    rr.text = ""
+            return i
+        # acc < offset < seg：截断当前 run 并清空后续
+        cut = start_char_offset - acc
+        r.text = rt[:cut]
+        for rr in list(p.runs)[i + 1 :]:
+            if _run_is_placeholder(rr):
+                rr.text = ""
+        return i
+    # fallback：按原逻辑清空，锚点取最后一个含文本的 run
+    _clear_runs_after_offset(p, start_char_offset)
+    return last_nonempty_idx
+
+
+def _move_run_after_run_idx(p: Paragraph, new_run, anchor_run_idx: int) -> None:
+    """
+    python-docx 只能在段末 add_run；此处把 new_run 的 XML 节点移动到 anchor_run_idx 后面，
+    以保证图片紧接字段标题后（不会跑到点线/空格末尾导致换行）。
+    """
+    try:
+        if anchor_run_idx < 0:
+            return
+        runs = list(p.runs)
+        if not runs:
+            return
+        if anchor_run_idx >= len(runs):
+            anchor_run_idx = len(runs) - 1
+        anchor_r = runs[anchor_run_idx]._r
+        new_r = new_run._r
+        # 先从末尾移除，再插入到 anchor 后
+        p._p.remove(new_r)
+        insert_pos = p._p.index(anchor_r) + 1
+        p._p.insert(insert_pos, new_r)
+    except Exception:
+        # 若低层 XML 操作失败，退化为段末追加（不致使签署失败）
+        return
+
+
 def _insert_pictures_in_paragraph(
     p: Paragraph, sig_png: Optional[bytes], date_png: Optional[bytes]
 ) -> None:
-    """在同一段落中按需插入签名/日期（可只插入其一）。"""
+    """在同一段落中按需插入签名/日期（可只插入其一）。默认追加到段末。"""
     if sig_png:
         p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
     if sig_png and date_png:
         p.add_run(" ")
     if date_png:
-        p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+        p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
+
+
+def _insert_pictures_after_anchor_run_idx(
+    p: Paragraph,
+    anchor_run_idx: int,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> None:
+    """
+    在 anchor_run_idx 之后插入签名/日期图片，并把对应 run 移动到锚点后，
+    以保证紧贴字段标题，不会跑到点线/空格末尾导致换行。
+    """
+    runs_to_place = []
+    if sig_png:
+        rs = p.add_run()
+        rs.add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+        runs_to_place.append(rs)
+    if sig_png and date_png:
+        runs_to_place.append(p.add_run(" "))
+    if date_png:
+        rd = p.add_run()
+        rd.add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
+        runs_to_place.append(rd)
+
+    # 逐个移动：每次都插到“当前锚点后”，并推进锚点以保持顺序
+    cur_anchor = anchor_run_idx
+    for r in runs_to_place:
+        _move_run_after_run_idx(p, r, cur_anchor)
+        cur_anchor += 1
 
 
 def _cell_looks_like_date_header_cell(text: str) -> bool:
     t = (text or "").strip()
     return bool(_DATE_HEADER_CELL.match(t))
-
-
-def _char_is_signature_blank_placeholder(c: str) -> bool:
-    if not c:
-        return False
-    if c in " \t\n\r_\u00a0":
-        return True
-    if c in "-—–\u2014\u2015\u2500\u3000.·…．~～":
-        return True
-    return False
-
-
-def _sig_image_insert_char_offset(full: str, kw_end: int) -> int:
-    """
-    签名图插入点（字符下标）：关键词结束后，若有「姓名等正文 + 尾部下划线空白」则插在空白起点；
-    若关键词后整段为占位则插在关键词后；否则插在段落末尾（姓名后无下划线时）。
-    """
-    if kw_end < 0:
-        return len(full)
-    if kw_end >= len(full):
-        return len(full)
-    tail = full[kw_end:]
-    if _is_emptyish_text(tail):
-        return kw_end
-    j = len(full)
-    while j > kw_end and _char_is_signature_blank_placeholder(full[j - 1]):
-        j -= 1
-    if j < len(full):
-        return j
-    return len(full)
 
 
 def _find_date_label_end_in_paragraph(p: Paragraph) -> int:
@@ -160,12 +253,12 @@ def _find_date_label_end_in_paragraph(p: Paragraph) -> int:
 
 
 def _insert_sig_only_at_char_offset(p: Paragraph, char_offset: int, sig_png: bytes) -> None:
-    # 不能把插入点挪到段落末尾：
-    # Word 模板中常用 tab leader/制表符/空格作为“占位留白”，若插入点被挪到末尾，
-    # 图片会被推到占位末端（看起来离“Author:/Date:”很远）。
-    # 因此保持插入点在“正文末尾/冒号后”，并清除其后的占位字符即可。
-    _clear_runs_after_offset(p, char_offset)
-    p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+    # 紧接「Author:/Approver:」等标题后插入：从插入点起清空其后文本/点线占位，
+    # 再把图片 run 移到标题 run 后（避免落在点线/空格末尾导致换行）。
+    anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, char_offset)
+    rn = p.add_run()
+    rn.add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+    _move_run_after_run_idx(p, rn, anchor_idx)
 
 
 def _insert_date_only_in_date_cell(date_cell, date_png: bytes) -> bool:
@@ -174,17 +267,21 @@ def _insert_date_only_in_date_cell(date_cell, date_png: bytes) -> bool:
         offd = _find_date_label_end_in_paragraph(p)
         if offd < 0:
             continue
-        _clear_runs_after_offset(p, offd)
-        p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+        anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, offd)
+        rn = p.add_run()
+        rn.add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
+        _move_run_after_run_idx(p, rn, anchor_idx)
         return True
     if date_cell.paragraphs:
         p0 = date_cell.paragraphs[0]
         for r in list(p0.runs):
             r.text = ""
-        p0.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+        rn = p0.add_run()
+        rn.add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
         return True
     p = date_cell.add_paragraph()
-    p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
+    rn = p.add_run()
+    rn.add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
     return True
 
 
@@ -195,9 +292,7 @@ def _insert_sig_in_role_cell_for_adjacent_date_column(
         off = _find_keyword_in_paragraph(p, keyword)
         if off < 0:
             continue
-        full = _paragraph_full_text(p)
-        ins = _sig_image_insert_char_offset(full, off)
-        _insert_sig_only_at_char_offset(p, ins, sig_png)
+        _insert_sig_only_at_char_offset(p, off, sig_png)
         return True
     return False
 
@@ -207,6 +302,34 @@ def _insert_sig_only_in_empty_cell(cell, sig_png: bytes) -> None:
     for r in list(p.runs):
         r.text = ""
     p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+
+
+def _insert_sig_and_date_in_empty_cell(cell, sig_png: Optional[bytes], date_png: Optional[bytes]) -> None:
+    """把签名/日期插入到“预留空白格”中（清空原占位）。"""
+    p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+    for r in list(p.runs):
+        r.text = ""
+    if sig_png:
+        p.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+    if sig_png and date_png:
+        p.add_run(" ")
+    if date_png:
+        p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
+
+
+def _next_distinct_cell(cells, idx: int):
+    """返回同一行里 idx 之后第一个“不同的 cell”（按合并单元格去重）。"""
+    try:
+        base = cells[idx]
+        base_tc = getattr(base, "_tc", None)
+        for j in range(idx + 1, len(cells)):
+            c2 = cells[j]
+            if getattr(c2, "_tc", None) is not None and getattr(c2, "_tc", None) == base_tc:
+                continue
+            return c2
+    except Exception:
+        pass
+    return None
 
 
 def _try_table_adjacent_date_column(
@@ -239,18 +362,32 @@ def _try_table_adjacent_date_column(
             placed_any = False
             if sig_png:
                 if date_idx == ci + 1:
+                    # 只有两列且右列就是 Date 标签：签名只能写在左格关键词后
                     if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
                         continue
                 else:
-                    mid = cells[ci + 1]
-                    if not _is_emptyish_text(_cell_text(mid)):
-                        continue
-                    # 优先贴近“角色/姓名”字段标记插入，避免落到 tab leader/占位末端导致距离过远
-                    if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
+                    # 三列（或更多）：字段格后面通常有“预留空白签字格”，优先插到该空白格里
+                    mid = _next_distinct_cell(cells, ci)
+                    if mid is None or mid._tc == date_cell._tc:
+                        # 没有独立签字格：退回写在字段格关键词后
+                        if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
+                            continue
+                    else:
+                        if not _is_emptyish_text(_cell_text(mid)):
+                            continue
                         _insert_sig_only_in_empty_cell(mid, sig_png)
                 placed_any = True
             if date_png:
-                if not _insert_date_only_in_date_cell(date_cell, date_png):
+                # 日期：优先插到 Date 标签格的右侧空白格；否则退回 Date 标签格内
+                date_target = None
+                try:
+                    date_target = _next_distinct_cell(cells, date_idx)
+                except Exception:
+                    date_target = None
+                if date_target is not None and _is_emptyish_text(_cell_text(date_target)):
+                    _insert_sig_and_date_in_empty_cell(date_target, None, date_png)
+                    placed_any = True
+                elif not _insert_date_only_in_date_cell(date_cell, date_png):
                     # 仅有日期时若没能插入（极少），继续找其它匹配
                     if not placed_any:
                         continue
@@ -276,8 +413,8 @@ def _try_paragraph_inline(
     # 同段有「日期」且要先签后日期：用户按角色提供 sig+date，都插在同一角色关联区域
     head = (rest_stripped[:20] if len(rest_stripped) > 20 else rest_stripped) if rest_stripped else ""
     if _is_emptyish_text(rest_stripped) or (head and _PLACEHOLDER_CHARS.match(head)):
-        _clear_runs_after_offset(p, off)
-        _insert_pictures_in_paragraph(p, sig_png, date_png)
+        anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, off)
+        _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, date_png)
         return True
     # 尝试：从第一个 run 开始找关键词后的下划线 run
     acc = 0
@@ -295,16 +432,15 @@ def _try_paragraph_inline(
             break
         acc = seg
     if insert_after_run_idx is not None:
-        # 在指定 run 后插入新 run（通过往段落添加；python-docx 只能 add_run 在末尾）
-        # 故退化为：清除关键词后的占位并末尾追加图（避免破坏顺序时）
-        _clear_runs_after_offset(p, off)
-        _insert_pictures_in_paragraph(p, sig_png, date_png)
+        # 在关键词后（通常为冒号后）清空占位，并把图片 run 移动到标题 run 后
+        anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, off)
+        _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, date_png)
         return True
     # 关键词后已有非占位正文：避免误删，交其它段落/表格再匹配
     if rest_stripped and not _PLACEHOLDER_CHARS.match(rest_stripped):
         return False
-    _clear_runs_after_offset(p, off)
-    _insert_pictures_in_paragraph(p, sig_png, date_png)
+    anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, off)
+    _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, date_png)
     return True
 
 
@@ -322,54 +458,50 @@ def _try_table_role(
         for ci, cell in enumerate(cells):
             if not cell_text_matches_keyword(_cell_text(cell), keyword):
                 continue
-            if ci + 1 >= len(cells):
-                continue
-            sig_cell = cells[ci + 1]
-            if not _is_emptyish_text(_cell_text(sig_cell)):
-                if ci + 2 < len(cells) and _is_emptyish_text(_cell_text(cells[ci + 2])):
-                    sig_cell = cells[ci + 2]
-                else:
-                    continue
-            si = None
-            for j in range(len(cells)):
-                if cells[j]._tc == sig_cell._tc:
-                    si = j
-                    break
+            sig_cell = _next_distinct_cell(cells, ci)
+            # 优先找同一行 Date/日期 标签格，保证日期贴在字段标题后，而非整段点线末端
             date_cell = None
-            if si is not None:
-                if si + 1 < len(cells) and _is_emptyish_text(_cell_text(cells[si + 1])):
-                    date_cell = cells[si + 1]
-                elif si + 2 < len(cells) and _is_emptyish_text(_cell_text(cells[si + 2])):
-                    date_cell = cells[si + 2]
+            for j in range(ci + 1, len(cells)):
+                if _cell_looks_like_date_header_cell(_cell_text(cells[j])):
+                    date_cell = cells[j]
+                    break
             if date_cell is None and ri + 1 < len(rows_list):
+                # 次选：下一行同列/右邻列若出现 Date/日期 标签格
                 nrow = rows_list[ri + 1]
-                nc = nrow.cells
-                if ci + 1 < len(nc) and _is_emptyish_text(_cell_text(nc[ci + 1])):
-                    date_cell = nc[ci + 1]
-                elif ci < len(nc) and _is_emptyish_text(_cell_text(nc[ci])):
-                    date_cell = nc[ci]
+                for cand_col in (ci, ci + 1, ci + 2):
+                    if cand_col < len(nrow.cells) and _cell_looks_like_date_header_cell(_cell_text(nrow.cells[cand_col])):
+                        date_cell = nrow.cells[cand_col]
+                        break
             placed_any = False
             if sig_png:
-                sig_cell.text = ""
-                p0 = sig_cell.paragraphs[0] if sig_cell.paragraphs else sig_cell.add_paragraph()
-                for r in list(p0.runs):
-                    r.text = ""
-                p0.add_run().add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
-                placed_any = True
+                # 优先写在“字段后紧接的预留空白格”（按合并单元格后的 next distinct cell）
+                if sig_cell is not None and _is_emptyish_text(_cell_text(sig_cell)) and (date_cell is None or sig_cell._tc != date_cell._tc):
+                    _insert_sig_and_date_in_empty_cell(sig_cell, sig_png, None)
+                    placed_any = True
+                else:
+                    # 无预留空白格时才写回字段格关键词后（保持正文逻辑不变）
+                    if _insert_sig_in_role_cell_for_adjacent_date_column(cell, keyword, sig_png):
+                        placed_any = True
             if date_png and date_cell is not None:
-                date_cell.text = ""
-                p2 = date_cell.paragraphs[0] if date_cell.paragraphs else date_cell.add_paragraph()
-                for r in list(p2.runs):
-                    r.text = ""
-                p2.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_SMALL)
-                placed_any = True
+                # 日期：优先写到 Date 标签格右侧空白格
+                dt_target = _next_distinct_cell(cells, cells.index(date_cell)) if date_cell in cells else None
+                if dt_target is not None and _is_emptyish_text(_cell_text(dt_target)):
+                    _insert_sig_and_date_in_empty_cell(dt_target, None, date_png)
+                    placed_any = True
+                elif _insert_date_only_in_date_cell(date_cell, date_png):
+                    placed_any = True
             if date_png and date_cell is None and (not sig_png):
-                # 只有日期但没找到日期单元格时，退化为写入 sig_cell（至少能落在该角色附近）
-                sig_cell.text = ""
-                p0 = sig_cell.paragraphs[0] if sig_cell.paragraphs else sig_cell.add_paragraph()
-                for r in list(p0.runs):
-                    r.text = ""
-                _insert_pictures_in_paragraph(p0, None, date_png)
+                # 只有日期但没找到 Date 标签时，退化：尝试该角色格关键词后插入
+                for p0 in cell.paragraphs:
+                    off = _find_keyword_in_paragraph(p0, keyword)
+                    if off >= 0:
+                        _clear_runs_after_offset(p0, off)
+                        _insert_pictures_in_paragraph(p0, None, date_png)
+                        placed_any = True
+                        break
+            # 若标签为 “Reviewer/Date” 这类同格字段且后面有预留空白格：把签名+日期都插到预留格里
+            if (sig_png or date_png) and (date_cell is None) and sig_cell is not None and _is_emptyish_text(_cell_text(sig_cell)):
+                _insert_sig_and_date_in_empty_cell(sig_cell, sig_png, date_png)
                 placed_any = True
             if placed_any:
                 return True
@@ -402,9 +534,26 @@ def sign_docx(
         out_path = f"{base}_signed{ext}"
     doc = Document(path)
 
+    sig_map: dict = {}
+    date_map: dict = {}
+    for rid in ROLE_ID_TO_KEYWORD:
+        sb = role_to_signature_png.get(rid)
+        db = role_to_date_png.get(rid)
+        if sb and db:
+            s2, d2 = prepare_signature_date_pair_for_word(sb, db)
+            if s2:
+                sig_map[rid] = s2
+            if d2:
+                date_map[rid] = d2
+        else:
+            if sb:
+                sig_map[rid] = prepare_png_for_word(sb) or sb
+            if db:
+                date_map[rid] = prepare_png_for_word(db) or db
+
     for role_id in ROLE_ID_TO_KEYWORD:
-        sig = role_to_signature_png.get(role_id)
-        dt = role_to_date_png.get(role_id)
+        sig = sig_map.get(role_id)
+        dt = date_map.get(role_id)
         if not sig and not dt:
             continue
         done = False

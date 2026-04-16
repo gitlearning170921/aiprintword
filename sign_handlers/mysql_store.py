@@ -336,6 +336,7 @@ def _ensure_sign_file_columns(conn) -> None:
                 pass
             # sign_signed_output
             for sql in (
+                "ALTER TABLE sign_signed_output ADD COLUMN batch_id VARCHAR(32) NULL",
                 "ALTER TABLE sign_signed_output ADD COLUMN ftp_path VARCHAR(768) NULL",
                 "ALTER TABLE sign_signed_output ADD COLUMN file_size BIGINT NULL",
                 "ALTER TABLE sign_signed_output ADD COLUMN sha256 CHAR(64) NULL",
@@ -344,6 +345,10 @@ def _ensure_sign_file_columns(conn) -> None:
                     cur.execute(sql)
                 except Exception:
                     pass
+            try:
+                cur.execute("CREATE INDEX idx_signed_batch ON sign_signed_output (batch_id)")
+            except Exception:
+                pass
             try:
                 cur.execute("ALTER TABLE sign_signed_output MODIFY COLUMN file_data LONGBLOB NULL")
             except Exception:
@@ -437,7 +442,15 @@ def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) ->
     ensure_sign_mysql()
     size = int(len(file_data or b""))
     sha = hashlib.sha256(file_data or b"").hexdigest()
-    safe_name = (original_name or "document")[:200]
+    # 记录里保留原始文件名（可含中文）；FTP 路径使用安全文件名避免乱码/不支持字符
+    def _safe_ftp_filename(name: str) -> str:
+        base = os.path.basename(name or "document")
+        base = base.strip() or "document"
+        base = re.sub(r"[^0-9A-Za-z._()\-\s]+", "_", base)
+        base = re.sub(r"\s+", " ", base).strip()
+        return (base or "document")[:200]
+
+    safe_name = _safe_ftp_filename(original_name or "document")
     remote_rel = f"sign/inbox/{file_id}/{safe_name}"
     ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(file_data or b"", remote_rel)
     err_s = (ftp_err or "")[:512] if ftp_err else None
@@ -532,6 +545,7 @@ def _ensure_signed_output_table(conn) -> None:
             """
             CREATE TABLE IF NOT EXISTS sign_signed_output (
                 id VARCHAR(32) NOT NULL PRIMARY KEY,
+                batch_id VARCHAR(32) NULL,
                 source_file_id VARCHAR(32) NULL,
                 source_name VARCHAR(512) NOT NULL,
                 output_name VARCHAR(512) NOT NULL,
@@ -543,7 +557,8 @@ def _ensure_signed_output_table(conn) -> None:
                 file_data LONGBLOB NULL,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 KEY idx_signed_created (created_at),
-                KEY idx_signed_source (source_file_id)
+                KEY idx_signed_source (source_file_id),
+                KEY idx_signed_batch (batch_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
@@ -565,6 +580,7 @@ def _signed_output_row_to_item(r: dict) -> dict:
     fe = (r.get("ftp_last_error") or "").strip()
     return {
         "id": r["id"],
+        "batch_id": r.get("batch_id"),
         "source_file_id": r.get("source_file_id"),
         "source_name": r.get("source_name"),
         "name": r.get("output_name"),
@@ -602,7 +618,7 @@ def list_signed_outputs_page(
                 )
                 total = int((cur.fetchone() or {}).get("c") or 0)
                 cur.execute(
-                    "SELECT id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    "SELECT id, batch_id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
                     " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
                     "FROM sign_signed_output "
                     "WHERE output_name LIKE %s OR source_name LIKE %s "
@@ -613,7 +629,7 @@ def list_signed_outputs_page(
                 cur.execute("SELECT COUNT(*) AS c FROM sign_signed_output")
                 total = int((cur.fetchone() or {}).get("c") or 0)
                 cur.execute(
-                    "SELECT id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    "SELECT id, batch_id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
                     " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
                     "FROM sign_signed_output ORDER BY created_at DESC LIMIT %s OFFSET %s",
                     (page_size, offset),
@@ -630,6 +646,7 @@ def list_signed_outputs() -> List[dict]:
 
 def insert_signed_output(
     signed_id: str,
+    batch_id: Optional[str],
     source_file_id: Optional[str],
     source_name: str,
     output_name: str,
@@ -640,7 +657,15 @@ def insert_signed_output(
     ensure_sign_mysql()
     size = int(len(file_data or b""))
     sha = hashlib.sha256(file_data or b"").hexdigest()
-    safe_name = (output_name or "signed")[:200]
+    # 记录里保留 output_name（可含中文）；FTP 路径使用安全文件名避免乱码/不支持字符
+    def _safe_ftp_filename(name: str) -> str:
+        base = os.path.basename(name or "signed")
+        base = base.strip() or "signed"
+        base = re.sub(r"[^0-9A-Za-z._()\-\s]+", "_", base)
+        base = re.sub(r"\s+", " ", base).strip()
+        return (base or "signed")[:200]
+
+    safe_name = _safe_ftp_filename(output_name or "signed")
     remote_rel = f"sign/output/{signed_id}/{safe_name}"
     ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(file_data or b"", remote_rel)
     err_s = (ftp_err or "")[:512] if ftp_err else None
@@ -650,10 +675,11 @@ def insert_signed_output(
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO sign_signed_output "
-                "(id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, file_size, sha256, file_data, ftp_last_error) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "(id, batch_id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, file_size, sha256, file_data, ftp_last_error) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     signed_id,
+                    batch_id,
                     source_file_id,
                     source_name[:512],
                     output_name[:512],
@@ -666,6 +692,132 @@ def insert_signed_output(
                     None if ftp_path else err_s,
                 ),
             )
+
+
+def list_signed_batches_page(*, q: str = "", page: int = 1, page_size: int = 10):
+    """
+    按 batch_id 聚合的批次列表（分页、搜索）。
+    搜索 q 会匹配 output_name/source_name/batch_id。
+    """
+    ensure_sign_mysql()
+    q = (q or "").strip()
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 200))
+    offset = (page - 1) * page_size
+    with _conn_commit() as conn:
+        _ensure_signed_output_table(conn)
+        with conn.cursor() as cur:
+            where = "WHERE batch_id IS NOT NULL AND batch_id <> ''"
+            args = []
+            if q:
+                like = f"%{q}%"
+                where += " AND (batch_id LIKE %s OR output_name LIKE %s OR source_name LIKE %s)"
+                args.extend([like, like, like])
+            cur.execute(
+                "SELECT COUNT(DISTINCT batch_id) AS c FROM sign_signed_output " + where,
+                tuple(args),
+            )
+            total = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute(
+                "SELECT batch_id, MAX(created_at) AS created_at, COUNT(*) AS n "
+                "FROM sign_signed_output "
+                + where
+                + " GROUP BY batch_id ORDER BY MAX(created_at) DESC LIMIT %s OFFSET %s",
+                tuple(args + [page_size, offset]),
+            )
+            rows = cur.fetchall() or []
+            # legacy：无 batch_id 的历史记录条数
+            if q:
+                like = f"%{q}%"
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM sign_signed_output "
+                    "WHERE (batch_id IS NULL OR batch_id='') AND (output_name LIKE %s OR source_name LIKE %s)",
+                    (like, like),
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM sign_signed_output WHERE (batch_id IS NULL OR batch_id='')"
+                )
+            legacy_total = int((cur.fetchone() or {}).get("c") or 0)
+    out = []
+    for r in rows:
+        ts = r.get("created_at")
+        out.append(
+            {
+                "batch_id": r.get("batch_id"),
+                "created_at": ts.isoformat(sep=" ") if ts is not None else None,
+                "n": int(r.get("n") or 0),
+            }
+        )
+    return out, total, legacy_total
+
+
+def list_signed_outputs_by_batch(*, batch_id: str, q: str = "") -> list[dict]:
+    ensure_sign_mysql()
+    q = (q or "").strip()
+    with _conn_commit() as conn:
+        _ensure_signed_output_table(conn)
+        with conn.cursor() as cur:
+            if q:
+                like = f"%{q}%"
+                cur.execute(
+                    "SELECT id, batch_id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
+                    "FROM sign_signed_output WHERE batch_id=%s AND (output_name LIKE %s OR source_name LIKE %s) "
+                    "ORDER BY created_at DESC",
+                    (batch_id, like, like),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, batch_id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
+                    "FROM sign_signed_output WHERE batch_id=%s ORDER BY created_at DESC",
+                    (batch_id,),
+                )
+            rows = cur.fetchall() or []
+    return [_signed_output_row_to_item(dict(r)) for r in rows]
+
+
+def list_signed_legacy_page(*, q: str = "", page: int = 1, page_size: int = 50):
+    """历史记录（batch_id 为空）：分页、按文件名搜索。"""
+    ensure_sign_mysql()
+    q = (q or "").strip()
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 200))
+    offset = (page - 1) * page_size
+    with _conn_commit() as conn:
+        _ensure_signed_output_table(conn)
+        with conn.cursor() as cur:
+            if q:
+                like = f"%{q}%"
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM sign_signed_output "
+                    "WHERE (batch_id IS NULL OR batch_id='') AND (output_name LIKE %s OR source_name LIKE %s)",
+                    (like, like),
+                )
+                total = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT id, batch_id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
+                    "FROM sign_signed_output "
+                    "WHERE (batch_id IS NULL OR batch_id='') AND (output_name LIKE %s OR source_name LIKE %s) "
+                    "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (like, like, page_size, offset),
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM sign_signed_output WHERE (batch_id IS NULL OR batch_id='')"
+                )
+                total = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute(
+                    "SELECT id, batch_id, source_file_id, source_name, output_name, ext, roles_json, ftp_path, ftp_last_error, "
+                    " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob, created_at "
+                    "FROM sign_signed_output WHERE (batch_id IS NULL OR batch_id='') "
+                    "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (page_size, offset),
+                )
+            rows = cur.fetchall() or []
+    return [_signed_output_row_to_item(dict(r)) for r in rows], total
 
 
 def get_signed_row(signed_id: str) -> Optional[dict]:

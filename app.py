@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import socket
 import re
 import shutil
 import subprocess
@@ -2297,6 +2298,24 @@ def _sign_upload_display_name(client_filename):
     return display, ext
 
 
+def _safe_display_filename_keep_unicode(name: str) -> str:
+    """
+    保留中文等非 ASCII 字符的“安全显示文件名”净化。
+    仅替换 Windows 非法文件名字符，避免 secure_filename 把中文清空。
+    """
+    s = str(name or "").strip()
+    if not s:
+        return "document"
+    # 仅取最后一段，避免路径穿越/目录显示
+    s = os.path.basename(s.replace("\\", "/"))
+    # Windows 非法字符：<>:"/\\|?* 以及控制字符
+    s = re.sub(r"[<>:\"/\\\\|?*]+", "_", s)
+    s = re.sub(r"[\x00-\x1f]+", "_", s)
+    # 尾部点/空格在 Windows 里会被裁剪；这里做个兜底
+    s = s.rstrip(". ")
+    return s or "document"
+
+
 def _sign_find_record(file_id: str):
     fid = str(file_id or "")
     for rec in session.get("sign_files") or []:
@@ -2389,17 +2408,22 @@ def _sign_process_document_bytes(
     sig_map: dict,
     date_map: dict,
     source_file_id: Optional[str],
+    batch_id: Optional[str] = None,
 ) -> dict:
     """生成已签名文档字节；MySQL 模式下同时写入 sign_signed_output。返回 dict 含 ok / error / out_bytes 等。"""
     tmp_dir = tempfile.mkdtemp(prefix="aiprintword_sign_")
     try:
-        in_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex[:8]}_{base_name}")
+        # 临时文件名需兼容 Windows/文件系统；显示名称/记录名称保留原始（可含中文）
+        safe_in_name = secure_filename(os.path.basename(base_name or "")) or ("document" + ext)
+        if not safe_in_name.lower().endswith(ext):
+            safe_in_name = os.path.splitext(safe_in_name)[0] + ext
+        in_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex[:8]}_{safe_in_name}")
         with open(in_path, "wb") as fp:
             fp.write(file_bytes)
         from sign_handlers import sign_document
 
         out_path = sign_document(in_path, sig_map, date_map)
-        dl_name = os.path.splitext(base_name)[0] + "_signed" + ext
+        dl_name = os.path.splitext(os.path.basename(base_name or "document"))[0] + "_signed" + ext
         with open(out_path, "rb") as fp:
             out_bytes = fp.read()
         try:
@@ -2420,6 +2444,7 @@ def _sign_process_document_bytes(
             )
             mysql_store.insert_signed_output(
                 signed_row_id,
+                batch_id,
                 src_id,
                 base_name,
                 dl_name,
@@ -2444,8 +2469,14 @@ def _sign_process_document_bytes(
 
 @app.route("/sign")
 def sign_page():
-    """Serve online signature page."""
-    return send_from_directory(os.path.join(ROOT, "static"), "sign.html")
+    """Serve online signature page (default: file signing)."""
+    return send_from_directory(os.path.join(ROOT, "static"), "sign_file.html")
+
+
+@app.route("/sign/materials")
+def sign_materials_page():
+    """Serve online signature materials page (stroke library input)."""
+    return send_from_directory(os.path.join(ROOT, "static"), "sign_materials.html")
 
 
 @app.route("/api/sign/files", methods=["GET"])
@@ -2685,7 +2716,7 @@ def api_sign():
                 ext = (row.get("ext") or ".docx").lower()
                 if ext not in SIGN_ALLOWED_EXT:
                     return jsonify({"ok": False, "error": "????????"}), 400
-                base_name = secure_filename(row.get("name") or "document") or "document"
+                base_name = _safe_display_filename_keep_unicode(row.get("name") or "document") or "document"
                 if not base_name.lower().endswith(ext):
                     base_name = os.path.splitext(base_name)[0] + ext
                 mysql_blob = row["file_data"]
@@ -2703,7 +2734,7 @@ def api_sign():
             source_path = _sign_saved_disk_path(sid, file_id, ext)
             if not os.path.isfile(source_path):
                 return jsonify({"ok": False, "error": "????????????"}), 404
-            base_name = secure_filename(rec.get("name") or "document") or "document"
+            base_name = _safe_display_filename_keep_unicode(rec.get("name") or "document") or "document"
             if not base_name.lower().endswith(ext):
                 base_name = os.path.splitext(base_name)[0] + ext
             mysql_blob = None
@@ -2918,7 +2949,7 @@ def api_sign():
             return jsonify({"ok": False, "error": f"MySQL 检查失败: {e}"}), 500
 
     if not base_name and upload and upload.filename:
-        base_name = secure_filename(os.path.basename(upload.filename)) or "document"
+        base_name = _safe_display_filename_keep_unicode(os.path.basename(upload.filename)) or "document"
         if not base_name.lower().endswith(ext):
             base_name = os.path.splitext(base_name)[0] + ext
 
@@ -2932,7 +2963,7 @@ def api_sign():
         upload.stream.seek(0)
         file_bytes = upload.read()
         if not base_name:
-            base_name = secure_filename(os.path.basename(upload.filename)) or "document"
+            base_name = _safe_display_filename_keep_unicode(os.path.basename(upload.filename)) or "document"
             if not base_name.lower().endswith(ext):
                 base_name = base_name + ext
 
@@ -2944,6 +2975,7 @@ def api_sign():
         sig_map,
         date_map,
         file_id or None,
+        batch_id=uuid.uuid4().hex,
     )
     if not res.get("ok"):
         return jsonify({"ok": False, "error": res.get("error", "失败")}), 500
@@ -3506,6 +3538,7 @@ def api_sign_batch():
                     return jsonify({"ok": False, "error": f"角色 {rr} 缺少画布签名或日期"}), 400
 
     results = []
+    batch_id = uuid.uuid4().hex
     for fid in file_ids:
         try:
             row = mysql_store.get_file_row(fid)
@@ -3520,7 +3553,7 @@ def api_sign_batch():
             if ext not in SIGN_ALLOWED_EXT:
                 results.append({"file_id": fid, "ok": False, "error": "不支持的扩展名"})
                 continue
-            base_name = secure_filename(row.get("name") or "document") or "document"
+            base_name = _safe_display_filename_keep_unicode(row.get("name") or "document") or "document"
             if not base_name.lower().endswith(ext):
                 base_name = os.path.splitext(base_name)[0] + ext
             mapping = mysql_store.get_file_role_signer_map(fid) or {}
@@ -3668,7 +3701,14 @@ def api_sign_batch():
                 )
                 continue
             res = _sign_process_document_bytes(
-                row["file_data"], ext, base_name, roles, sig_map, date_map, fid
+                row["file_data"],
+                ext,
+                base_name,
+                roles,
+                sig_map,
+                date_map,
+                fid,
+                batch_id=batch_id,
             )
             if not res.get("ok"):
                 results.append(
@@ -3801,6 +3841,198 @@ def api_sign_signed_delete(signed_id):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/sign/signed-batches", methods=["GET"])
+def api_sign_signed_batches():
+    """按批次列出已签名输出（分页、按批次/文件名搜索）。"""
+    if not _sign_using_mysql():
+        return jsonify(
+            {
+                "ok": True,
+                "batches": [],
+                "total": 0,
+                "page": 1,
+                "page_size": 10,
+                "db_share": False,
+            }
+        )
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        q = (request.args.get("q") or "").strip()
+        page = max(1, int(request.args.get("page") or 1))
+        page_size = max(1, min(100, int(request.args.get("page_size") or 10)))
+        batches, total, legacy_total = mysql_store.list_signed_batches_page(
+            q=q, page=page, page_size=page_size
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "batches": batches,
+                "legacy_total": legacy_total,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "db_share": True,
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/signed-batch/<batch_id>", methods=["GET"])
+def api_sign_signed_batch_items(batch_id):
+    """列出某批次内的已签名文件（支持按文件名搜索）。"""
+    if not _sign_using_mysql():
+        return jsonify({"ok": False, "error": "未启用 MySQL"}), 404
+    if not _SIGN_FILE_ID_RE.match(batch_id or ""):
+        return jsonify({"ok": False, "error": "无效批次 id"}), 400
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        q = (request.args.get("q") or "").strip()
+        items = mysql_store.list_signed_outputs_by_batch(batch_id=batch_id, q=q)
+        return jsonify({"ok": True, "items": items})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/signed-batch/<batch_id>/zip", methods=["GET"])
+def api_sign_signed_batch_zip(batch_id):
+    """下载某批次的 zip 包。"""
+    if not _sign_using_mysql():
+        return jsonify({"ok": False, "error": "未启用 MySQL"}), 404
+    if not _SIGN_FILE_ID_RE.match(batch_id or ""):
+        return jsonify({"ok": False, "error": "无效批次 id"}), 400
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        items = mysql_store.list_signed_outputs_by_batch(batch_id=batch_id, q="")
+        if not items:
+            return jsonify({"ok": False, "error": "该批次无文件"}), 404
+        # 写入临时 zip，避免内存过大
+        import tempfile
+
+        fd, zp = tempfile.mkstemp(prefix=f"sign_batch_{batch_id}_", suffix=".zip")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as zf:
+                seen = set()
+                for it in items:
+                    sid = it.get("id")
+                    if not sid:
+                        continue
+                    row = mysql_store.get_signed_row(str(sid))
+                    if not row or not row.get("file_data"):
+                        continue
+                    nm = (it.get("name") or row.get("name") or (sid + (it.get("ext") or ""))) or "signed"
+                    nm = os.path.basename(nm)
+                    base = nm
+                    k = 2
+                    while nm in seen:
+                        root, ext = os.path.splitext(base)
+                        nm = f"{root}({k}){ext}"
+                        k += 1
+                    seen.add(nm)
+                    zf.writestr(nm, row["file_data"])
+            dl = f"signed_batch_{batch_id[:8]}.zip"
+            return send_file(zp, as_attachment=True, download_name=dl, mimetype="application/zip")
+        finally:
+            try:
+                os.remove(zp)
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/signed-legacy", methods=["GET"])
+def api_sign_signed_legacy():
+    """历史已签名记录（无 batch_id）：分页、搜索。"""
+    if not _sign_using_mysql():
+        return jsonify(
+            {
+                "ok": True,
+                "items": [],
+                "total": 0,
+                "page": 1,
+                "page_size": 50,
+                "db_share": False,
+            }
+        )
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        q = (request.args.get("q") or "").strip()
+        page = max(1, int(request.args.get("page") or 1))
+        page_size = max(1, min(200, int(request.args.get("page_size") or 50)))
+        items, total = mysql_store.list_signed_legacy_page(q=q, page=page, page_size=page_size)
+        return jsonify(
+            {
+                "ok": True,
+                "items": items,
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "db_share": True,
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/signed-legacy/zip", methods=["GET"])
+def api_sign_signed_legacy_zip():
+    """下载历史（无 batch_id）记录 zip 包（按搜索过滤）。"""
+    if not _sign_using_mysql():
+        return jsonify({"ok": False, "error": "未启用 MySQL"}), 404
+    try:
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        q = (request.args.get("q") or "").strip()
+        # 限制最多打包 300 个，避免 zip 过大
+        items, total = mysql_store.list_signed_legacy_page(q=q, page=1, page_size=300)
+        if not items:
+            return jsonify({"ok": False, "error": "无匹配历史文件"}), 404
+        import tempfile
+
+        fd, zp = tempfile.mkstemp(prefix="sign_legacy_", suffix=".zip")
+        os.close(fd)
+        try:
+            with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as zf:
+                seen = set()
+                for it in items:
+                    sid = it.get("id")
+                    if not sid:
+                        continue
+                    row = mysql_store.get_signed_row(str(sid))
+                    if not row or not row.get("file_data"):
+                        continue
+                    nm = (it.get("name") or row.get("name") or (sid + (it.get("ext") or ""))) or "signed"
+                    nm = os.path.basename(nm)
+                    base = nm
+                    k = 2
+                    while nm in seen:
+                        root, ext = os.path.splitext(base)
+                        nm = f"{root}({k}){ext}"
+                        k += 1
+                    seen.add(nm)
+                    zf.writestr(nm, row["file_data"])
+            dl = "signed_legacy.zip"
+            return send_file(zp, as_attachment=True, download_name=dl, mimetype="application/zip")
+        finally:
+            try:
+                os.remove(zp)
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/sign/stroke-items", methods=["GET"])
 def api_sign_stroke_items_list():
     """已入库签字 PNG 素材列表（分页、按签署人搜索）。"""
@@ -3875,4 +4107,25 @@ if __name__ == "__main__":
     print(
         "[aiprintword] 若 token_loaded=False 或浏览器仍见极短 503：关闭其它占用 5050 的窗口后只保留本进程，并确认 .env 在同目录"
     )
+    # 启动自检：端口被占用时，直接提示并退出，避免“看似启动成功但页面打不开/超时”
+    _port = 5050
+    try:
+        _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _sock.bind(("127.0.0.1", _port))
+        _sock.close()
+    except OSError:
+        print("")
+        print("[aiprintword] 启动自检失败：端口 %s 已被占用。" % _port)
+        print("[aiprintword] 已有其它 app.py 在跑，先关掉它，再重新启动本服务。")
+        if os.name == "nt":
+            print("[aiprintword] Windows 排查/关闭示例：")
+            print("  netstat -ano | findstr \":%s\"" % _port)
+            print("  tasklist /FI \"PID eq <PID>\" /FO LIST")
+            print("  taskkill /PID <PID> /F")
+        else:
+            print("[aiprintword] Linux/macOS 排查/关闭示例：")
+            print("  lsof -nP -iTCP:%s -sTCP:LISTEN" % _port)
+            print("  kill -9 <PID>")
+        raise SystemExit(2)
     app.run(host="0.0.0.0", port=5050, debug=False)

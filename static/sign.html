@@ -136,6 +136,7 @@
     }
     .btn-inline-feedback.is-error { color: var(--error); }
     .btn-inline-feedback.is-ok { color: var(--text-muted); }
+    /* 生成/批量：错误与结果在「签名来源」区块下方同一卡片内（见 #errMsg / #batchResultMsg） */
     .spinner {
       width: 18px;
       height: 18px;
@@ -180,6 +181,7 @@
       <a href="/">返回批量打印</a>
     </div>
     <h1>在线签名</h1>
+    <div id="signBootstrapBanner" role="alert" style="display:none;margin:0 0 14px;padding:12px 14px;border-radius:8px;background:#ffebee;border:1px solid #e57373;color:#b71c1c;font-size:0.92rem;line-height:1.45;"></div>
     <p class="subtitle">分两块使用：先维护每位签署人的<strong>手写签名图、手写日期图</strong>（保存为 PNG 素材，可成套或分条），再在「文件签名」中上传文档、按角色套用并生成已签文件。</p>
     <div id="fileProtoWarn" class="card" style="display:none;background:#fff8e1;border-color:#ffc107;">
       <strong>请勿用本地文件打开本页。</strong> 请在本机运行 <code>python app.py</code> 后，用浏览器打开 <strong>http://127.0.0.1:5050/sign</strong>（或本机局域网 IP 同端口），否则「保存到列表」会失败。
@@ -201,11 +203,11 @@
           <button type="button" class="btn btn-secondary" id="signerNextBtn" style="padding:6px 12px;">下一页</button>
         </div>
         <label for="newSignerName" style="margin-top:8px;">添加签署人（多人请用逗号、分号或换行分隔）</label>
-        <div class="btn-row" style="margin-top:6px;">
+        <div class="btn-row" style="margin-top:6px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
           <input type="text" id="newSignerName" placeholder="例如：张三, 李四, 王五" maxlength="2000" style="flex:1;min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
           <button type="button" class="btn btn-secondary" id="addSignerBtn">添加</button>
+          <p class="btn-inline-feedback" id="signerErrMsg" style="display:none;margin:0;flex:1;min-width:160px;max-width:100%;min-height:1.2em;" role="alert" aria-live="assertive"></p>
         </div>
-        <p class="hint" id="signerErrMsg" style="display:none;margin-top:8px;min-height:1.2em;"></p>
         <ul class="file-list" id="signerListEl" style="margin-top:12px;"></ul>
       </div>
 
@@ -243,11 +245,11 @@
             <button type="button" class="btn btn-secondary" id="libClearDateBtn">清除日期</button>
           </div>
         </div>
-        <div class="btn-row" style="margin-top:12px;">
+        <div class="btn-row" style="margin-top:12px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
           <button type="button" class="btn btn-secondary" id="libLoadStrokesBtn">从服务器载入该人笔迹</button>
           <button type="button" class="btn btn-primary" id="libSaveStrokesBtn" style="padding:10px 18px;">保存笔迹到该签署人</button>
+          <p id="libStrokeFeedback" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="status" aria-live="polite"></p>
         </div>
-        <p id="libStrokeFeedback" class="btn-inline-feedback" style="display:none;" role="status" aria-live="polite"></p>
       </div>
 
       <div class="card" id="pieceDateCard" style="display:none;">
@@ -267,31 +269,31 @@
             <div style="font-size:0.88rem;font-weight:600;margin-bottom:6px;">月份简称（1–12）</div>
             <div id="pieceMonthChecks" style="display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;"></div>
           </div>
-          <div class="btn-row" style="margin-top:10px;flex-wrap:wrap;">
+          <div class="btn-row" style="margin-top:10px;flex-wrap:wrap;align-items:flex-start;gap:8px;">
             <button type="button" class="btn btn-secondary" id="pieceBatchStartBtn">开始按序录入</button>
             <button type="button" class="btn btn-secondary" id="pieceBatchNextBtn" disabled>本项完成，下一项</button>
             <button type="button" class="btn btn-primary" id="pieceBatchUploadBtn" disabled>上传队列中全部</button>
             <button type="button" class="btn btn-secondary" id="pieceBatchCancelBtn">取消批量</button>
+            <p id="pieceBatchStatus" class="btn-inline-feedback is-ok" style="margin:0;flex:1;min-width:200px;max-width:100%;" role="status" aria-live="polite"></p>
           </div>
-          <p id="pieceBatchStatus" class="btn-inline-feedback is-ok" style="margin-top:8px;" role="status" aria-live="polite"></p>
         </div>
         <div class="canvas-wrap" style="margin-top:12px;">
           <label>手写区</label>
           <canvas class="sign-pad" id="piece_canvas" width="400" height="120"></canvas>
-          <div class="btn-row">
+          <div class="btn-row" style="align-items:flex-start;flex-wrap:wrap;gap:8px;">
             <button type="button" class="btn btn-secondary" id="pieceClearBtn">清除</button>
+            <p id="pieceHint" class="btn-inline-feedback is-ok" style="margin:0;flex:1;min-width:200px;max-width:100%;" role="status" aria-live="polite"></p>
           </div>
         </div>
-        <p id="pieceHint" class="btn-inline-feedback is-ok" style="margin-top:8px;" role="status" aria-live="polite"></p>
       </div>
 
       <div class="card" id="strokeItemsCard">
         <h2>已存储的签字图片</h2>
         <p class="hint" id="strokeItemsHint">加载中…</p>
-        <div class="btn-row" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
+        <div class="btn-row" style="margin-top:6px;align-items:flex-start;gap:8px;flex-wrap:wrap;">
           <button type="button" class="btn btn-secondary" id="btnRefreshStrokeItems" style="padding:6px 12px;">刷新列表</button>
+          <p id="strokeItemsActionMsg" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
         </div>
-        <p id="strokeItemsActionMsg" class="btn-inline-feedback" style="display:none;" role="alert" aria-live="assertive"></p>
         <label for="strokeItemCatSelect" style="margin-top:8px;">类别筛选</label>
         <div class="btn-row" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
           <select id="strokeItemCatSelect" style="min-width:220px;max-width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
@@ -328,18 +330,19 @@
         <label for="dirInput" class="btn btn-secondary" style="cursor:pointer;margin:0;">选择文件夹（含子文件夹）</label>
       </div>
       <p class="hint" id="fileHint">可多选 .docx / .xlsx，或使用「选择文件夹」上传整目录</p>
-      <div class="btn-row" style="margin-top:12px;">
+      <div class="btn-row" style="margin-top:12px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
         <button type="button" class="btn btn-secondary" id="saveBtn" disabled>保存到列表</button>
+        <p id="saveUploadFeedback" class="btn-inline-feedback is-error" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
       </div>
     </div>
 
     <div class="card">
       <h2>2. 选择要签名的文件</h2>
       <p class="hint" id="listHint">正在加载文件列表…</p>
-      <div class="btn-row" style="margin:6px 0 10px;align-items:center;gap:8px;flex-wrap:wrap;">
+      <div class="btn-row" style="margin:6px 0 10px;align-items:flex-start;gap:8px;flex-wrap:wrap;">
         <button type="button" class="btn btn-secondary" id="btnRefreshFiles" style="padding:6px 12px;">刷新列表</button>
+        <p id="fileListActionMsg" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
       </div>
-      <p id="fileListActionMsg" class="btn-inline-feedback" style="display:none;margin-bottom:8px;" role="alert" aria-live="assertive"></p>
       <div class="btn-row" style="margin-bottom:10px;">
         <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
           <input type="checkbox" id="batchSelectAll"> 全选（用于下方「一键批量签」）
@@ -349,9 +352,13 @@
     </div>
 
     <div class="card" id="needSignCard">
-      <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;">
-        <h2 style="margin:0;font-size:1rem;font-weight:600;">本文件需签角色（检测结果）</h2>
-        <button type="button" class="btn btn-secondary" id="redetectRolesBtn">重新识别需签字角色</button>
+      <div class="btn-row" style="margin-bottom:8px;align-items:flex-start;flex-wrap:wrap;justify-content:space-between;gap:12px;">
+        <h2 style="margin:0;font-size:1rem;font-weight:600;flex:1;min-width:200px;">本文件需签角色（检测结果）</h2>
+        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;max-width:100%;">
+          <button type="button" class="btn btn-secondary" id="batchApplyRoleMapBtn">将本文件映射批量应用到已勾选文件</button>
+          <button type="button" class="btn btn-secondary" id="redetectRolesBtn">重新识别需签字角色</button>
+          <p id="needSignActionMsg" class="btn-inline-feedback is-error" style="display:none;margin:0;max-width:min(480px,92vw);" role="alert" aria-live="assertive"></p>
+        </div>
       </div>
       <p class="hint">根据模板中的编制/审核/批准等关键词自动识别；为每个角色绑定签名/日期素材后可「载入签名」「载入日期」到下方画布。表格较宽时可左右滑动查看。</p>
       <div id="needSignTable"></div>
@@ -365,14 +372,13 @@
     </div>
 
     <div class="card">
-      <div class="btn-row" style="align-items:center;">
+      <div class="btn-row" style="align-items:center;margin-bottom:0;flex-wrap:wrap;gap:10px;">
         <button type="button" class="btn btn-primary" id="submitBtn" disabled>生成已签名文档</button>
         <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
           <input type="checkbox" id="batchModeCb" style="width:18px;height:18px;accent-color:var(--accent);">
           批量签字（已勾选文件）
         </label>
       </div>
-      <p class="err btn-inline-feedback is-error" id="errMsg" style="display:none;margin-top:8px;" role="alert" aria-live="assertive"></p>
       <div class="btn-row" style="align-items:center;margin-top:8px;">
         <label for="signSourceMode" style="margin:0;font-size:0.9rem;min-width:5.5em;">签名来源</label>
         <select id="signSourceMode" style="flex:1;min-width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
@@ -380,15 +386,23 @@
           <option value="library">库映射（按“角色→素材”直接取库中签名/日期）</option>
         </select>
       </div>
-      <p class="hint" id="batchResultMsg" style="display:none;margin-top:10px;"></p>
+      <div id="libraryRolesModeRow" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+        <label style="display:inline-flex;align-items:flex-start;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
+          <input type="checkbox" id="libraryRolesUseChecksCb" style="width:18px;height:18px;margin-top:2px;accent-color:var(--accent);flex-shrink:0;">
+          <span>与上方「签字角色（可多选）」卡片勾选一致（高级）</span>
+        </label>
+        <p class="hint" style="margin:8px 0 0;font-size:0.85rem;">默认关闭：按「本文件需签角色」表中已绑定内容自动决定要套打的角色。勾选后改为仅提交上方「签字角色（可多选）」卡片中已勾选的角色（与旧版一致；未绑定的角色将由后端跳过）。批量 + 库映射 + 默认关闭时<strong>不传 roles</strong>，由服务端按各文件映射表处理。</p>
+      </div>
+      <p class="err btn-inline-feedback is-error" id="errMsg" style="display:none;margin-top:10px;" role="alert" aria-live="assertive"></p>
+      <p class="hint btn-inline-feedback" id="batchResultMsg" style="display:none;margin-top:6px;font-size:0.88rem;color:var(--text-muted);" role="status" aria-live="polite"></p>
     </div>
 
     <div class="card" id="signedSection">
       <h2>已签名文档（数据库共享）</h2>
       <p class="hint" id="signedHint">正在加载已签名列表…</p>
-      <p id="signedListActionMsg" class="btn-inline-feedback" style="display:none;margin-top:8px;" role="alert" aria-live="assertive"></p>
-      <div class="btn-row" style="margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
+      <div class="btn-row" style="margin-top:6px;align-items:flex-start;gap:8px;flex-wrap:wrap;">
         <button type="button" class="btn btn-secondary" id="btnRefreshSigned" style="padding:6px 12px;">刷新列表</button>
+        <p id="signedListActionMsg" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
       </div>
       <div id="signedSearchRow" style="display:none;">
         <label for="signedSearchInput">按文件名搜索（输出文件名或源文件名）</label>
@@ -413,19 +427,37 @@
         var warn = document.getElementById('fileProtoWarn');
         if (warn) warn.style.display = 'block';
       }
-      var p = (window.__APP_ROOT__ || '').replace(/\/+$/, '');
-      var s = document.createElement('script');
-      s.defer = true;
-      s.src = p + '/js/sign-page.js';
-      s.onerror = function () {
+      function showScriptLoadFail(msg) {
+        var b = document.getElementById('signBootstrapBanner');
+        if (b) {
+          b.style.display = 'block';
+          b.textContent = msg;
+        }
         var e = document.getElementById('errMsg');
         if (e) {
           e.style.display = 'block';
-          e.textContent =
-            '无法加载 js/sign-page.js。请用 http://127.0.0.1:5050/sign 打开，并确认已保存 static/js/sign-page.js 后重启 python app.py。';
+          e.textContent = msg;
         }
+      }
+      var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
+      var s = document.createElement('script');
+      s.defer = true;
+      s.src = (p || '') + '/js/sign-page.js';
+      s.onerror = function () {
+        showScriptLoadFail(
+          '无法加载「' +
+            s.src +
+            '」。请 Ctrl+F5 强刷；确认 static/js/sign-page.js 存在且已重启 python app.py；若站点有子路径请在页面注入 window.__APP_ROOT__。'
+        );
       };
       document.body.appendChild(s);
+      setTimeout(function () {
+        if (window.__SIGN_PAGE_BOOT_OK || window.__SIGN_PAGE_BOOT_HALTED) return;
+        showScriptLoadFail(
+          window.__SIGN_PAGE_BOOT_FAIL_MSG ||
+            '签名脚本在数秒内未完成启动（可能未加载、校验失败或运行时报错）。请按 F12 打开「控制台」查看红色报错，Ctrl+F5 强刷本页。'
+        );
+      }, 4500);
     })();
   </script>
 </body>

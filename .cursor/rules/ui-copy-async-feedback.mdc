@@ -1,10 +1,16 @@
 ---
-description: 界面文案要说清业务含义；触发网络请求的按钮须有进行中反馈
-globs: static/js/sign-page.js
+description: 界面文案要说清业务含义；触发网络请求的按钮须有进行中反馈；提示紧贴触发操作避免重复
+globs: static/js/sign-page.js, static/sign.html
 alwaysApply: false
 ---
 
 # 在线签名页：文案与异步反馈
+
+## 提示位置（防重复）
+
+- **与「生成已签名文档 / 批量签」相关的错误与结果**（`errMsg`、`batchResultMsg`）放在 **`sign.html` 文件签名卡片内、「签名来源」及 `#libraryRolesModeRow` 之后**；**禁止**再为同一职责增加第二处 `#errMsg` / `#batchResultMsg`。其它操作仍用各自 **`btn-inline-feedback`** 紧挨对应按钮。
+- 其它卡片（签署人列表、文件列表、已签名列表等）的反馈仍用各自卡片内 **`btn-inline-feedback`**：与对应按钮**同一 `btn-row` 或换行后紧挨其下**均可，以易读、不与其它提示串位为准；**不要**把同一错误再写到页面顶栏或其它区块，除非属于不同业务阶段（例如仅脚本未加载时的 `signBootstrapBanner` 全页级告警）。
+- 新增提示 DOM 或 `showErr`/`showBatchResult` 的替代容器时，先检查是否已有同文案渠道，避免双写。
 
 ## 文案
 
@@ -18,7 +24,7 @@ alwaysApply: false
 - 若按钮的 `disabled` 在结束后须由业务重算（例如批量按钮依赖勾选数量），不要用统一的「恢复点击前 disabled」，应在 `finally` 里调用现有的状态函数（如 `updateBatchUi()`）。
 - 图片载入画布等异步也应尽量让触发按钮有进行中态，或保证 `Promise` 链在结束时结束忙碌态。
 
-本仓库实现参考：`sign-page.js` 中的 `withButtonBusy`。
+本仓库实现参考：`sign-page.js` 中的 `withButtonBusy`；布局参考 `sign.html` 中文件签名卡片内 `#errMsg` / `#batchResultMsg` 与各 `btn-inline-feedback` 的位置。
 
 ## 配置项（避免环境变量重复问题）
 

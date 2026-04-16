@@ -95,8 +95,12 @@ def paragraph_text_keyword_end_offset(full_text: str, keyword: str) -> int:
     if not full_text or not keyword:
         return -1
     esc = re.escape(keyword)
-    if all(ord(c) < 128 for c in keyword):
+    # 英文关键词里若包含 ':' '/' 等非“单词字符”，使用 \b...\b 词边界会匹配失败。
+    # 仅当关键词本身是纯 [A-Za-z0-9_] 时才使用词边界，避免 Author 匹配到 Authors。
+    ascii_only = all(ord(c) < 128 for c in keyword)
+    use_word_boundary = ascii_only and bool(re.match(r"^[A-Za-z0-9_]+$", str(keyword or '')))
+    if ascii_only and use_word_boundary:
         m = re.search(r"(?i)\b" + esc + r"\b\s*[:：]?", full_text)
     else:
-        m = re.search(re.escape(keyword) + r"\s*[:：]?", full_text)
+        m = re.search(r"(?i)" + esc + r"\s*[:：]?", full_text)
     return m.end() if m else -1

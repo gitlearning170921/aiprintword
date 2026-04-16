@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>在线签名 - 文件签名</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f5f5f5;
+      --surface: #ffffff;
+      --surface2: #fafafa;
+      --border: #e0e0e0;
+      --text: #000000;
+      --text-muted: #666666;
+      --accent: #1a73e8;
+      --accent-hover: #1557b0;
+      --error: #c62828;
+      --radius: 6px;
+      --shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Noto Sans SC', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    .container { max-width: 880px; margin: 0 auto; }
+    h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 8px; }
+    .subtitle { color: var(--text-muted); font-size: 0.95rem; margin-bottom: 16px; }
+    .nav-top { margin-bottom: 24px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .nav-top a { color: var(--accent); text-decoration: none; font-size: 0.95rem; }
+    .nav-top a:hover { text-decoration: underline; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 20px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 { font-size: 1rem; font-weight: 600; margin: 0 0 16px; }
+    label { display: block; font-size: 0.9rem; margin-bottom: 6px; }
+    input[type="file"] {
+      width: 100%;
+      padding: 12px;
+      background: var(--surface2);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      font-size: 0.9rem;
+    }
+    /* 与 sign-page.js 联动：勾选角色后才显示对应画布面板（原 sign.html 样式） */
+    .role-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+    .role-row input { width: 18px; height: 18px; accent-color: var(--accent); }
+    .role-panel {
+      display: none;
+      margin-top: 12px;
+      padding: 16px;
+      background: var(--surface2);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      max-width: 100%;
+      box-sizing: border-box;
+    }
+    .role-panel.visible { display: block; }
+    #needSignTable { overflow-x: auto; max-width: 100%; margin-top: 8px; -webkit-overflow-scrolling: touch; }
+    #rolePanels { max-width: 100%; overflow-x: auto; }
+    .canvas-wrap { margin-bottom: 14px; max-width: 100%; }
+    .canvas-wrap label { font-weight: 500; }
+    canvas.sign-pad {
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      height: 120px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      touch-action: none;
+      cursor: crosshair;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 14px;
+      font-size: 0.9rem;
+      font-family: inherit;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      padding: 12px 24px;
+      font-size: 1rem;
+    }
+    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    .hint { font-size: 0.85rem; color: var(--text-muted); margin-top: 6px; }
+    .err { color: var(--error); font-size: 0.9rem; margin-top: 8px; }
+    .btn-inline-feedback { font-size: 0.88rem; margin-top: 8px; min-height: 1.25em; word-break: break-word; }
+    .btn-inline-feedback.is-error { color: var(--error); }
+    .btn-inline-feedback.is-ok { color: var(--text-muted); }
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(0,0,0,0.2);
+      border-top-color: #000;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      display: inline-block;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .file-list { list-style: none; margin: 0; padding: 0; }
+    .file-list li {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      background: var(--surface2);
+    }
+    .file-list li.selected { border-color: var(--accent); background: rgba(26,115,232,0.06); }
+    .file-list li label { margin: 0; cursor: pointer; flex: 1; min-width: 0; word-break: break-all; }
+    .file-list .del-btn { flex-shrink: 0; }
+    .signed-meta { font-size: 0.85rem; color: var(--text-muted); margin-top: 4px; width: 100%; }
+    .sign-region { margin-bottom: 28px; }
+    .sign-region-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin: 0 0 6px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--accent);
+    }
+    .sign-region-desc { color: var(--text-muted); font-size: 0.92rem; margin: 0 0 16px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="nav-top">
+      <a href="/">返回批量打印</a>
+      <a href="/sign/materials">去素材录入页面</a>
+    </div>
+    <h1>在线签名</h1>
+    <div id="signBootstrapBanner" role="alert" style="display:none;margin:0 0 14px;padding:12px 14px;border-radius:8px;background:#ffebee;border:1px solid #e57373;color:#b71c1c;font-size:0.92rem;line-height:1.45;"></div>
+    <p class="subtitle">默认进入「文件签名」。如需新增/更新签署人手写素材，请点击上方「去素材录入页面」。</p>
+    <div id="fileProtoWarn" class="card" style="display:none;background:#fff8e1;border-color:#ffc107;">
+      <strong>请勿用本地文件打开本页。</strong> 请在本机运行 <code>python app.py</code> 后，用浏览器打开 <strong>http://127.0.0.1:5050/sign</strong>（或本机局域网 IP 同端口）。
+    </div>
+
+    <div id="pageFileSign">
+      <!-- 复用原 sign.html 的「文件签名」区块 -->
+      <section class="sign-region" id="regionFileSign" aria-label="文件签名">
+        <h2 class="sign-region-title">文件签名</h2>
+        <p class="sign-region-desc">上传 Word/Excel 待签文件，按检测结果或自选角色配置「角色→笔迹套（含签署人）」；可从库载入已有签字或重新手写，支持将当前画布一键入库（同人同图同日期覆盖）。可多选文件一键批量签（需 MySQL）。</p>
+
+        <div class="card">
+          <h2>1. 上传并保存到列表</h2>
+          <input type="file" id="fileInput" multiple accept=".docx,.xlsx">
+          <div class="btn-row" style="margin-top:10px;">
+            <input type="file" id="dirInput" webkitdirectory directory style="display:none">
+            <label for="dirInput" class="btn btn-secondary" style="cursor:pointer;margin:0;">选择文件夹（含子文件夹）</label>
+          </div>
+          <p class="hint" id="fileHint">可多选 .docx / .xlsx，或使用「选择文件夹」上传整目录</p>
+          <div class="btn-row" style="margin-top:12px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
+            <button type="button" class="btn btn-secondary" id="saveBtn" disabled>保存到列表</button>
+            <p id="saveUploadFeedback" class="btn-inline-feedback is-error" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>2. 选择要签名的文件</h2>
+          <p class="hint" id="listHint">正在加载文件列表…</p>
+          <div class="btn-row" style="margin:6px 0 10px;align-items:flex-start;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="btn btn-secondary" id="btnRefreshFiles" style="padding:6px 12px;">刷新列表</button>
+            <p id="fileListActionMsg" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
+          </div>
+          <div class="btn-row" style="margin-bottom:10px;">
+            <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
+              <input type="checkbox" id="batchSelectAll"> 全选（用于下方「一键批量签」）
+            </label>
+          </div>
+          <ul class="file-list" id="fileList"></ul>
+        </div>
+
+        <div class="card" id="needSignCard">
+          <div class="btn-row" style="margin-bottom:8px;align-items:flex-start;flex-wrap:wrap;justify-content:space-between;gap:12px;">
+            <h2 style="margin:0;font-size:1rem;font-weight:600;flex:1;min-width:200px;">本文件需签角色（检测结果）</h2>
+            <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;max-width:100%;">
+              <button type="button" class="btn btn-secondary" id="redetectRolesBtn">重新识别需签字角色</button>
+              <p id="needSignActionMsg" class="btn-inline-feedback is-error" style="display:none;margin:0;max-width:min(480px,92vw);" role="alert" aria-live="assertive"></p>
+            </div>
+          </div>
+          <p class="hint">根据模板中的编制/审核/批准等关键词自动识别；为每个角色绑定签名/日期素材后可「载入签名」「载入日期」到下方画布。表格较宽时可左右滑动查看。</p>
+          <div id="needSignTable"></div>
+        </div>
+
+        <div class="card">
+          <h2>3. 签字角色（可多选）</h2>
+          <p class="hint">勾选后会在<strong>本卡片下方</strong>展开对应签字画布；每个角色需分别完成「签名」和「日期」后再生成文档。未识别到角色时可手动勾选。</p>
+          <div id="roleChecks"></div>
+          <div id="rolePanels"></div>
+        </div>
+
+        <div class="card">
+          <div class="btn-row" style="align-items:center;margin-bottom:0;flex-wrap:wrap;gap:10px;">
+            <button type="button" class="btn btn-primary" id="submitBtn" disabled>生成已签名文档</button>
+            <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
+              <input type="checkbox" id="batchModeCb" style="width:18px;height:18px;accent-color:var(--accent);">
+              批量签字（已勾选文件）
+            </label>
+          </div>
+          <div class="btn-row" style="align-items:center;margin-top:8px;">
+            <label for="signSourceMode" style="margin:0;font-size:0.9rem;min-width:5.5em;">签名来源</label>
+            <select id="signSourceMode" style="flex:1;min-width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+              <option value="canvas" selected>画布（当前手写 / 已载入到画布）</option>
+              <option value="library">库映射（按“角色→素材”直接取库中签名/日期）</option>
+            </select>
+          </div>
+          <div id="libraryRolesModeRow" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+            <label style="display:inline-flex;align-items:flex-start;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
+              <input type="checkbox" id="libraryRolesUseChecksCb" style="width:18px;height:18px;margin-top:2px;accent-color:var(--accent);flex-shrink:0;">
+              <span>与上方「签字角色（可多选）」卡片勾选一致（高级）</span>
+            </label>
+            <p class="hint" style="margin:8px 0 0;font-size:0.85rem;">默认关闭：按「本文件需签角色」表中已绑定内容自动决定要套打的角色。勾选后改为仅提交上方「签字角色（可多选）」卡片中已勾选的角色（与旧版一致；未绑定的角色将由后端跳过）。批量 + 库映射 + 默认关闭时<strong>不传 roles</strong>，由服务端按各文件映射表处理。</p>
+          </div>
+          <p class="err btn-inline-feedback is-error" id="errMsg" style="display:none;margin-top:10px;" role="alert" aria-live="assertive"></p>
+          <p class="hint btn-inline-feedback" id="batchResultMsg" style="display:none;margin-top:6px;font-size:0.88rem;color:var(--text-muted);" role="status" aria-live="polite"></p>
+        </div>
+
+        <div class="card" id="signedSection">
+          <h2>已签名文档（数据库共享）</h2>
+          <p class="hint" id="signedHint">正在加载已签名列表…</p>
+          <div class="btn-row" style="margin-top:6px;align-items:flex-start;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="btn btn-secondary" id="btnRefreshSigned" style="padding:6px 12px;">刷新列表</button>
+            <p id="signedListActionMsg" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
+          </div>
+          <div id="signedSearchRow" style="display:none;">
+            <label for="signedSearchInput">按文件名搜索（输出文件名或源文件名）</label>
+            <div class="btn-row" style="margin-top:6px;">
+              <input type="search" id="signedSearchInput" placeholder="输入关键字" maxlength="200" style="flex:1;min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+              <button type="button" class="btn btn-secondary" id="signedSearchBtn">搜索</button>
+            </div>
+            <div class="btn-row" id="signedPager" style="margin-top:8px;align-items:center;gap:8px;flex-wrap:wrap;">
+              <span class="hint" id="signedPagerInfo" style="margin:0;">—</span>
+              <button type="button" class="btn btn-secondary" id="signedPrevBtn" style="padding:6px 12px;">上一页</button>
+              <button type="button" class="btn btn-secondary" id="signedNextBtn" style="padding:6px 12px;">下一页</button>
+            </div>
+          </div>
+          <ul class="file-list" id="signedList"></ul>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      if (typeof window !== 'undefined' && window.location.protocol === 'file:') {
+        var warn = document.getElementById('fileProtoWarn');
+        if (warn) warn.style.display = 'block';
+      }
+      function showScriptLoadFail(msg) {
+        var b = document.getElementById('signBootstrapBanner');
+        if (b) {
+          b.style.display = 'block';
+          b.textContent = msg;
+        }
+        var e = document.getElementById('errMsg');
+        if (e) {
+          e.style.display = 'block';
+          e.textContent = msg;
+        }
+      }
+      var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
+      var s = document.createElement('script');
+      s.defer = true;
+      s.src = (p || '') + '/js/sign-page.js';
+      s.onerror = function () {
+        showScriptLoadFail(
+          '无法加载「' +
+            s.src +
+            '」。请 Ctrl+F5 强刷；确认 static/js/sign-page.js 存在且已重启 python app.py；若站点有子路径请在页面注入 window.__APP_ROOT__。'
+        );
+      };
+      document.body.appendChild(s);
+      setTimeout(function () {
+        if (window.__SIGN_PAGE_BOOT_OK || window.__SIGN_PAGE_BOOT_HALTED) return;
+        showScriptLoadFail(
+          window.__SIGN_PAGE_BOOT_FAIL_MSG ||
+            '签名脚本在数秒内未完成启动（可能未加载、校验失败或运行时报错）。请按 F12 打开「控制台」查看红色报错，Ctrl+F5 强刷本页。'
+        );
+      }, 4500);
+    })();
+  </script>
+</body>
+</html>
+
