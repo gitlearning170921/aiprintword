@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import math
 from typing import Optional
 
 try:
@@ -78,6 +79,92 @@ def _median_ink_L(rgb) -> tuple[float, int]:
     return 255.0, n
 
 
+def _ink_bbox_rgb(rgb):
+    """返回墨迹（非近白）像素的外接矩形 (x0,y0,x1,y1)；无墨迹则 None。"""
+    w, h = rgb.size
+    data = rgb.tobytes()
+    minx, miny, maxx, maxy = w, h, -1, -1
+    any_ink = False
+    idx = 0
+    for y in range(h):
+        row_has = False
+        for x in range(w):
+            r, g, b = data[idx], data[idx + 1], data[idx + 2]
+            idx += 3
+            if r + g + b >= _INK_BG_SUM_MAX:
+                continue
+            any_ink = True
+            row_has = True
+            if x < minx:
+                minx = x
+            if x > maxx:
+                maxx = x
+        if row_has:
+            if y < miny:
+                miny = y
+            if y > maxy:
+                maxy = y
+    if not any_ink or maxx < 0:
+        return None
+    return (minx, miny, maxx + 1, maxy + 1)
+
+
+def _crop_rgb(rgb, box):
+    return rgb.crop(box)
+
+
+def _resize_rgb(rgb, new_w: int, new_h: int):
+    if new_w < 2 or new_h < 2:
+        return rgb
+    return rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+
+def _reexport_target_width(rgb) -> Image.Image:
+    """把图重新拉到统一像素宽度（与入库/Word 缩放假设一致）。"""
+    w, h = rgb.size
+    if w < 2 or h < 2:
+        return rgb
+    if w == _TARGET_EXPORT_W:
+        return rgb
+    nh = max(1, int(round(h * (_TARGET_EXPORT_W / float(w)))))
+    return _resize_rgb(rgb, _TARGET_EXPORT_W, nh)
+
+
+def _equalize_ink_scale_pair(s_rgb, d_rgb):
+    """
+    让签名/日期在“笔画粗细观感”上更接近：
+    - 先裁剪到墨迹外接矩形（去掉大量留白导致的缩放差异）
+    - 再按墨迹面积几何均值做互相缩放（避免只靠亮度对齐仍显一粗一细）
+    """
+    bs = _ink_bbox_rgb(s_rgb)
+    bd = _ink_bbox_rgb(d_rgb)
+    if not bs or not bd:
+        return s_rgb, d_rgb
+    cs = _crop_rgb(s_rgb, bs)
+    cd = _crop_rgb(d_rgb, bd)
+    as_ = max(1, cs.size[0] * cs.size[1])
+    ad = max(1, cd.size[0] * cd.size[1])
+    # 面积更接近几何均值：大的略缩小、小的略放大（都有上下限，避免极端）
+    g = math.sqrt(float(as_) * float(ad))
+    fs = max(0.75, min(1.35, g / float(as_)))
+    fd = max(0.75, min(1.35, g / float(ad)))
+    sw, sh = cs.size
+    dw, dh = cd.size
+    cs2 = _resize_rgb(cs, max(2, int(round(sw * fs))), max(2, int(round(sh * fs))))
+    cd2 = _resize_rgb(cd, max(2, int(round(dw * fd))), max(2, int(round(dh * fd))))
+    # 白底铺回固定画布，避免裁剪后尺寸漂移
+    def pad_to(w0, h0, im):
+        canvas = Image.new("RGB", (w0, h0), (255, 255, 255))
+        x = max(0, (w0 - im.size[0]) // 2)
+        y = max(0, (h0 - im.size[1]) // 2)
+        canvas.paste(im, (x, y))
+        return canvas
+
+    tw = max(cs2.size[0], cd2.size[0], 32)
+    th = max(cs2.size[1], cd2.size[1], 32)
+    return pad_to(tw, th, cs2), pad_to(tw, th, cd2)
+
+
 def _apply_ink_luminance_shift_rgb(rgb, delta: int):
     """仅对非近白像素做 RGB 同步平移，使墨迹整体变亮/变暗。"""
     if delta == 0:
@@ -102,11 +189,16 @@ def prepare_png_for_word(png_bytes: Optional[bytes]) -> Optional[bytes]:
 
 
 def prepare_signature_date_pair_for_word(
-    sig_png: Optional[bytes], date_png: Optional[bytes]
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+    *,
+    equalize_ink_scale: bool = True,
 ) -> tuple[Optional[bytes], Optional[bytes]]:
     """
-    同一角色同时有签名+日期时：把两者墨迹亮度对齐到「更淡」的一方，
-    避免历史窄图/透明抗锯齿导致 Word 里日期偏灰、签名偏黑（用户不要求重新入库日期）。
+    同一角色同时有签名+日期时：
+    - 可选：先按墨迹外接框与面积做轻微互相缩放，让笔画粗细更接近（Word 默认开启）；
+    - 再把两者墨迹亮度对齐到「更淡」的一方，避免历史窄图/透明抗锯齿导致 Word/Excel 里一深一浅。
+    Excel 若更追求清晰、可接受签名与日期略不一致，可传 equalize_ink_scale=False。
     """
     if not sig_png or not date_png or Image is None:
         s = prepare_png_for_word(sig_png) if sig_png else None
@@ -119,6 +211,10 @@ def prepare_signature_date_pair_for_word(
             prepare_png_for_word(sig_png) or sig_png,
             prepare_png_for_word(date_png) or date_png,
         )
+    if equalize_ink_scale:
+        s_rgb, d_rgb = _equalize_ink_scale_pair(s_rgb, d_rgb)
+        s_rgb = _reexport_target_width(s_rgb)
+        d_rgb = _reexport_target_width(d_rgb)
     ms, ns = _median_ink_L(s_rgb)
     md, nd = _median_ink_L(d_rgb)
     if ns == 0 or nd == 0:

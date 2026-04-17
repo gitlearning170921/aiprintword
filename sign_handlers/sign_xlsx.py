@@ -11,6 +11,7 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
 from openpyxl.drawing.xdr import XDRPositiveSize2D
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
 from openpyxl.utils.units import pixels_to_EMU
 from openpyxl import load_workbook
 
@@ -21,8 +22,11 @@ from sign_handlers.png_word_compat import (
     prepare_signature_date_pair_for_word,
 )
 
-# Excel 里 220px 太小，签字观感发虚；提高上限，同时仍按单元格宽高自适应缩放
-_MAX_IMG_WIDTH_PX = 420
+# Excel：按合并区域/单元格真实宽高适配；优先吃满行高（等比缩放、不变形），
+# 不设过小全局宽度上限，避免「行高还够但宽度先被 420 卡住」导致图偏小发虚。
+# 绝对宽度仅作防爆栅格，适度允许放大以填满行（上限避免糊成一片）。
+_EXCEL_ABS_MAX_IMG_WIDTH_PX = 1600
+_EXCEL_MAX_UPSCALE = 2.5
 _DATE_LABEL_KEYWORDS = ("日期", "Date")
 _PLACEHOLDER_TAIL = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·…．~～]+$")
 _GAP_PX = 6
@@ -56,10 +60,43 @@ def _row_height_px(ws, row_idx: int) -> int:
         return 20
 
 
-def _fit_to_box(w: int, h: int, max_w: int, max_h: int) -> tuple[int, int]:
+def _merged_span_box_px(ws, cell) -> tuple[int, int]:
+    """
+    合并单元格：用合并区域累计列宽、累计行高，避免图片只按左上角单列宽缩放导致「撑出格子」。
+    非合并：退化为单列宽 + 单行高。
+    """
+    try:
+        merged = getattr(ws, "merged_cells", None)
+        if merged is None:
+            return _col_width_px(ws, cell.column), _row_height_px(ws, cell.row)
+        for rng in merged.ranges:
+            if cell.coordinate in rng:
+                wpx = 0
+                for col in range(int(rng.min_col), int(rng.max_col) + 1):
+                    wpx += _col_width_px(ws, col)
+                hpx = 0
+                for row in range(int(rng.min_row), int(rng.max_row) + 1):
+                    hpx += _row_height_px(ws, row)
+                return max(24, wpx), max(18, hpx)
+    except Exception:
+        pass
+    return _col_width_px(ws, cell.column), _row_height_px(ws, cell.row)
+
+
+def _excel_content_max_width_px(box_w: int) -> int:
+    """单元格可用内容宽度（像素近似），并加绝对上限防爆。"""
+    return min(max(24, int(box_w) - 4), _EXCEL_ABS_MAX_IMG_WIDTH_PX)
+
+
+def _fit_to_box_excel(w: int, h: int, max_w: int, max_h: int) -> tuple[int, int]:
+    """
+    等比装入 max_w×max_h，不变形；不强制「只缩小不放大」，便于在小 PNG 时吃满行高更清晰。
+    缩放系数取 min(max_w/w, max_h/h)，行高较紧时自然由行高主导。
+    """
     if w <= 0 or h <= 0:
         return max(1, max_w), max(1, max_h)
-    s = min(max_w / float(w), max_h / float(h), 1.0)
+    s = min(max_w / float(w), max_h / float(h))
+    s = min(s, _EXCEL_MAX_UPSCALE)
     return max(1, int(round(w * s))), max(1, int(round(h * s)))
 
 
@@ -90,11 +127,30 @@ def _is_emptyish(v) -> bool:
     return len(s) < 2
 
 
-def _add_png(ws, png_bytes: bytes, anchor: str, max_w: int = _MAX_IMG_WIDTH_PX) -> None:
+def _add_png(
+    ws,
+    png_bytes: bytes,
+    anchor: str,
+    layout_cell=None,
+    max_w: int = _EXCEL_ABS_MAX_IMG_WIDTH_PX,
+) -> None:
     img = XLImage(io.BytesIO(png_bytes))
     w = int(getattr(img, "width", None) or max_w)
     h = int(getattr(img, "height", None) or int(max_w * 0.35))
-    w2, h2 = _fit_to_box(w, h, int(max_w), int(max_w * 0.55))
+    lc = layout_cell
+    if lc is None:
+        try:
+            r, c = coordinate_to_tuple(anchor)
+            lc = ws.cell(row=r, column=c)
+        except Exception:
+            lc = None
+    try:
+        box_w, box_h = _merged_span_box_px(ws, lc) if lc is not None else (int(max_w), int(max_w * 0.55))
+    except Exception:
+        box_w, box_h = int(max_w), int(max_w * 0.55)
+    max_w2 = min(int(max_w), _excel_content_max_width_px(int(box_w)))
+    max_h2 = max(14, int(box_h) - 4)
+    w2, h2 = _fit_to_box_excel(w, h, max_w2, max_h2)
     img.width = w2
     img.height = h2
     img.anchor = anchor
@@ -145,17 +201,18 @@ def _cell_inline_insert_offset_px(cell_value, keyword: str) -> Optional[int]:
     return min(max(px, 4), 300)
 
 
-def _add_png_after_label_in_cell(ws, png_bytes: bytes, cell, offset_x_px: int, max_w: int = _MAX_IMG_WIDTH_PX) -> None:
+def _add_png_after_label_in_cell(
+    ws, png_bytes: bytes, cell, offset_x_px: int, max_w: int = _EXCEL_ABS_MAX_IMG_WIDTH_PX
+) -> None:
     """把图片锚到当前标签单元格内偏移位置，避免落到占位点线末端，并按格宽高自适应缩放。"""
     img = XLImage(io.BytesIO(png_bytes))
     w = int(getattr(img, "width", None) or max_w)
     h = int(getattr(img, "height", None) or int(max_w * 0.35))
-    cell_w = _col_width_px(ws, cell.column)
-    cell_h = _row_height_px(ws, cell.row)
+    cell_w, cell_h = _merged_span_box_px(ws, cell)
     avail_w = max(28, cell_w - int(offset_x_px) - 4)
-    max_w2 = min(int(max_w), int(avail_w))
+    max_w2 = min(int(max_w), int(avail_w), _excel_content_max_width_px(cell_w))
     max_h2 = max(14, int(cell_h) - 4)
-    w2, h2 = _fit_to_box(w, h, max_w2, max_h2)
+    w2, h2 = _fit_to_box_excel(w, h, max_w2, max_h2)
     img.width = w2
     img.height = h2
     marker = AnchorMarker(
@@ -175,11 +232,10 @@ def _add_sig_and_date_after_label_in_cell(
     date_png: bytes,
     cell,
     offset_x_px: int,
-    max_w: int = _MAX_IMG_WIDTH_PX,
+    max_w: int = _EXCEL_ABS_MAX_IMG_WIDTH_PX,
 ) -> None:
     """同一单元格内：标题后先签名紧接日期（两个图片各自锚在不同 colOff）。"""
-    cell_w = _col_width_px(ws, cell.column)
-    cell_h = _row_height_px(ws, cell.row)
+    cell_w, cell_h = _merged_span_box_px(ws, cell)
     avail_w = max(40, cell_w - int(offset_x_px) - 4)
     max_h2 = max(14, int(cell_h) - 4)
 
@@ -191,11 +247,11 @@ def _add_sig_and_date_after_label_in_cell(
     d_h = int(getattr(date_img, "height", None) or int(max_w * 0.35))
 
     # 先给签名一个上限（优先留位置给日期）
-    sig_box_w = max(24, min(int(max_w), int(avail_w * 0.62)))
-    s_w2, s_h2 = _fit_to_box(s_w, s_h, sig_box_w, max_h2)
+    sig_box_w = max(24, min(int(max_w), int(avail_w * 0.62), _excel_content_max_width_px(cell_w)))
+    s_w2, s_h2 = _fit_to_box_excel(s_w, s_h, sig_box_w, max_h2)
     remain = max(24, avail_w - s_w2 - _GAP_PX)
-    d_box_w = max(24, min(int(max_w), int(remain)))
-    d_w2, d_h2 = _fit_to_box(d_w, d_h, d_box_w, max_h2)
+    d_box_w = max(24, min(int(max_w), int(remain), _excel_content_max_width_px(cell_w)))
+    d_w2, d_h2 = _fit_to_box_excel(d_w, d_h, d_box_w, max_h2)
 
     sig_img.width = s_w2
     sig_img.height = s_h2
@@ -239,7 +295,9 @@ def sign_xlsx(
         sb = role_to_signature_png.get(role_id)
         db = role_to_date_png.get(role_id)
         if sb and db:
-            sig, dt = prepare_signature_date_pair_for_word(sb, db)
+            sig, dt = prepare_signature_date_pair_for_word(
+                sb, db, equalize_ink_scale=False
+            )
         else:
             sig = prepare_png_for_word(sb) if sb else None
             dt = prepare_png_for_word(db) if db else None
@@ -285,7 +343,7 @@ def sign_xlsx(
                             # 优先：字段后紧接的空白单元格（按用户期望“插在字段后的单元格里”）
                             if _is_emptyish(sig_cell.value):
                                 sig_cell.value = None
-                                _add_png(ws, sig, _merged_top_left_coordinate(ws, sig_cell))
+                                _add_png(ws, sig, _merged_top_left_coordinate(ws, sig_cell), sig_cell)
                             else:
                                 # 仅当“同一单元格内留空占位”且没有可用的后续空白格时，才退化为同格插入
                                 sig_inline_x = _cell_inline_insert_offset_px(cell.value, kw)
@@ -296,7 +354,7 @@ def sign_xlsx(
                             # 优先：Date/日期 标签右侧空白格；其次：启发式找到的 date_cell
                             if date_cell is not None and _is_emptyish(date_cell.value):
                                 date_cell.value = None
-                                _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell))
+                                _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
                                 placed_any = True
                             else:
                                 # 若 Date/日期 标签格本身是“同格留空占位”，且没有可用的右侧空白格，才退化为同格插入
@@ -311,12 +369,13 @@ def sign_xlsx(
                                 elif date_cell is not None:
                                     # 非空也允许覆盖（用户明确选择了日期素材）
                                     date_cell.value = None
-                                    _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell))
+                                    _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
                                     placed_any = True
                                 else:
                                     # 找不到日期单元格时：放到签名格下方（兜底）
                                     below = f"{get_column_letter(c + 1)}{r + 1}"
-                                    _add_png(ws, dt, below)
+                                    below_cell = ws.cell(row=r + 1, column=c + 1)
+                                    _add_png(ws, dt, below, below_cell)
                                     placed_any = True
                         if not placed_any:
                             continue
