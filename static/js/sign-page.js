@@ -97,6 +97,7 @@
   var needSignTable = document.getElementById('needSignTable');
   var redetectRolesBtn = document.getElementById('redetectRolesBtn');
   var batchApplyRoleMapBtn = document.getElementById('batchApplyRoleMapBtn');
+  var saveRoleConfigBtn = document.getElementById('saveRoleConfigBtn');
   var batchSelectAll = document.getElementById('batchSelectAll');
   var batchModeCb = document.getElementById('batchModeCb');
   var batchResultMsg = document.getElementById('batchResultMsg');
@@ -322,6 +323,7 @@
       el.style.display = 'none';
       el.textContent = '';
       el.className = 'btn-inline-feedback';
+      el.style.whiteSpace = '';
       return;
     }
     clearFileRegionErr();
@@ -332,6 +334,7 @@
     el.style.display = 'block';
     el.textContent = s;
     el.className = 'btn-inline-feedback is-error';
+    el.style.whiteSpace = String(s).indexOf('\n') >= 0 ? 'pre-wrap' : 'normal';
   }
 
   function setPanelSaveFeedback(el, s, isErr) {
@@ -444,6 +447,43 @@
     if (!fileId) return;
     fileUiCache[fileId] = fileUiCache[fileId] || {};
     fileUiCache[fileId].currentRoleMap = _deepCloneJsonish(newMap || {});
+  }
+
+  /** 将「角色→素材」完整写入服务端（库映射签字读的是 MySQL，必须先落库再签） */
+  function persistRoleMapToServer(fileId, mapOpt) {
+    if (!fileId) return Promise.resolve(null);
+    var m = mapOpt != null ? mapOpt : currentRoleMap;
+    if (!m || typeof m !== 'object') m = {};
+    return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map'), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ map: m }),
+    }).then(function (r) {
+      var jj = r.data || {};
+      if (!jj.ok) throw new Error(jj.error || '保存角色映射失败');
+      if (String(selectedFileId) === String(fileId)) {
+        currentRoleMap = jj.map || m;
+      }
+      cachePatchCurrentRoleMap(fileId, jj.map || m);
+      return jj.map || m;
+    });
+  }
+
+  /** 库映射批量签：把各文件在内存里最后一次的映射刷到服务器，避免签的是旧配置 */
+  function bulkPersistRoleMapsForBatch(fileIds) {
+    var chain = Promise.resolve();
+    (fileIds || []).forEach(function (fid) {
+      chain = chain.then(function () {
+        if (!fid) return null;
+        var m =
+          String(fid) === String(selectedFileId)
+            ? _deepCloneJsonish(currentRoleMap || {})
+            : _deepCloneJsonish((fileUiCache[fid] || {}).currentRoleMap || {});
+        if (!m || !Object.keys(m).length) return null;
+        return persistRoleMapToServer(fid, m);
+      });
+    });
+    return chain;
   }
 
   function cacheSetNeedSignNotice(fileId, msg, isErr) {
@@ -1275,7 +1315,40 @@
   function showBatchResult(text, isErr) {
     batchResultMsg.style.display = text ? 'block' : 'none';
     batchResultMsg.style.color = isErr ? 'var(--error)' : 'var(--text-muted)';
+    batchResultMsg.style.whiteSpace = text && String(text).indexOf('\n') >= 0 ? 'pre-line' : 'normal';
     batchResultMsg.textContent = text || '';
+  }
+
+  /** 与首页批量打印 ETA 文案风格一致 */
+  function _formatSignBatchEtaSeconds(sec) {
+    if (sec == null || typeof sec !== 'number' || !isFinite(sec) || sec < 0) return '';
+    var s = Math.round(sec);
+    if (s < 60) return s + ' 秒';
+    var m = Math.floor(s / 60);
+    var rs = s % 60;
+    if (m < 60) return m + ' 分 ' + rs + ' 秒';
+    var h = Math.floor(m / 60);
+    var rm = m % 60;
+    return h + ' 小时 ' + rm + ' 分 ' + rs + ' 秒';
+  }
+
+  function _randomSignBatchIdHex32() {
+    try {
+      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        var arr = new Uint8Array(16);
+        crypto.getRandomValues(arr);
+        var o = '';
+        for (var i = 0; i < 16; i++) {
+          o += ('0' + arr[i].toString(16)).slice(-2);
+        }
+        return o;
+      }
+    } catch (_) {}
+    var x = '';
+    for (var j = 0; j < 32; j++) {
+      x += Math.floor(Math.random() * 16).toString(16);
+    }
+    return x;
   }
 
   function drawUrlToCanvas(canvasId, url, onImgErr) {
@@ -1626,24 +1699,29 @@
         fillRoleItemSelect(sigSel, 'sig', prev, fq.sig);
       });
       sigSel.addEventListener('change', function () {
+        var fid = selectedFileId;
+        if (!fid) return;
         var m = Object.assign({}, currentRoleMap);
         var p = m[rid] && typeof m[rid] === 'object' ? Object.assign({}, m[rid]) : {};
         p.sig = sigSel.value || null;
         if (!roleMapEntryNonEmpty(p)) delete m[rid];
         else m[rid] = p;
-        fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'), {
+        currentRoleMap = m;
+        cachePatchCurrentRoleMap(fid, currentRoleMap);
+        fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ map: m }),
         })
           .then(function (r) {
             var jj = r.data;
+            if (String(selectedFileId) !== String(fid)) return;
             if (!jj.ok) {
               setRoleRowFeedback(rid, jj.error || '保存映射失败');
               return;
             }
             currentRoleMap = jj.map || m;
-            cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+            cachePatchCurrentRoleMap(fid, currentRoleMap);
             setRoleRowFeedback(rid, '');
           })
           .catch(function (e) {
@@ -1722,24 +1800,29 @@
         fillRoleItemSelect(dateSel, 'date', prev, fq.date);
       });
       dateSel.addEventListener('change', function () {
+        var fid = selectedFileId;
+        if (!fid) return;
         var m = Object.assign({}, currentRoleMap);
         var p = m[rid] && typeof m[rid] === 'object' ? Object.assign({}, m[rid]) : {};
         p.date = dateSel.value || null;
         if (!roleMapEntryNonEmpty(p)) delete m[rid];
         else m[rid] = p;
-        fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'), {
+        currentRoleMap = m;
+        cachePatchCurrentRoleMap(fid, currentRoleMap);
+        fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ map: m }),
         })
           .then(function (r) {
             var jj = r.data;
+            if (String(selectedFileId) !== String(fid)) return;
             if (!jj.ok) {
               setRoleRowFeedback(rid, jj.error || '保存映射失败');
               return;
             }
             currentRoleMap = jj.map || m;
-            cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+            cachePatchCurrentRoleMap(fid, currentRoleMap);
             setRoleRowFeedback(rid, '');
           })
           .catch(function (e) {
@@ -1811,22 +1894,29 @@
       }
 
       function putRoleMap(p) {
+        var fid = selectedFileId;
+        if (!fid) {
+          return Promise.reject(new Error('no_file'));
+        }
         var m = Object.assign({}, currentRoleMap);
         if (!roleMapEntryNonEmpty(p)) delete m[rid];
         else m[rid] = p;
-        return fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'), {
+        currentRoleMap = m;
+        cachePatchCurrentRoleMap(fid, currentRoleMap);
+        return fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ map: m }),
         })
           .then(function (r) {
             var jj = r.data;
+            if (String(selectedFileId) !== String(fid)) return;
             if (!jj.ok) {
               setRoleRowFeedback(rid, jj.error || '保存映射失败');
               return;
             }
             currentRoleMap = jj.map || m;
-            cachePatchCurrentRoleMap(selectedFileId, currentRoleMap);
+            cachePatchCurrentRoleMap(fid, currentRoleMap);
             setRoleRowFeedback(rid, '');
           })
           .catch(function (e) {
@@ -1906,6 +1996,7 @@
                 pvImg.src = url;
                 pvImg.style.display = 'block';
                 pvMsg.style.display = 'none';
+                pvMsg.style.whiteSpace = '';
               });
             }
             return res.text().then(function (text) {
@@ -1919,12 +2010,14 @@
               }
               pvMsg.style.display = 'block';
               pvMsg.style.color = 'var(--error)';
+              pvMsg.style.whiteSpace = 'pre-wrap';
               pvMsg.textContent = msg;
             });
           });
         }).catch(function (e) {
           pvMsg.style.display = 'block';
           pvMsg.style.color = 'var(--error)';
+          pvMsg.style.whiteSpace = 'pre-wrap';
           pvMsg.textContent = (e && e.message) ? e.message : String(e);
         });
       });
@@ -2428,23 +2521,70 @@
     showErr('');
     submitBtn.disabled = true;
     submitBtn.innerHTML = '<span class="spinner"></span> 批量处理中…';
-    fetchJson(apiUrl('/api/sign/batch'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-      .then(function (r) {
-        var j = r.data || {};
-        if (!j.ok) {
-          showErr(j.error || '批量失败');
-          return;
-        }
-        var res = j.results || [];
+    var persist0 = source === 'library' ? bulkPersistRoleMapsForBatch(ids) : Promise.resolve();
+    var total = ids.length;
+    var t0 = Date.now();
+    var batchId = _randomSignBatchIdHex32();
+    var allResults = [];
+
+    function signBatchProgressLine(done, phaseSuffix) {
+      var elapsed = (Date.now() - t0) / 1000;
+      var pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+      var tail = '';
+      if (done > 0 && done < total) {
+        var avg = elapsed / done;
+        tail =
+          ' · 预计剩余 ' +
+          _formatSignBatchEtaSeconds(avg * (total - done)) +
+          '（近均 ' +
+          (Math.round(avg * 10) / 10) +
+          ' 秒/文件）';
+      } else if (done >= total && total) {
+        tail = ' · 本批总耗时 ' + _formatSignBatchEtaSeconds(elapsed);
+      }
+      var head = '批量签字 进度 ' + done + '/' + total + '（' + pct + '%）';
+      showBatchResult(head + (phaseSuffix ? ' ' + phaseSuffix : '') + ' · 已用 ' + _formatSignBatchEtaSeconds(elapsed) + tail, false);
+    }
+
+    persist0
+      .then(function () {
+        signBatchProgressLine(0, '· 正在提交第 1 个文件…');
+        var chain2 = Promise.resolve();
+        ids.forEach(function (fid, idx) {
+          chain2 = chain2.then(function () {
+            var rec = savedFiles.find(function (x) {
+              return x && String(x.id) === String(fid);
+            });
+            var nm = (rec && (rec.name || rec.id)) ? String(rec.name || rec.id) : String(fid);
+            signBatchProgressLine(idx, '· 正在处理「' + nm + '」…');
+            var onePayload = Object.assign({}, payload, { file_ids: [fid], batch_id: batchId });
+            return fetchJson(apiUrl('/api/sign/batch'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(onePayload),
+            }).then(function (r) {
+              var j = r.data || {};
+              if (!j.ok) throw new Error(j.error || '批量失败');
+              if (j.batch_id) batchId = String(j.batch_id);
+              var chunk = j.results || [];
+              for (var ci = 0; ci < chunk.length; ci++) {
+                if (chunk[ci]) allResults.push(chunk[ci]);
+              }
+              signBatchProgressLine(idx + 1, '· 「' + nm + '」已返回');
+            });
+          });
+        });
+        return chain2;
+      })
+      .then(function () {
+        var res = allResults;
         var okn = res.filter(function (x) {
-          return x.ok;
+          return x && x.ok;
         }).length;
         var lines = [];
-        lines.push('批量完成：成功 ' + okn + ' / ' + res.length + '。');
+        lines.push(
+          '批量完成：成功 ' + okn + ' / ' + res.length + '（批次 ' + (batchId ? batchId.slice(0, 8) : '') + '…）。'
+        );
         res.forEach(function (it) {
           if (!it) return;
           var nm = it.name || it.file_id || '';
@@ -2465,6 +2605,10 @@
       })
       .catch(function (e) {
         showErr(e.message || String(e));
+        signBatchProgressLine(
+          allResults.length,
+          '· 已中断（已完成 ' + allResults.length + '/' + total + '）'
+        );
       })
       .then(function () {
         submitBtn.disabled = false;
@@ -2615,19 +2759,27 @@
                   }
                   setPanelSaveFeedback(panelSaveFb, '', false);
                   var newId = (kind === 'date') ? jj.date_item_id : jj.sig_item_id;
-                  if (newId && selectedFileId) {
+                  var fidPanel = selectedFileId;
+                  if (newId && fidPanel) {
                     var m = Object.assign({}, currentRoleMap);
                     var p = m[rid] && typeof m[rid] === 'object' ? Object.assign({}, m[rid]) : {};
                     if (kind === 'date') p.date = newId;
                     else p.sig = newId;
                     m[rid] = p;
-                    return fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'), {
+                    currentRoleMap = m;
+                    cachePatchCurrentRoleMap(fidPanel, currentRoleMap);
+                    return fetchJson(apiUrl('/api/sign/files/' + fidPanel + '/role-map'), {
                       method: 'PUT',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ map: m }),
                     }).then(function (r2) {
                       var j2 = r2.data;
-                      if (j2 && j2.ok) currentRoleMap = j2.map || m;
+                      if (j2 && j2.ok) {
+                        if (String(selectedFileId) === String(fidPanel)) {
+                          currentRoleMap = j2.map || m;
+                        }
+                        cachePatchCurrentRoleMap(fidPanel, j2.map || m);
+                      }
                       setPanelSaveFeedback(
                         panelSaveFb,
                         (kind === 'date' ? '日期' : '签名') + '已入库并已绑定本角色。',
@@ -2676,6 +2828,7 @@
             });
           });
         }
+        if (IS_FILE_SIGN_PAGE && selectedFileId) saveCurrentFileUiToCache(selectedFileId);
         renderNeedSignTable();
         updateSubmitState();
       });
@@ -4076,6 +4229,26 @@
     return b;
   }
 
+  function ensureSaveRoleConfigBtn() {
+    if (saveRoleConfigBtn) return saveRoleConfigBtn;
+    if (!IS_FILE_SIGN_PAGE) return null;
+    if (!redetectRolesBtn || !redetectRolesBtn.parentNode) return null;
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn btn-secondary';
+    b.id = 'saveRoleConfigBtn';
+    b.textContent = '保存角色与签署人配置';
+    b.title =
+      '将当前文件「需签角色」勾选与「角色→素材」表完整写入服务器。库映射生成前也会自动保存；改配置后点一次可确认已生效。';
+    try {
+      redetectRolesBtn.parentNode.insertBefore(b, redetectRolesBtn);
+    } catch (_) {
+      redetectRolesBtn.parentNode.appendChild(b);
+    }
+    saveRoleConfigBtn = b;
+    return b;
+  }
+
   function _checkedBatchFileIds() {
     return Array.from(document.querySelectorAll('.batch-pick:checked')).map(function (el) {
       return el.getAttribute('data-id');
@@ -4097,8 +4270,8 @@
     if (!window.confirm('将“当前文件”的角色→素材映射，批量覆盖到已勾选的 ' + ids.length + ' 个文件？')) {
       return;
     }
-    var m0 = _deepCloneJsonish(currentRoleMap || {});
-    if (!Object.keys(m0).length) {
+    var mPreview = _deepCloneJsonish(currentRoleMap || {});
+    if (!Object.keys(mPreview).length) {
       setNeedSignActionFeedback('当前文件尚未绑定任何映射（表格里未选择签名/日期素材）。');
       return;
     }
@@ -4110,71 +4283,81 @@
       batchApplyRoleMapBtn.disabled = true;
       batchApplyRoleMapBtn.innerHTML = '<span class="spinner" aria-hidden="true"></span> 应用中…';
     }
-    // 逐个 PUT（避免后端新增接口；同时可在失败时精确提示文件）
-    var okN = 0;
-    var fail = [];
-    var chain = Promise.resolve();
-    ids.forEach(function (fid) {
-      chain = chain.then(function () {
-        return fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ map: m0 }),
-        }).then(function (r) {
-          var jj = r.data || {};
-          if (jj.ok) {
-            okN += 1;
-            cachePatchCurrentRoleMap(fid, jj.map || m0);
-          } else {
-            fail.push((fid || '') + '：' + (jj.error || '失败'));
-          }
-        }).catch(function (e) {
-          fail.push((fid || '') + '：' + (e && e.message ? e.message : String(e)));
-        });
-      });
-    });
-    chain.then(function () {
-      var okMsg = '已将“' + srcName + '”文件角色配置批量映射到 ' + okN + ' 个文件。';
-      // 只给“映射目标文件”写入提示；其它文件不提示
-      ids.forEach(function (fid2) {
-        if (!fid2) return;
-        // 如果该文件失败了，不写成功提示
-        var isFailed = fail.some(function (x) {
-          return String(x || '').indexOf(String(fid2) + '：') === 0;
-        });
-        if (!isFailed) cacheSetNeedSignNotice(fid2, okMsg, false);
-      });
-      // 若当前选中的不是映射目标（极少：用户切走了），则不显示成功提示
-      if (ids.indexOf(String(selectedFileId)) < 0) {
-        cacheSetNeedSignNotice(selectedFileId, '', false);
-      }
-      if (fail.length) {
-        setNeedSignActionFeedback(
-          '批量映射完成：成功 ' +
-            okN +
-            ' 个；失败 ' +
-            fail.length +
-            ' 个：' +
-            fail.slice(0, 3).join('；') +
-            (fail.length > 3 ? '…' : ''),
-          true
-        );
-      } else {
-        if (ids.indexOf(String(selectedFileId)) >= 0) {
-          setNeedSignActionFeedback(okMsg, false);
-        } else {
-          setNeedSignActionFeedback('');
+    persistRoleMapToServer(selectedFileId)
+      .then(function () {
+        var m0 = _deepCloneJsonish(currentRoleMap || {});
+        if (!Object.keys(m0).length) {
+          setNeedSignActionFeedback('当前文件尚未绑定任何映射（表格里未选择签名/日期素材）。');
+          return Promise.reject(new Error('empty_map'));
         }
-      }
-      // 若当前选中文档也在列表里，刷新表格显示
-      renderNeedSignTable();
-      updateSubmitState();
-    }).then(function () {
-      if (batchApplyRoleMapBtn) {
-        batchApplyRoleMapBtn.disabled = false;
-        batchApplyRoleMapBtn.textContent = '将本文件映射批量应用到已勾选文件';
-      }
-    });
+        // 逐个 PUT（避免后端新增接口；同时可在失败时精确提示文件）
+        var okN = 0;
+        var fail = [];
+        var chain = Promise.resolve();
+        ids.forEach(function (fid) {
+          chain = chain.then(function () {
+            return fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ map: m0 }),
+            }).then(function (r) {
+              var jj = r.data || {};
+              if (jj.ok) {
+                okN += 1;
+                cachePatchCurrentRoleMap(fid, jj.map || m0);
+              } else {
+                fail.push((fid || '') + '：' + (jj.error || '失败'));
+              }
+            }).catch(function (e) {
+              fail.push((fid || '') + '：' + (e && e.message ? e.message : String(e)));
+            });
+          });
+        });
+        return chain.then(function () {
+          var okMsg = '已将“' + srcName + '”文件角色配置批量映射到 ' + okN + ' 个文件。';
+          ids.forEach(function (fid2) {
+            if (!fid2) return;
+            var isFailed = fail.some(function (x) {
+              return String(x || '').indexOf(String(fid2) + '：') === 0;
+            });
+            if (!isFailed) cacheSetNeedSignNotice(fid2, okMsg, false);
+          });
+          if (ids.indexOf(String(selectedFileId)) < 0) {
+            cacheSetNeedSignNotice(selectedFileId, '', false);
+          }
+          if (fail.length) {
+            setNeedSignActionFeedback(
+              '批量映射完成：成功 ' +
+                okN +
+                ' 个；失败 ' +
+                fail.length +
+                ' 个：' +
+                fail.slice(0, 3).join('；') +
+                (fail.length > 3 ? '…' : ''),
+              true
+            );
+          } else {
+            if (ids.indexOf(String(selectedFileId)) >= 0) {
+              setNeedSignActionFeedback(okMsg, false);
+            } else {
+              setNeedSignActionFeedback('');
+            }
+          }
+          renderNeedSignTable();
+          updateSubmitState();
+        });
+      })
+      .catch(function (e) {
+        if (!e || e.message !== 'empty_map') {
+          setNeedSignActionFeedback(e && e.message ? e.message : String(e), true);
+        }
+      })
+      .then(function () {
+        if (batchApplyRoleMapBtn) {
+          batchApplyRoleMapBtn.disabled = false;
+          batchApplyRoleMapBtn.textContent = '将本文件映射批量应用到已勾选文件';
+        }
+      });
   }
 
   if (batchApplyRoleMapBtn) {
@@ -4189,6 +4372,27 @@
     batchApplyRoleMapBtn.__boundApplyRoleMap = true;
     batchApplyRoleMapBtn.addEventListener('click', function () {
       batchApplyCurrentRoleMapToPickedFiles();
+    });
+  }
+  ensureSaveRoleConfigBtn();
+  if (saveRoleConfigBtn && !saveRoleConfigBtn.__boundSaveRoleCfg) {
+    saveRoleConfigBtn.__boundSaveRoleCfg = true;
+    saveRoleConfigBtn.addEventListener('click', function () {
+      if (!selectedFileId) {
+        setNeedSignActionFeedback('请先在文件列表中选择一项。', true);
+        return;
+      }
+      setNeedSignActionFeedback('');
+      withButtonBusy(saveRoleConfigBtn, '保存中…', function () {
+        return persistRoleMapToServer(selectedFileId)
+          .then(function () {
+            saveCurrentFileUiToCache(selectedFileId);
+            setNeedSignActionFeedback('已保存本文件的角色与签署人映射（含表格中当前选择）。', false);
+          })
+          .catch(function (e) {
+            setNeedSignActionFeedback(e.message || String(e), true);
+          });
+      });
     });
   }
 
@@ -4320,27 +4524,32 @@
       resizeCanvasesForRoles(roles);
     }
 
-    var form = new FormData();
-    form.append('file_id', selectedFileId);
-    form.append('roles', JSON.stringify(roles));
-    form.append('sign_source', source2);
-    if (source2 === 'canvas') {
-      roles.forEach(function (id) {
-        var sigC = document.getElementById('sig_' + id);
-        var dateC = document.getElementById('date_' + id);
-        if (sigC && !isCanvasBlank(sigC)) {
-          form.append('sig_' + id, _normalizedPngDataUrl(sigC, 'sig'));
-        }
-        if (dateC && !isCanvasBlank(dateC)) {
-          form.append('date_' + id, _normalizedPngDataUrl(dateC, 'date'));
-        }
-      });
-    }
-
+    var persistPre = source2 === 'library' ? persistRoleMapToServer(selectedFileId) : Promise.resolve();
     submitBtn.disabled = true;
-    submitBtn.innerHTML = '<span class="spinner"></span> 处理中…';
+    submitBtn.innerHTML =
+      source2 === 'library'
+        ? '<span class="spinner"></span> 保存配置并生成…'
+        : '<span class="spinner"></span> 处理中…';
 
-    fetch(apiUrl('/api/sign'), { method: 'POST', body: form, credentials: 'include' })
+    persistPre
+      .then(function () {
+        var form = new FormData();
+        form.append('file_id', selectedFileId);
+        form.append('roles', JSON.stringify(roles));
+        form.append('sign_source', source2);
+        if (source2 === 'canvas') {
+          roles.forEach(function (id) {
+            var sigC = document.getElementById('sig_' + id);
+            var dateC = document.getElementById('date_' + id);
+            if (sigC && !isCanvasBlank(sigC)) {
+              form.append('sig_' + id, _normalizedPngDataUrl(sigC, 'sig'));
+            }
+            if (dateC && !isCanvasBlank(dateC)) {
+              form.append('date_' + id, _normalizedPngDataUrl(dateC, 'date'));
+            }
+          });
+        }
+        return fetch(apiUrl('/api/sign'), { method: 'POST', body: form, credentials: 'include' })
       .then(function (res) {
         var ct = res.headers.get('Content-Type') || '';
         if (!res.ok) {
@@ -4427,7 +4636,8 @@
           URL.revokeObjectURL(a.href);
           refreshSignedList();
         });
-      })
+      });
+    })
       .catch(function (e) {
         showErr(e.message || String(e));
       })

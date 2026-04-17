@@ -1,0 +1,10 @@
+---
+description: 库映射签字在拼接日期失败时须部分成功（签名/日期可只成其一），单文件与批量逻辑一致
+globs: app.py
+alwaysApply: false
+---
+
+# 库映射 + 拼接日期（不变量）
+
+- `POST /api/sign` 与 `POST /api/sign/batch` 中，当 `date_mode` 为拼接类（`composite_*`）时：任一步拼接条件不齐、素材缺失、或 `compose_date_piece_png` 抛错，应令 `dm=None` 并**继续**走后续「整张日期 `date_item` / 仅 `sig_item`」分支。
+- **禁止**在仅拼接失败时对整角色使用 `continue`（或等价早退），否则会出现「已选签署人签名素材，但审核格仍空白」——用户期望：有签无日则签成功、日期跳过；有日无签则日期成功、签名跳过；结果里分别记录成功与跳过原因。

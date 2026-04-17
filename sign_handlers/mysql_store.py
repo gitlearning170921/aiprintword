@@ -40,6 +40,7 @@ from sign_handlers.date_piece_compose import (
     kinds_zh_ymd_dot,
     normalize_piece_kind,
     piece_kind_label,
+    piece_slot_category,
 )
 
 _DB_NAME_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
@@ -1765,22 +1766,25 @@ def compose_date_piece_png(signer_id: str, iso: str, layout: str) -> Tuple[bytes
     else:
         kinds, label = kinds_for_iso_date(iso)
     pngs: List[bytes] = []
-    missing: List[str] = []
+    missing_by_cat: Dict[str, List[str]] = {"数字": [], "日期月份": [], "连接符": [], "其他": []}
     for slot in kinds:
         b = get_piece_png_for_date_compose(signer_id, slot)
         if not b:
             sk = (slot or "").strip().lower()
             try:
-                from sign_handlers.date_piece_compose import piece_kind_label
-
                 human = piece_kind_label(sk)
+                cat = piece_slot_category(sk)
             except Exception:
                 human = sk
+                cat = "其他"
             # 兼容：若仍有人录入了整词 pmXX，缺失提示里也说明可用简称
             if re.fullmatch(r"pm(0[1-9]|1[0-2])", sk):
-                missing.append(f"{human}（{sk}；也可录入简称 pma{sk[2:]}）")
+                line = f"{human}（{sk}；也可录入简称 pma{sk[2:]}）"
             else:
-                missing.append(f"{human}（{sk}）" if human and human != sk else sk)
+                line = f"{human}（{sk}）" if human and human != sk else sk
+            if cat not in missing_by_cat:
+                cat = "其他"
+            missing_by_cat[cat].append(line)
         else:
             if lay == "zh_ymd" and (slot or "").strip().lower() == "pdot":
                 # 中文点分日期：句点单独占一格，但点贴在格子的右下角（视觉上靠近前一位数字）
@@ -1792,12 +1796,30 @@ def compose_date_piece_png(signer_id: str, iso: str, layout: str) -> Tuple[bytes
                     pngs.append(b)
             else:
                 pngs.append(b)
-    if missing:
-        lay_h = "中文 2026.04.15" if lay == "zh_ymd" else ("英文 15 Apr 2026" if lay == "en_space" else lay)
+    if any(missing_by_cat.values()):
+        lay_h = (
+            "中文 2026.04.15"
+            if lay == "zh_ymd"
+            else ("英文 15 Apr 2026（空格版）" if lay == "en_space" else "英文 15.April.2026（点分版）")
+        )
+        order = ("数字", "日期月份", "连接符", "其他")
+        parts = []
+        for cat in order:
+            items = missing_by_cat.get(cat) or []
+            if items:
+                parts.append("【" + cat + "】" + "、".join(items))
+        detail = "\n".join(parts) if parts else ""
+        hint_page = (
+            "「中文点分日期」或「英文点分/空格日期」笔迹元件"
+            if lay == "zh_ymd"
+            else "「英文点分/空格日期」笔迹元件"
+        )
         raise ValueError(
-            "无法拼接预览：" + lay_h + " 所需的笔迹元件尚未录入。缺少："
-            + "，".join(missing)
-            + "。请先到「英文点分日期笔迹元件」为该签署人录入对应元件后再预览。"
+            "无法拼接预览（版式：" + lay_h + "）。以下类别仍有缺失：\n"
+            + detail
+            + "\n请到素材页 "
+            + hint_page
+            + " 为该签署人补录后再预览。"
         )
     # 默认字间距收紧（英文空格版可通过 gaps 单独放大“空格”）
     out = compose_png_horizontal(pngs, gap=3, gaps=gaps, target_h=360)

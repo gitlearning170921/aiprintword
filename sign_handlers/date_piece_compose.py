@@ -390,6 +390,20 @@ def month_label_for_kind(pm_kind: str) -> str:
     return pm_kind
 
 
+def piece_slot_category(slot: str) -> str:
+    """
+    拼接预览缺失提示用：将元件槽位归为「数字 / 日期月份 / 连接符 / 其他」。
+    """
+    sk = (slot or "").strip().lower()
+    if sk == "pdot":
+        return "连接符"
+    if re.fullmatch(r"pd[0-9]", sk):
+        return "数字"
+    if re.fullmatch(r"pm(0[1-9]|1[0-2])", sk) or re.fullmatch(r"pma(0[1-9]|1[0-2])", sk):
+        return "日期月份"
+    return "其他"
+
+
 def piece_kind_label(kind: str) -> str:
     """用于列表展示的中文标签。"""
     k = normalize_piece_kind(kind) or (kind or "").strip().lower()

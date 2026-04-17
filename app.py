@@ -3538,7 +3538,9 @@ def api_sign_batch():
                     return jsonify({"ok": False, "error": f"角色 {rr} 缺少画布签名或日期"}), 400
 
     results = []
-    batch_id = uuid.uuid4().hex
+    # 允许前端分文件多次提交同一批（用于进度展示）；须为 32 位 hex，否则每次请求自动生成
+    _bid = (data.get("batch_id") or "").strip().lower()
+    batch_id = _bid if _bid and _SIGN_FILE_ID_RE.match(_bid) else uuid.uuid4().hex
     for fid in file_ids:
         try:
             row = mysql_store.get_file_row(fid)
@@ -3602,57 +3604,62 @@ def api_sign_batch():
                     dm = (pair.get("date_mode") if isinstance(pair, dict) else None) or None
                     diso = (pair.get("date_iso") if isinstance(pair, dict) else None) or None
                     if mysql_store.is_composite_date_mode(dm):
+                        # 与单文件 POST /api/sign 一致：拼接失败不整角色放弃，退回「素材签名/整张日期图」能签则签
                         if not sig_id or not diso:
-                            # 拼接日期需要签名确定 signer_id；缺条件则跳过该角色
                             skipped.append(
                                 {
                                     "role_id": rid,
-                                    "reason": "拼接日期需绑定签名并选择日历日期",
+                                    "reason": "拼接日期条件不齐（需签名素材+日历），已改试整张日期/仅签名",
                                 }
                             )
-                            continue
-                        srow = mysql_store.get_stroke_item_row(sig_id)
-                        if not srow or not srow.get("png"):
-                            skipped.append(
-                                {
-                                    "role_id": rid,
-                                    "reason": "签名素材缺失",
-                                }
-                            )
-                            continue
-                        sid0 = (srow.get("signer_id") or "").strip()
-                        if not sid0:
-                            skipped.append(
-                                {
-                                    "role_id": rid,
-                                    "reason": "无法解析签署人",
-                                }
-                            )
-                            continue
-                        try:
-                            lay = mysql_store.composite_mode_to_layout(dm)
-                            dbytes, _lbl = mysql_store.compose_date_piece_png(
-                                sid0, str(diso).strip(), lay
-                            )
-                        except Exception as e:
-                            skipped.append(
-                                {
-                                    "role_id": rid,
-                                    "reason": f"日期拼接失败：{e}",
-                                }
-                            )
-                            continue
-                        sig_map[rid] = srow["png"]
-                        date_map[rid] = dbytes
-                        applied.append(
-                            {
-                                "role_id": rid,
-                                "sig": True,
-                                "date": True,
-                                "date_mode": "composite",
-                            }
-                        )
-                        continue
+                            dm = None
+                        srow = None
+                        if dm:
+                            srow = mysql_store.get_stroke_item_row(sig_id)
+                            if not srow or not srow.get("png"):
+                                skipped.append(
+                                    {
+                                        "role_id": rid,
+                                        "reason": "签名素材缺失，无法拼接；已改试整张日期/仅签名",
+                                    }
+                                )
+                                dm = None
+                        if dm:
+                            sid0 = (srow.get("signer_id") or "").strip()
+                            if not sid0:
+                                skipped.append(
+                                    {
+                                        "role_id": rid,
+                                        "reason": "无法解析签署人，跳过拼接；已改试整张日期/仅签名",
+                                    }
+                                )
+                                dm = None
+                        if dm:
+                            try:
+                                lay = mysql_store.composite_mode_to_layout(dm)
+                                dbytes, _lbl = mysql_store.compose_date_piece_png(
+                                    sid0, str(diso).strip(), lay
+                                )
+                            except Exception as e:
+                                skipped.append(
+                                    {
+                                        "role_id": rid,
+                                        "reason": f"日期拼接失败：{e}；已改试整张日期/仅签名",
+                                    }
+                                )
+                                dm = None
+                            else:
+                                sig_map[rid] = srow["png"]
+                                date_map[rid] = dbytes
+                                applied.append(
+                                    {
+                                        "role_id": rid,
+                                        "sig": True,
+                                        "date": True,
+                                        "date_mode": "composite",
+                                    }
+                                )
+                                continue
                     sb = None
                     if sig_id:
                         srow = mysql_store.get_stroke_item_row(sig_id)
@@ -3753,7 +3760,7 @@ def api_sign_batch():
                 )
         except Exception as e:
             results.append({"file_id": fid, "ok": False, "error": str(e) or type(e).__name__})
-    return jsonify({"ok": True, "results": results})
+    return jsonify({"ok": True, "results": results, "batch_id": batch_id})
 
 
 @app.route("/api/sign/signed", methods=["GET"])
