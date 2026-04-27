@@ -3263,6 +3263,7 @@ def api_sign_signer_stroke_pieces_batch_put(signer_id):
         return jsonify({"ok": False, "error": "单次最多提交 80 条元件"}), 400
     try:
         from sign_handlers import mysql_store
+        from sign_handlers.date_piece_compose import piece_kind_label
 
         mysql_store.ensure_sign_mysql()
         overwrite = True
@@ -3271,17 +3272,47 @@ def api_sign_signer_stroke_pieces_batch_put(signer_id):
         except Exception:
             overwrite = True
         results = []
+        seen_kind = set()
         for it in items:
             if not isinstance(it, dict):
                 results.append({"piece_kind": "", "ok": False, "error": "条目须为 JSON 对象"})
                 continue
             pk = (it.get("piece_kind") or it.get("kind") or "").strip()
+            pk_norm = pk.lower()
+            if pk_norm in seen_kind:
+                results.append(
+                    {
+                        "piece_kind": pk,
+                        "ok": False,
+                        "error_code": "duplicate_in_request",
+                        "error": "本次队列中该元件类别重复，请保留一条后重试",
+                    }
+                )
+                continue
+            seen_kind.add(pk_norm)
             png_raw = it.get("png") or ""
             png_b = _decode_png_data_url_or_b64(png_raw) if str(png_raw).strip() else None
             if not png_b:
                 results.append({"piece_kind": pk, "ok": False, "error": "缺少 png"})
                 continue
             try:
+                _pk_l = pk.lower()
+                _kind_h = piece_kind_label(_pk_l) if _pk_l else "元件"
+                # 覆盖判断按「签署人 + 具体元件 kind」；overwrite=False 时命中即返回 exists，不写库
+                if not overwrite:
+                    ex = mysql_store.get_stroke_item_row_by_signer_kind(
+                        signer_id, "en", pk
+                    )
+                    if ex:
+                        results.append(
+                            {
+                                "piece_kind": pk,
+                                "ok": False,
+                                "error_code": "exists",
+                                "error": f"该签署人的该元件已存在：{_kind_h}（{_pk_l}），请确认是否覆盖",
+                            }
+                        )
+                        continue
                 r = mysql_store.upsert_signer_stroke_piece(signer_id, pk, png_b)
                 if (not overwrite) and r and r.get("overwritten"):
                     results.append(
@@ -3289,7 +3320,7 @@ def api_sign_signer_stroke_pieces_batch_put(signer_id):
                             "piece_kind": pk,
                             "ok": False,
                             "error_code": "exists",
-                            "error": "该元件已存在，请确认是否覆盖",
+                            "error": f"该签署人的该元件已存在：{_kind_h}（{_pk_l}），请确认是否覆盖",
                         }
                     )
                 else:
@@ -3334,20 +3365,23 @@ def api_sign_signer_stroke_get(signer_id, kind):
         return jsonify({"ok": False, "error": "kind 须为 sig 或 date"}), 400
     try:
         blob = None
+        loc_q = (request.args.get("locale") or "").strip().lower()
+        if loc_q not in ("zh", "en"):
+            loc_q = ""
         if _sign_using_mysql():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            row = mysql_store.get_signer_strokes_row(signer_id)
-            if row:
-                blob = row.get("sig_png") if kind == "sig" else row.get("date_png")
+            blob = mysql_store.get_signer_stroke_png_resolved(
+                signer_id, kind, loc_q or None
+            )
         else:
             _sign_ensure_session_inbox()
             sid = session["sign_inbox_sid"]
-            from sign_handlers.sign_library_local import get_strokes as local_get
+            from sign_handlers.sign_library_local import get_signer_stroke_bytes_for_kind as local_stroke_kind
 
-            sig_b, date_b = local_get(SIGN_INBOX_ROOT, sid, signer_id)
-            blob = sig_b if kind == "sig" else date_b
+            loc_use = loc_q if loc_q in ("zh", "en") else "zh"
+            blob = local_stroke_kind(SIGN_INBOX_ROOT, sid, signer_id, kind, loc_use)
         if not blob:
             return Response(status=404)
         return Response(blob, mimetype="image/png")
@@ -3363,20 +3397,23 @@ def api_sign_stroke_set_stroke_get(set_id, kind):
         return jsonify({"ok": False, "error": "kind 须为 sig 或 date"}), 400
     try:
         blob = None
+        loc_q = (request.args.get("locale") or "").strip().lower()
+        if loc_q not in ("zh", "en"):
+            loc_q = ""
         if _sign_using_mysql():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            row = mysql_store.get_stroke_set_row(set_id)
-            if row:
-                blob = row.get("sig_png") if kind == "sig" else row.get("date_png")
+            blob = mysql_store.get_stroke_set_stroke_png_resolved(
+                set_id, kind, loc_q or None
+            )
         else:
             _sign_ensure_session_inbox()
             sid = session["sign_inbox_sid"]
-            from sign_handlers.sign_library_local import get_strokes_for_set as local_get_set
+            from sign_handlers.sign_library_local import get_stroke_set_stroke_bytes_for_kind as local_set_kind
 
-            sig_b, date_b = local_get_set(SIGN_INBOX_ROOT, sid, set_id)
-            blob = sig_b if kind == "sig" else date_b
+            loc_use = loc_q if loc_q in ("zh", "en") else "zh"
+            blob = local_set_kind(SIGN_INBOX_ROOT, sid, set_id, kind, loc_use)
         if not blob:
             return Response(status=404)
         return Response(blob, mimetype="image/png")

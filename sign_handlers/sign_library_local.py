@@ -352,23 +352,27 @@ def list_signers(inbox_root: str, sid: str) -> List[dict]:
         sid_signer = r["id"]
         signer_sets = by_signer.get(sid_signer, [])
         stroke_out: List[dict] = []
+        has_set_sig = False
+        has_set_date = False
         for i, ss in enumerate(signer_sets):
+            sb, db = _read_set_bytes(inbox_root, sid, ss["id"])
+            if sb:
+                has_set_sig = True
+            if db:
+                has_set_date = True
             stroke_out.append(
                 {
                     "id": ss["id"],
                     "signer_id": sid_signer,
+                    "locale": ss.get("locale") or "zh",
                     "updated_at": ss.get("updated_at"),
                     "sig_sha256": ss.get("sig_sha256"),
                     "date_sha256": ss.get("date_sha256"),
+                    "has_sig_blob": bool(sb),
+                    "has_date_blob": bool(db),
                     "label": "第 %d 套" % (i + 1),
                 }
             )
-        has_pair = False
-        for ss in signer_sets:
-            sb, db = _read_set_bytes(inbox_root, sid, ss["id"])
-            if sb and db:
-                has_pair = True
-                break
         sig_items = []
         date_items = []
         for i, it in enumerate((items_by_signer.get(sid_signer) or {}).get("sig", []) or []):
@@ -399,8 +403,8 @@ def list_signers(inbox_root: str, sid: str) -> List[dict]:
             {
                 "id": sid_signer,
                 "name": r.get("name") or "未命名",
-                "has_sig": bool(sig_items) or has_pair,
-                "has_date": bool(date_items) or has_pair,
+                "has_sig": bool(sig_items) or has_set_sig,
+                "has_date": bool(date_items) or has_set_date,
                 "created_at": None,
                 "stroke_sets": stroke_out,
                 "sig_items": sig_items,
@@ -483,11 +487,84 @@ def get_strokes(
     return _read_set_bytes(inbox_root, sid, latest["id"])
 
 
+def get_signer_stroke_bytes_for_kind(
+    inbox_root: str, sid: str, signer_id: str, kind: str, locale: str = "zh"
+) -> Optional[bytes]:
+    """GET 笔迹用：最近一套 + legacy 单文件之后，回落 stroke_items 中该侧最近一条。"""
+    _migrate_sets_to_items(inbox_root, sid)
+    k = (kind or "").strip().lower()
+    if k not in ("sig", "date"):
+        return None
+    sig_b, date_b = get_strokes(inbox_root, sid, signer_id)
+    blob = sig_b if k == "sig" else date_b
+    if blob:
+        return blob
+    sig_p, date_p = _legacy_paths(inbox_root, sid, signer_id)
+    if k == "sig" and os.path.isfile(sig_p) and os.path.getsize(sig_p) > 0:
+        try:
+            with open(sig_p, "rb") as fp:
+                return fp.read()
+        except OSError:
+            pass
+    if k == "date" and os.path.isfile(date_p) and os.path.getsize(date_p) > 0:
+        try:
+            with open(date_p, "rb") as fp:
+                return fp.read()
+        except OSError:
+            pass
+    loc_pref = (locale or "zh").strip().lower()
+    if loc_pref not in ("zh", "en"):
+        loc_pref = "zh"
+    items = _load_stroke_items(inbox_root, sid)
+    loc_order: List[str] = []
+    for L in (loc_pref, "zh", "en"):
+        if L in ("zh", "en") and L not in loc_order:
+            loc_order.append(L)
+    for loc in loc_order:
+        cand = [
+            it
+            for it in items
+            if str(it.get("signer_id")) == str(signer_id)
+            and (it.get("kind") or "").strip().lower() == k
+            and (it.get("locale") or "zh") == loc
+        ]
+        if not cand:
+            continue
+        it0 = max(cand, key=lambda x: str(x.get("updated_at") or ""))
+        got = get_stroke_item_bytes(inbox_root, sid, str(it0.get("id")))
+        if got:
+            return got
+    return None
+
+
 def get_strokes_for_set(
     inbox_root: str, sid: str, stroke_set_id: str
 ) -> Tuple[Optional[bytes], Optional[bytes]]:
     _migrate_legacy_files(inbox_root, sid)
     return _read_set_bytes(inbox_root, sid, stroke_set_id)
+
+
+def get_stroke_set_stroke_bytes_for_kind(
+    inbox_root: str, sid: str, stroke_set_id: str, kind: str, locale: str = "zh"
+) -> Optional[bytes]:
+    """套内文件缺一侧时，回落到该签署人 stroke_items / 最近套（与仅存一侧素材一致）。"""
+    k = (kind or "").strip().lower()
+    if k not in ("sig", "date"):
+        return None
+    sig_b, date_b = get_strokes_for_set(inbox_root, sid, stroke_set_id)
+    blob = sig_b if k == "sig" else date_b
+    if blob:
+        return blob
+    _migrate_legacy_files(inbox_root, sid)
+    stroke_sets = _load_stroke_sets(inbox_root, sid)
+    signer_id = ""
+    for s in stroke_sets:
+        if str(s.get("id")) == str(stroke_set_id):
+            signer_id = str(s.get("signer_id") or "")
+            break
+    if not signer_id:
+        return None
+    return get_signer_stroke_bytes_for_kind(inbox_root, sid, signer_id, k, locale)
 
 
 def upsert_strokes(

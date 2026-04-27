@@ -1872,6 +1872,8 @@ def list_stroke_items_page(
     cat_args: List[Any] = []
     if cat in ("sig", "signature"):
         where_cat = " AND i.kind='sig' "
+    elif cat in ("date", "sign_date", "hand_date"):
+        where_cat = " AND i.kind='date' "
     elif cat in ("digit", "digits"):
         where_cat = " AND i.locale='en' AND i.kind REGEXP '^(pd[0-9])$' "
     elif cat in ("en_date", "en", "month", "months"):
@@ -2307,7 +2309,11 @@ def list_signers() -> List[dict]:
             rows = cur.fetchall()
             cur.execute(
                 """
-                SELECT id, signer_id, locale, updated_at, sig_sha256, date_sha256
+                SELECT id, signer_id, locale, updated_at, sig_sha256, date_sha256,
+                    ( (sig_png IS NOT NULL AND LENGTH(sig_png) > 0)
+                      OR (sig_ftp_path IS NOT NULL AND sig_ftp_path <> '') ) AS has_sig_blob,
+                    ( (date_png IS NOT NULL AND LENGTH(date_png) > 0)
+                      OR (date_ftp_path IS NOT NULL AND date_ftp_path <> '') ) AS has_date_blob
                 FROM sign_stroke_set ORDER BY signer_id ASC, locale ASC, updated_at DESC
                 """
             )
@@ -2354,10 +2360,13 @@ def list_signers() -> List[dict]:
                     "updated_at": ut.isoformat(sep=" ") if ut is not None else None,
                     "sig_sha256": sr.get("sig_sha256"),
                     "date_sha256": sr.get("date_sha256"),
+                    "has_sig_blob": bool(sr.get("has_sig_blob")),
+                    "has_date_blob": bool(sr.get("has_date_blob")),
                     "label": ("%s · 第 %d 套" % (("中文" if (sr.get("locale") or "zh") == "zh" else "英文"), i + 1)),
                 }
             )
-        has_from_sets = len(stroke_sets) > 0
+        has_set_sig = any(bool(sr.get("has_sig_blob")) for sr in stroke_sets_raw)
+        has_set_date = any(bool(sr.get("has_date_blob")) for sr in stroke_sets_raw)
         sig_items_raw = (items_by_signer.get(signer_id) or {}).get("sig", []) or []
         date_items_raw = (items_by_signer.get(signer_id) or {}).get("date", []) or []
         sig_items: List[dict] = []
@@ -2400,8 +2409,8 @@ def list_signers() -> List[dict]:
                     "label": "第 %d 条" % (i + 1),
                 }
             )
-        has_sig = bool(sig_items) or has_from_sets or bool(r.get("leg_sig"))
-        has_date = bool(date_items) or has_from_sets or bool(r.get("leg_date"))
+        has_sig = bool(sig_items) or has_set_sig or bool(r.get("leg_sig"))
+        has_date = bool(date_items) or has_set_date or bool(r.get("leg_date"))
         pie = pieces_by_signer.get(signer_id) or {x: False for x in all_piece_kinds()}
         out.append(
             {
@@ -2483,6 +2492,69 @@ def get_signer_strokes_row(signer_id: str) -> Optional[dict]:
     if not row:
         return None
     return _hydrate_stroke_storage_row(dict(row))
+
+
+def _signer_stroke_item_latest_png(
+    signer_id: str, kind: str, locale_hint: Optional[str] = None
+) -> Optional[bytes]:
+    """该签署人 sign_stroke_item 中 kind 最近一条（locale_hint → zh → en）。"""
+    k = (kind or "").strip().lower()
+    if k not in ("sig", "date"):
+        return None
+    locales: List[str] = []
+    if locale_hint:
+        lh = locale_hint.strip().lower()
+        if lh in ("zh", "en"):
+            locales.append(lh)
+    for loc in ("zh", "en"):
+        if loc not in locales:
+            locales.append(loc)
+    for loc in locales:
+        item = get_stroke_item_row_by_signer_kind(signer_id, loc, k)
+        b = (item or {}).get("png")
+        if b:
+            return b
+    return None
+
+
+def get_signer_stroke_png_resolved(
+    signer_id: str, kind: str, locale_hint: Optional[str] = None
+) -> Optional[bytes]:
+    """
+    供 GET /stroke/<kind>：先取成套/legacy 行中对应 PNG；若该侧为空（例如仅有 sign_stroke_item），
+    再回落到 sign_stroke_item 该签署人该 kind 的最近一条（按 locale_hint → zh → en）。
+    """
+    k = (kind or "").strip().lower()
+    if k not in ("sig", "date"):
+        return None
+    row = get_signer_strokes_row(signer_id)
+    if row:
+        blob = row.get("sig_png") if k == "sig" else row.get("date_png")
+        if blob:
+            return blob
+    return _signer_stroke_item_latest_png(signer_id, k, locale_hint)
+
+
+def get_stroke_set_stroke_png_resolved(
+    stroke_set_id: str, kind: str, locale_hint: Optional[str] = None
+) -> Optional[bytes]:
+    """
+    供 GET /stroke-sets/<id>/stroke/<kind>：先取该套内 PNG；若该侧为空则回落到该签署人
+    sign_stroke_item 同侧最近一条（与「仅保存一侧」数据一致）。
+    """
+    k = (kind or "").strip().lower()
+    if k not in ("sig", "date"):
+        return None
+    row = get_stroke_set_row(stroke_set_id)
+    if not row:
+        return None
+    blob = row.get("sig_png") if k == "sig" else row.get("date_png")
+    if blob:
+        return blob
+    signer_id = (row.get("signer_id") or "").strip()
+    if not signer_id:
+        return None
+    return _signer_stroke_item_latest_png(signer_id, k, locale_hint)
 
 
 def upsert_signer_strokes(

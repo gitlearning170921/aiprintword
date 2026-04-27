@@ -115,6 +115,9 @@
   var libClearDateBtn = document.getElementById('libClearDateBtn');
   var libLoadStrokesBtn = document.getElementById('libLoadStrokesBtn');
   var libSaveStrokesBtn = document.getElementById('libSaveStrokesBtn');
+  var libSaveSigOnlyBtn = document.getElementById('libSaveSigOnlyBtn');
+  var libSaveDateOnlyBtn = document.getElementById('libSaveDateOnlyBtn');
+  var libSaveStrokeSetBtn = document.getElementById('libSaveStrokeSetBtn');
   var libStrokeFeedback = document.getElementById('libStrokeFeedback');
   var strokeItemsHint = document.getElementById('strokeItemsHint');
   var strokeItemCatSelect = document.getElementById('strokeItemCatSelect');
@@ -942,13 +945,14 @@
     if (!signer) return false;
     kind = (kind || '').toLowerCase();
     loc = (loc === 'en') ? 'en' : 'zh';
-    // stroke_sets（成对）可视为同时拥有 sig+date
     try {
       var sets = signer.stroke_sets || [];
       if (Array.isArray(sets) && sets.length) {
         for (var i = 0; i < sets.length; i++) {
           var st = sets[i] || {};
-          if ((st.locale || 'zh') === loc) return true;
+          if ((st.locale || 'zh') !== loc) continue;
+          if (kind === 'sig' && st.has_sig_blob) return true;
+          if (kind === 'date' && st.has_date_blob) return true;
         }
       }
     } catch (_) {}
@@ -1024,6 +1028,8 @@
     }
     setLibStrokeFeedback('', false);
     var ts = '?t=' + Date.now();
+    var locRaw = (libLocaleSelect && libLocaleSelect.value) ? String(libLocaleSelect.value).trim() : 'zh';
+    var locParam = '&locale=' + encodeURIComponent(locRaw === 'en' ? 'en' : 'zh');
     var setId = libStrokeSetSelect.value;
     var urlSig =
       setId && setId.length === 32
@@ -1043,15 +1049,138 @@
             canvases['lib_date_canvas'].resize();
           }
           Promise.all([
-            drawUrlToCanvas('lib_sig_canvas', urlSig + ts, onLibStrokeImgErr),
-            drawUrlToCanvas('lib_date_canvas', urlDate + ts, onLibStrokeImgErr),
+            drawUrlToCanvas('lib_sig_canvas', urlSig + ts + locParam, false),
+            drawUrlToCanvas('lib_date_canvas', urlDate + ts + locParam, false),
           ])
-            .then(function () {
+            .then(function (results) {
+              var sigOk = !!results[0];
+              var dateOk = !!results[1];
+              var parts = [];
+              if (sigOk) parts.push('签名');
+              if (dateOk) parts.push('日期');
+              if (!parts.length) {
+                setLibStrokeFeedback(
+                  '该签署人尚无已保存的签名或日期笔迹（可先手写后保存）',
+                  false
+                );
+              } else {
+                var tail =
+                  !sigOk || !dateOk
+                    ? '（未载入的一侧尚无素材，可只手写该侧后点「仅保存签名」或「仅保存日期」）'
+                    : '';
+                setLibStrokeFeedback('已载入：' + parts.join('、') + tail, false);
+              }
               resolve();
             })
             .catch(reject);
         });
       });
+    });
+  }
+
+  function _libResizeStrokeCanvases() {
+    if (canvases['lib_sig_canvas'] && canvases['lib_sig_canvas'].resize) {
+      canvases['lib_sig_canvas'].resize();
+    }
+    if (canvases['lib_date_canvas'] && canvases['lib_date_canvas'].resize) {
+      canvases['lib_date_canvas'].resize();
+    }
+  }
+
+  /**
+   * @param {'nonempty'|'sig_only'|'date_only'|'set_both'} mode
+   */
+  function _libStrokeFormData(mode) {
+    var sigC = document.getElementById('lib_sig_canvas');
+    var dateC = document.getElementById('lib_date_canvas');
+    var sigBlank = isCanvasBlank(sigC);
+    var dateBlank = isCanvasBlank(dateC);
+    var fd = new FormData();
+    if (mode === 'sig_only') {
+      if (sigBlank) {
+        return { error: '「仅保存签名」需要左侧签名画布有手写内容。' };
+      }
+      fd.append('sig', _normalizedPngDataUrl(sigC, 'sig'));
+    } else if (mode === 'date_only') {
+      if (dateBlank) {
+        return { error: '「仅保存日期」需要右侧日期画布有手写内容。' };
+      }
+      fd.append('date', _normalizedPngDataUrl(dateC, 'date'));
+    } else if (mode === 'set_both') {
+      if (sigBlank || dateBlank) {
+        return {
+          error:
+            '「成套保存」需要签名与日期两侧均有手写内容。只改一侧时请用「仅保存签名 / 仅保存日期」，或任一侧有内容时用「保存非空项」。',
+        };
+      }
+      fd.append('sig', _normalizedPngDataUrl(sigC, 'sig'));
+      fd.append('date', _normalizedPngDataUrl(dateC, 'date'));
+    } else {
+      if (sigBlank && dateBlank) {
+        return {
+          error:
+            '请先在「签名」或「日期」画布中至少手写一项（也可用「仅保存签名 / 仅保存日期」单侧提交）。',
+        };
+      }
+      if (!sigBlank) fd.append('sig', _normalizedPngDataUrl(sigC, 'sig'));
+      if (!dateBlank) fd.append('date', _normalizedPngDataUrl(dateC, 'date'));
+    }
+    fd.append('locale', (libLocaleSelect && libLocaleSelect.value) ? libLocaleSelect.value : 'zh');
+    return { form: fd };
+  }
+
+  function runLibStrokeSave(mode, busyBtn, busyText) {
+    if (!libSignerSelect || !busyBtn) return;
+    var sid = libSignerSelect.value;
+    if (!sid) {
+      setLibStrokeFeedback('请先选择签署人', true);
+      return;
+    }
+    _libResizeStrokeCanvases();
+    var parsed = _libStrokeFormData(mode);
+    if (parsed.error) {
+      setLibStrokeFeedback(parsed.error, true);
+      return;
+    }
+    return withButtonBusy(busyBtn, busyText || '保存中…', function () {
+      return fetchJson(apiUrl('/api/sign/signers/' + sid + '/strokes'), {
+        method: 'PUT',
+        body: parsed.form,
+      }).then(function (r) {
+        var jj = r.data || {};
+        if (!jj.ok) {
+          setLibStrokeFeedback(jj.error || '保存失败', true);
+          return;
+        }
+        var nid = jj.stroke_set_id;
+        var signerLabel = libSignerSelect.options[libSignerSelect.selectedIndex].text || '';
+        var suffix = jj.overwritten ? '（已覆盖同内容的记录）' : '';
+        var msg = '已按画布非空项保存到「' + signerLabel + '」' + suffix + '。';
+        if (mode === 'sig_only') {
+          msg = '已仅更新「' + signerLabel + '」的签名笔迹' + suffix + '。';
+        } else if (mode === 'date_only') {
+          msg = '已仅更新「' + signerLabel + '」的日期笔迹' + suffix + '。';
+        } else if (mode === 'set_both') {
+          msg = '已将签名与日期成套保存到「' + signerLabel + '」' + suffix + '。';
+        }
+        setLibStrokeFeedback(msg, false);
+        return refreshSigners().then(function () {
+          if (nid) {
+            syncLibStrokeSetSelect();
+            if (
+              libStrokeSetSelect &&
+              Array.prototype.some.call(libStrokeSetSelect.options, function (op) {
+                return op.value === nid;
+              })
+            ) {
+              libStrokeSetSelect.value = nid;
+            }
+          }
+          refreshStrokeItemList();
+        });
+      });
+    }).catch(function (e) {
+      setLibStrokeFeedback(e.message || String(e), true);
     });
   }
 
@@ -1380,10 +1509,17 @@
         }
       };
       img.onerror = function () {
+        try {
+          var c2 = canvas.getContext('2d');
+          if (c2) {
+            c2.setTransform(1, 0, 0, 1, 0, 0);
+            c2.clearRect(0, 0, canvas.width, canvas.height);
+          }
+        } catch (_) {}
         var msg = '无法加载手写图（请确认该签署人已保存对应签名/日期）';
         if (typeof onImgErr === 'function') {
           onImgErr(msg);
-        } else {
+        } else if (onImgErr !== false) {
           showErr(msg);
         }
         resolve(false);
@@ -1421,6 +1557,11 @@
           : '当前为会话目录存储：笔迹仅保存在本浏览器对应会话目录，换浏览器需重新添加。';
         if (pieceDateCard) pieceDateCard.style.display = signersDbShare ? 'block' : 'none';
         renderSignerLib();
+        try {
+          if (typeof window.__tryRestorePieceDraft === 'function') {
+            window.__tryRestorePieceDraft();
+          }
+        } catch (_) {}
         if (IS_FILE_SIGN_PAGE) {
           renderNeedSignTable();
           refreshRoleSaveSignerControls();
@@ -2388,71 +2529,26 @@
     });
   });
 
-  if (libSaveStrokesBtn) libSaveStrokesBtn.addEventListener('click', function () {
-    var sid = libSignerSelect.value;
-    if (!sid) {
-      setLibStrokeFeedback('请先选择签署人', true);
-      return;
-    }
-    if (canvases['lib_sig_canvas'] && canvases['lib_sig_canvas'].resize) {
-      canvases['lib_sig_canvas'].resize();
-    }
-    if (canvases['lib_date_canvas'] && canvases['lib_date_canvas'].resize) {
-      canvases['lib_date_canvas'].resize();
-    }
-    var sigC = document.getElementById('lib_sig_canvas');
-    var dateC = document.getElementById('lib_date_canvas');
-    var sigBlank = isCanvasBlank(sigC);
-    var dateBlank = isCanvasBlank(dateC);
-    if (sigBlank && dateBlank) {
-      setLibStrokeFeedback(
-        '请先在上方「签名」或「日期」画布中至少手写一项（可只签一项，也可两项都签）',
-        true
-      );
-      return;
-    }
-    var fd = new FormData();
-    if (!sigBlank) fd.append('sig', _normalizedPngDataUrl(sigC, 'sig'));
-    if (!dateBlank) fd.append('date', _normalizedPngDataUrl(dateC, 'date'));
-    fd.append('locale', (libLocaleSelect && libLocaleSelect.value) ? libLocaleSelect.value : 'zh');
-    withButtonBusy(libSaveStrokesBtn, '保存中…', function () {
-      return fetchJson(apiUrl('/api/sign/signers/' + sid + '/strokes'), {
-        method: 'PUT',
-        body: fd,
-      }).then(function (r) {
-        var jj = r.data || {};
-        if (!jj.ok) {
-          setLibStrokeFeedback(jj.error || '保存失败', true);
-          return;
-        }
-        var nid = jj.stroke_set_id;
-        setLibStrokeFeedback(
-          '手写图已保存到「' +
-            (libSignerSelect.options[libSignerSelect.selectedIndex].text || '') +
-            '」' +
-            (jj.overwritten ? '（已覆盖同内容的一套）' : '') +
-            '。',
-          false
-        );
-        return refreshSigners().then(function () {
-          if (nid) {
-            syncLibStrokeSetSelect();
-            if (
-              libStrokeSetSelect &&
-              Array.prototype.some.call(libStrokeSetSelect.options, function (op) {
-                return op.value === nid;
-              })
-            ) {
-              libStrokeSetSelect.value = nid;
-            }
-          }
-          refreshStrokeItemList();
-        });
-      });
-    }).catch(function (e) {
-      setLibStrokeFeedback(e.message || String(e), true);
+  if (libSaveSigOnlyBtn) {
+    libSaveSigOnlyBtn.addEventListener('click', function () {
+      runLibStrokeSave('sig_only', libSaveSigOnlyBtn, '保存签名…');
     });
-  });
+  }
+  if (libSaveDateOnlyBtn) {
+    libSaveDateOnlyBtn.addEventListener('click', function () {
+      runLibStrokeSave('date_only', libSaveDateOnlyBtn, '保存日期…');
+    });
+  }
+  if (libSaveStrokesBtn) {
+    libSaveStrokesBtn.addEventListener('click', function () {
+      runLibStrokeSave('nonempty', libSaveStrokesBtn, '保存中…');
+    });
+  }
+  if (libSaveStrokeSetBtn) {
+    libSaveStrokeSetBtn.addEventListener('click', function () {
+      runLibStrokeSave('set_both', libSaveStrokeSetBtn, '成套保存中…');
+    });
+  }
 
   if (btnRefreshSigners) {
     btnRefreshSigners.addEventListener('click', function () {
@@ -2942,6 +3038,81 @@
       var batchStep = 0;
       var batchQueue = [];
       var batchActive = false;
+      var PIECE_BATCH_DRAFT_KEY = 'sign_piece_batch_draft_v1';
+      var __pieceDraftRestored = false;
+
+      function _pieceDraftSnapshot(reason) {
+        return {
+          v: 1,
+          sid: (libSignerSelect && libSignerSelect.value) ? String(libSignerSelect.value) : '',
+          signer_name: (currentSignerName && currentSignerName.textContent) ? String(currentSignerName.textContent) : '',
+          batchOrder: (batchOrder || []).slice(),
+          batchStep: Number(batchStep || 0),
+          batchQueue: (batchQueue || []).slice(),
+          batchActive: !!batchActive,
+          reason: reason || '',
+          ts: Date.now(),
+        };
+      }
+
+      function savePieceBatchDraft(reason) {
+        try {
+          if (!window.localStorage) return;
+          var snap = _pieceDraftSnapshot(reason);
+          if (!(snap.batchQueue && snap.batchQueue.length)) {
+            return;
+          }
+          window.localStorage.setItem(PIECE_BATCH_DRAFT_KEY, JSON.stringify(snap));
+        } catch (_) {}
+      }
+
+      function clearPieceBatchDraft() {
+        try {
+          if (!window.localStorage) return;
+          window.localStorage.removeItem(PIECE_BATCH_DRAFT_KEY);
+        } catch (_) {}
+      }
+
+      function tryRestorePieceBatchDraft() {
+        if (__pieceDraftRestored) return;
+        __pieceDraftRestored = true;
+        try {
+          if (!window.localStorage) return;
+          var raw = window.localStorage.getItem(PIECE_BATCH_DRAFT_KEY);
+          if (!raw) return;
+          var d = JSON.parse(raw || '{}');
+          if (!d || !Array.isArray(d.batchQueue) || !d.batchQueue.length) return;
+          var ageSec = Math.max(0, Math.floor((Date.now() - Number(d.ts || 0)) / 1000));
+          var msg =
+            '检测到一份元件上传草稿（' +
+            d.batchQueue.length +
+            ' 项，约 ' +
+            ageSec +
+            ' 秒前）' +
+            (d.signer_name ? '，签署人：' + d.signer_name : '') +
+            '。是否恢复并重试上传？';
+          if (!window.confirm(msg)) return;
+          batchOrder = Array.isArray(d.batchOrder) ? d.batchOrder.slice() : [];
+          batchQueue = d.batchQueue.slice();
+          batchStep = Number(d.batchStep || batchQueue.length);
+          batchActive = false;
+          if (d.sid && libSignerSelect) {
+            try {
+              if (Array.prototype.some.call(libSignerSelect.options || [], function (o) { return o.value === d.sid; })) {
+                libSignerSelect.value = d.sid;
+              }
+            } catch (_) {}
+          }
+          pieceBatchNextBtn.disabled = true;
+          pieceBatchUploadBtn.disabled = false;
+          pieceBatchStartBtn.disabled = false;
+          setPieceBatchFeedback(
+            '已恢复上传草稿：' + batchQueue.length + ' 项。可直接点「上传队列中全部」重试。',
+            false
+          );
+        } catch (_) {}
+      }
+      try { window.__tryRestorePieceDraft = tryRestorePieceBatchDraft; } catch (_) {}
 
       function pieceMetaLabel(kind) {
         var f = PIECE_ORDER.find(function (x) {
@@ -2958,6 +3129,7 @@
         batchStep = 0;
         batchQueue = [];
         batchActive = false;
+        clearPieceBatchDraft();
         pieceBatchNextBtn.disabled = true;
         pieceBatchUploadBtn.disabled = true;
         pieceBatchStartBtn.disabled = false;
@@ -3011,6 +3183,7 @@
         batchQueue = [];
         batchStep = 0;
         batchActive = true;
+        savePieceBatchDraft('started');
         pieceBatchNextBtn.disabled = false;
         pieceBatchUploadBtn.disabled = true;
         pieceBatchStartBtn.disabled = true;
@@ -3037,6 +3210,7 @@
           piece_kind: kind,
           png: _normalizedPngDataUrl(pieceCanvasEl, 'date'),
         });
+        savePieceBatchDraft('collecting');
         if (canvases['piece_canvas'] && canvases['piece_canvas'].clear) canvases['piece_canvas'].clear();
         batchStep += 1;
         clearFileRegionErr();
@@ -3044,6 +3218,7 @@
           batchActive = false;
           pieceBatchNextBtn.disabled = true;
           pieceBatchUploadBtn.disabled = false;
+          savePieceBatchDraft('ready_to_upload');
           setPieceBatchProgress(
             '已将 ' +
               batchQueue.length +
@@ -3108,7 +3283,7 @@
             if (r && r.ok) okn += 1;
             else {
               failn += 1;
-              if (r && (r.error_code === 'exists' || /存在/.test(String(r.error || '')))) {
+              if (r && (r.error_code === 'exists' || /已存在|同名元件/.test(String(r.error || '')))) {
                 hasExists = true;
               }
               if (firstErrs.length < 3 && r && (r.error || r.piece_kind)) {
@@ -3121,7 +3296,7 @@
 
           // 先检测存在 → 弹窗确认是否覆盖 → 再覆盖提交
           if (hasExists && okn === 0) {
-            var yes = window.confirm('检测到该签署人已存在同名元件，是否覆盖？');
+            var yes = window.confirm('检测到该签署人已存在同类别元件（按签署人+元件类别判断），是否覆盖？');
             if (!yes) {
               setPieceBatchFeedback('已取消覆盖：队列未清空，你可以调整选择或换签署人后再上传。', true);
               return Promise.resolve();
@@ -3133,9 +3308,10 @@
             setPieceBatchFeedback(
               '全部未保存成功' +
                 (firstErrs.length ? '（' + firstErrs.join('；') + '）' : '') +
-                '。请根据提示修正后仍可从队列重试上传。',
+                '。请根据提示修正后可从草稿箱重试上传。',
               true
             );
+            savePieceBatchDraft('upload_failed');
             setPieceHintFeedback(
               '服务器明细：成功 0 条' + (failn ? '，失败 ' + failn + ' 条' : '') + '。',
               false
@@ -3152,8 +3328,10 @@
         }
 
         withButtonBusy(pieceBatchUploadBtn, '上传中…', function () {
+          savePieceBatchDraft('uploading');
           return uploadPieces(false).then(handleUploadResult);
         }).catch(function (e) {
+          savePieceBatchDraft('upload_failed');
           setPieceBatchFeedback(e.message || String(e), true);
         });
       });

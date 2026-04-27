@@ -1,0 +1,13 @@
+---
+description: 批量元件上传健壮性与覆盖判定
+globs: static/js/sign-page.js, app.py
+alwaysApply: false
+---
+
+# 批量元件上传（不变量）
+
+- `/api/sign/signers/<sid>/stroke-pieces` 在 `overwrite=false` 时，覆盖判定必须按 **签署人 + 元件类别(kind)**，命中后返回 `error_code=exists`，且不应先写库后回滚语义。
+- 前端“是否覆盖”提示只对 `error_code=exists` 或“已存在/同名元件”触发；不得用宽泛 `存在` 匹配，避免把“签署人不存在”等错误误判为重复。
+- 批量元件上传失败时保留可重试队列（草稿箱/本地缓存）；成功或用户显式取消后再清空。
+- 脚本启动看门狗需采用重试窗口（而非 4-5 秒单次判定），避免弱网或冷启动时偶发误报“脚本未完成启动”。
+

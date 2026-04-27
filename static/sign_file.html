@@ -309,13 +309,21 @@
         );
       };
       document.body.appendChild(s);
-      setTimeout(function () {
+      var bootCheckTry = 0;
+      function watchSignBoot() {
         if (window.__SIGN_PAGE_BOOT_OK || window.__SIGN_PAGE_BOOT_HALTED) return;
+        bootCheckTry += 1;
+        // 弱网或首次冷启动时给更长缓冲，减少偶发误报
+        if (bootCheckTry < 8) {
+          setTimeout(watchSignBoot, 1500);
+          return;
+        }
         showScriptLoadFail(
           window.__SIGN_PAGE_BOOT_FAIL_MSG ||
-            '签名脚本在数秒内未完成启动（可能未加载、校验失败或运行时报错）。请按 F12 打开「控制台」查看红色报错，Ctrl+F5 强刷本页。'
+            '签名脚本在较长等待后仍未完成启动（可能未加载、校验失败或运行时报错）。请按 F12 打开「控制台」查看红色报错，Ctrl+F5 强刷本页。'
         );
-      }, 4500);
+      }
+      setTimeout(watchSignBoot, 5000);
     })();
   </script>
 </body>

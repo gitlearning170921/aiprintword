@@ -213,7 +213,7 @@
 
       <div class="card" id="signerStrokeCard">
         <h2>为所选签署人录入 / 更新手写图</h2>
-        <p class="hint">选择签署人后在画布上手写；可只保存左侧「签名」或只保存右侧「日期」，也可两项一起保存（内容相同则覆盖）。此处与下方「按文件、按角色」画布相互独立。</p>
+        <p class="hint">选择签署人后在画布上手写。可用「仅保存签名 / 仅保存日期」只更新一侧（请求里不带另一侧）；「保存非空项」会提交当前两侧所有有内容的画布；「成套保存」要求两侧均有内容并写入成对素材套。此处与下方「按文件、按角色」画布相互独立。</p>
         <label for="libSignerSelect" style="margin-top:8px;">当前签署人</label>
         <div class="hint" id="currentSignerBanner" style="margin-top:6px;">
           当前选中：<strong id="currentSignerName">—</strong>
@@ -222,7 +222,7 @@
         <select id="libSignerSelect" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
           <option value="">请先添加签署人</option>
         </select>
-        <label for="libStrokeSetSelect" style="margin-top:8px;">成对素材套（签名+日期成套；可选指定一套载入，不选则按该人最近一套）</label>
+        <label for="libStrokeSetSelect" style="margin-top:8px;">成对素材套（可选：指定一套同时载入签名+日期；不选则各侧取该人最近一条笔迹）</label>
         <select id="libStrokeSetSelect" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
           <option value="">最近一套</option>
         </select>
@@ -247,7 +247,12 @@
         </div>
         <div class="btn-row" style="margin-top:12px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
           <button type="button" class="btn btn-secondary" id="libLoadStrokesBtn">从服务器载入该人笔迹</button>
-          <button type="button" class="btn btn-primary" id="libSaveStrokesBtn" style="padding:10px 18px;">保存笔迹到该签署人</button>
+        </div>
+        <div class="btn-row" style="margin-top:8px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
+          <button type="button" class="btn btn-secondary" id="libSaveSigOnlyBtn" style="padding:8px 14px;">仅保存签名</button>
+          <button type="button" class="btn btn-secondary" id="libSaveDateOnlyBtn" style="padding:8px 14px;">仅保存日期</button>
+          <button type="button" class="btn btn-primary" id="libSaveStrokesBtn" style="padding:10px 18px;">保存非空项</button>
+          <button type="button" class="btn btn-secondary" id="libSaveStrokeSetBtn" style="padding:8px 14px;">成套保存</button>
           <p id="libStrokeFeedback" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="status" aria-live="polite"></p>
         </div>
       </div>
@@ -299,6 +304,7 @@
           <select id="strokeItemCatSelect" style="min-width:220px;max-width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
             <option value="" selected>全部</option>
             <option value="sig">签名</option>
+            <option value="date">签日期</option>
             <option value="digit">数字（0–9）</option>
             <option value="en_date">英文日期（月份简称）</option>
             <option value="connector">连接符（句点 .）</option>
@@ -452,13 +458,21 @@
         );
       };
       document.body.appendChild(s);
-      setTimeout(function () {
+      var bootCheckTry = 0;
+      function watchSignBoot() {
         if (window.__SIGN_PAGE_BOOT_OK || window.__SIGN_PAGE_BOOT_HALTED) return;
+        bootCheckTry += 1;
+        // 弱网或首次冷启动时给更长缓冲，减少偶发误报
+        if (bootCheckTry < 8) {
+          setTimeout(watchSignBoot, 1500);
+          return;
+        }
         showScriptLoadFail(
           window.__SIGN_PAGE_BOOT_FAIL_MSG ||
-            '签名脚本在数秒内未完成启动（可能未加载、校验失败或运行时报错）。请按 F12 打开「控制台」查看红色报错，Ctrl+F5 强刷本页。'
+            '签名脚本在较长等待后仍未完成启动（可能未加载、校验失败或运行时报错）。请按 F12 打开「控制台」查看红色报错，Ctrl+F5 强刷本页。'
         );
-      }, 4500);
+      }
+      setTimeout(watchSignBoot, 5000);
     })();
   </script>
 </body>
