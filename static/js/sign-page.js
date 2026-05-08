@@ -2,6 +2,134 @@
 (function () {
   'use strict';
 
+  // 兼容部分老旧移动端 WebView：避免 Object.assign / Array.from 缺失导致整页脚本中断。
+  if (!Object.assign) {
+    Object.assign = function (target) {
+      if (target == null) throw new TypeError('Cannot convert undefined or null to object');
+      var to = Object(target);
+      for (var i = 1; i < arguments.length; i++) {
+        var src = arguments[i];
+        if (src == null) continue;
+        for (var key in src) {
+          if (Object.prototype.hasOwnProperty.call(src, key)) to[key] = src[key];
+        }
+      }
+      return to;
+    };
+  }
+  if (!Array.from) {
+    Array.from = function (arrLike) {
+      return Array.prototype.slice.call(arrLike);
+    };
+  }
+  if (typeof window !== 'undefined' && !window.requestAnimationFrame) {
+    window.requestAnimationFrame = function (cb) {
+      return setTimeout(function () {
+        cb(Date.now());
+      }, 16);
+    };
+  }
+  if (typeof window !== 'undefined' && !window.cancelAnimationFrame) {
+    window.cancelAnimationFrame = function (id) {
+      clearTimeout(id);
+    };
+  }
+  if (typeof Promise === 'undefined') {
+    (function () {
+      function MiniPromise(executor) {
+        this._state = 'pending';
+        this._value = undefined;
+        this._handlers = [];
+        var self = this;
+        function resolve(v) {
+          if (self._state !== 'pending') return;
+          self._state = 'fulfilled';
+          self._value = v;
+          self._flush();
+        }
+        function reject(e) {
+          if (self._state !== 'pending') return;
+          self._state = 'rejected';
+          self._value = e;
+          self._flush();
+        }
+        try {
+          executor(resolve, reject);
+        } catch (e) {
+          reject(e);
+        }
+      }
+      MiniPromise.prototype._flush = function () {
+        var self = this;
+        setTimeout(function () {
+          while (self._handlers.length) {
+            var h = self._handlers.shift();
+            try {
+              if (self._state === 'fulfilled') {
+                if (typeof h.onFulfilled === 'function') {
+                  h.resolve(h.onFulfilled(self._value));
+                } else {
+                  h.resolve(self._value);
+                }
+              } else if (self._state === 'rejected') {
+                if (typeof h.onRejected === 'function') {
+                  h.resolve(h.onRejected(self._value));
+                } else {
+                  h.reject(self._value);
+                }
+              }
+            } catch (e) {
+              h.reject(e);
+            }
+          }
+        }, 0);
+      };
+      MiniPromise.prototype.then = function (onFulfilled, onRejected) {
+        var self = this;
+        return new MiniPromise(function (resolve, reject) {
+          self._handlers.push({
+            onFulfilled: onFulfilled,
+            onRejected: onRejected,
+            resolve: resolve,
+            reject: reject,
+          });
+          if (self._state !== 'pending') self._flush();
+        });
+      };
+      MiniPromise.prototype.catch = function (onRejected) {
+        return this.then(null, onRejected);
+      };
+      MiniPromise.resolve = function (v) {
+        return new MiniPromise(function (resolve) {
+          resolve(v);
+        });
+      };
+      MiniPromise.reject = function (e) {
+        return new MiniPromise(function (_, reject) {
+          reject(e);
+        });
+      };
+      MiniPromise.all = function (arr) {
+        arr = arr || [];
+        return new MiniPromise(function (resolve, reject) {
+          if (!arr.length) return resolve([]);
+          var out = new Array(arr.length);
+          var left = arr.length;
+          for (var i = 0; i < arr.length; i++) {
+            (function (idx) {
+              MiniPromise.resolve(arr[idx]).then(function (v) {
+                out[idx] = v;
+                left -= 1;
+                if (left === 0) resolve(out);
+              }, reject);
+            })(i);
+          }
+        });
+      };
+      window.Promise = MiniPromise;
+    })();
+  }
+
   var ROLES = [
     { id: 'author', label: '作者' },
     { id: 'reviewer', label: '审核' },
@@ -20,10 +148,46 @@
     return APP_PREFIX + p;
   }
 
+  function _fetchTextCompat(url, options) {
+    var opts = options || {};
+    if (typeof fetch === 'function') {
+      return fetch(url, opts).then(function (res) {
+        return res.text().then(function (text) {
+          return { res: res, text: text };
+        });
+      });
+    }
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open((opts.method || 'GET').toUpperCase(), url, true);
+      xhr.withCredentials = true;
+      try {
+        if (opts.headers) {
+          Object.keys(opts.headers).forEach(function (k) {
+            xhr.setRequestHeader(k, opts.headers[k]);
+          });
+        }
+      } catch (_) {}
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        var resLike = {
+          status: xhr.status || 0,
+          ok: xhr.status >= 200 && xhr.status < 300,
+        };
+        resolve({ res: resLike, text: xhr.responseText || '' });
+      };
+      xhr.onerror = function () {
+        reject(new Error('网络请求失败（浏览器兼容模式）'));
+      };
+      xhr.send(opts.body || null);
+    });
+  }
+
   function fetchJson(url, options) {
     var opts = Object.assign({ credentials: 'include' }, options || {});
-    return fetch(url, opts).then(function (res) {
-      return res.text().then(function (text) {
+    return _fetchTextCompat(url, opts).then(function (pack) {
+      var res = pack.res;
+      var text = pack.text || '';
         var t = text.trim();
         if (t.charAt(0) === '<') {
           var m = (opts && opts.method ? String(opts.method).toUpperCase() : 'GET');
@@ -40,7 +204,6 @@
         } catch (e) {
           throw new Error('接口返回无法解析为 JSON：' + t.slice(0, 160));
         }
-      });
     });
   }
 
@@ -71,6 +234,28 @@
   if (typeof window !== 'undefined' && window.location.protocol === 'file:') {
     var w = document.getElementById('fileProtoWarn');
     if (w) w.style.display = 'block';
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('error', function (ev) {
+      try {
+        var b = document.getElementById('signBootstrapBanner');
+        if (!b) return;
+        b.style.display = 'block';
+        var msg = (ev && ev.message) ? ev.message : '未知错误';
+        var src = (ev && ev.filename) ? String(ev.filename).split('/').pop() : '';
+        var ln = (ev && ev.lineno) ? String(ev.lineno) : '';
+        b.textContent = '前端脚本异常：' + msg + (src ? ' @' + src : '') + (ln ? ':' + ln : '');
+      } catch (_) {}
+    });
+    window.addEventListener('unhandledrejection', function (ev) {
+      try {
+        var b = document.getElementById('signBootstrapBanner');
+        if (!b) return;
+        b.style.display = 'block';
+        var reason = (ev && ev.reason) ? String(ev.reason.message || ev.reason) : 'Promise 未处理异常';
+        b.textContent = '前端脚本异常：' + reason;
+      } catch (_) {}
+    });
   }
 
   var fileInput = document.getElementById('fileInput');
@@ -381,6 +566,8 @@
   var currentRoleMap = {};
   var signersList = [];
   var signersDbShare = false;
+  var libSignerQuickPickEl = null;
+  var libLocaleQuickPickEl = null;
 
   var signerPageIndex = 0;
   var signerPageSize = 3;
@@ -812,8 +999,119 @@
     })) {
       libSignerSelect.value = prev;
     }
+    renderLibSignerQuickPick();
     syncLibStrokeSetSelect();
     syncCurrentSignerBanners();
+  }
+
+  function ensureLibSignerQuickPickEl() {
+    if (!libSignerSelect || !libSignerSelect.parentNode) return null;
+    if (!libSignerQuickPickEl) {
+      var host = document.createElement('div');
+      host.id = 'libSignerQuickPick';
+      host.style.marginTop = '8px';
+      host.style.display = 'none';
+      libSignerSelect.parentNode.insertBefore(host, libSignerSelect.nextSibling);
+      libSignerQuickPickEl = host;
+    }
+    return libSignerQuickPickEl;
+  }
+
+  function renderLibSignerQuickPick() {
+    var host = ensureLibSignerQuickPickEl();
+    if (!host) return;
+    var q = (libSignerFilter && libSignerFilter.value) ? String(libSignerFilter.value).trim().toLowerCase() : '';
+    var sid = libSignerSelect && libSignerSelect.value ? String(libSignerSelect.value) : '';
+    var rows = [];
+    for (var i = 0; i < signersList.length; i++) {
+      var s = signersList[i] || {};
+      var nm = (s && s.name ? String(s.name) : '');
+      var id = (s && s.id ? String(s.id) : '');
+      if (q) {
+        var nmLow = nm.toLowerCase();
+        var idLow = id.toLowerCase();
+        if (nmLow.indexOf(q) < 0 && idLow.indexOf(q) < 0) continue;
+      }
+      rows.push({ id: id, name: nm || id });
+    }
+    if (!rows.length) {
+      host.style.display = 'none';
+      host.innerHTML = '';
+      return;
+    }
+    host.style.display = 'block';
+    var html = '<div class="hint" style="margin:6px 0;">手机端点下拉无响应时，可直接点这里选择签署人：</div><div style="display:flex;gap:6px;flex-wrap:wrap;">';
+    for (var j = 0; j < rows.length; j++) {
+      var r = rows[j];
+      var active = sid && sid === r.id;
+      html +=
+        '<button type="button" class="btn btn-secondary lib-signer-chip" data-sid="' + r.id +
+        '" style="padding:6px 10px;' + (active ? 'border-color:#1a73e8;color:#1a73e8;background:#eef4ff;' : '') + '">' +
+        r.name + '</button>';
+    }
+    html += '</div>';
+    host.innerHTML = html;
+    var chips = host.querySelectorAll('.lib-signer-chip');
+    for (var k = 0; k < chips.length; k++) {
+      chips[k].addEventListener('click', function () {
+        var picked = this.getAttribute('data-sid') || '';
+        if (!picked || !libSignerSelect) return;
+        libSignerSelect.value = picked;
+        syncLibStrokeSetSelect();
+        syncCurrentSignerBanners();
+        renderLibSignerQuickPick();
+      });
+    }
+  }
+
+  function ensureLibLocaleQuickPickEl() {
+    if (!libLocaleSelect || !libLocaleSelect.parentNode) return null;
+    if (!libLocaleQuickPickEl) {
+      var host = document.createElement('div');
+      host.id = 'libLocaleQuickPick';
+      host.style.marginTop = '8px';
+      host.style.display = 'none';
+      libLocaleSelect.parentNode.insertBefore(host, libLocaleSelect.nextSibling);
+      libLocaleQuickPickEl = host;
+    }
+    return libLocaleQuickPickEl;
+  }
+
+  function renderLibLocaleQuickPick() {
+    var host = ensureLibLocaleQuickPickEl();
+    if (!host || !libLocaleSelect) return;
+    var cur = String(libLocaleSelect.value || 'zh');
+    var opts = Array.prototype.slice.call(libLocaleSelect.options || []).filter(function (op) {
+      return !!(op && op.value);
+    });
+    if (!opts.length) {
+      host.style.display = 'none';
+      host.innerHTML = '';
+      return;
+    }
+    host.style.display = 'block';
+    var html = '<div class="hint" style="margin:6px 0;">手机端点下拉无响应时，可直接点这里切换版本：</div><div style="display:flex;gap:6px;flex-wrap:wrap;">';
+    for (var i = 0; i < opts.length; i++) {
+      var op = opts[i];
+      var v = String(op.value || '');
+      var txt = String(op.textContent || v || '');
+      var active = cur === v;
+      html +=
+        '<button type="button" class="btn btn-secondary lib-locale-chip" data-loc="' + v +
+        '" style="padding:6px 10px;' + (active ? 'border-color:#1a73e8;color:#1a73e8;background:#eef4ff;' : '') + '">' +
+        txt + '</button>';
+    }
+    html += '</div>';
+    host.innerHTML = html;
+    var chips = host.querySelectorAll('.lib-locale-chip');
+    for (var j = 0; j < chips.length; j++) {
+      chips[j].addEventListener('click', function () {
+        var picked = this.getAttribute('data-loc') || '';
+        if (!picked || !libLocaleSelect) return;
+        libLocaleSelect.value = picked;
+        renderLibLocaleQuickPick();
+      });
+    }
   }
 
   function syncCurrentSignerBanners() {
@@ -2486,12 +2784,17 @@
     showSignerErr('');
     syncLibStrokeSetSelect();
     syncCurrentSignerBanners();
+    renderLibSignerQuickPick();
   });
 
   if (libSignerFilter) libSignerFilter.addEventListener('input', function () {
     showSignerErr('');
     syncLibSignerSelect();
     syncCurrentSignerBanners();
+    renderLibSignerQuickPick();
+  });
+  if (libLocaleSelect) libLocaleSelect.addEventListener('change', function () {
+    renderLibLocaleQuickPick();
   });
 
   if (signerPrevBtn) signerPrevBtn.addEventListener('click', function () {
@@ -4842,6 +5145,7 @@
     if (IS_MATERIALS_PAGE) {
       // 素材页：仅同步本页相关的按钮状态
       updateSubmitState();
+      renderLibLocaleQuickPick();
     }
     try {
       window.__SIGN_PAGE_BOOT_OK = true;

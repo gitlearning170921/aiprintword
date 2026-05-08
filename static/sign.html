@@ -126,6 +126,11 @@
       font-size: 1rem;
     }
     .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    select {
+      -webkit-appearance: menulist;
+      appearance: auto;
+      touch-action: manipulation;
+    }
     .hint { font-size: 0.85rem; color: var(--text-muted); margin-top: 6px; }
     .err { color: var(--error); font-size: 0.9rem; margin-top: 8px; }
     .btn-inline-feedback {
@@ -173,6 +178,13 @@
       border-bottom: 2px solid var(--accent);
     }
     .sign-region-desc { color: var(--text-muted); font-size: 0.92rem; margin: 0 0 16px; }
+    @media (max-width: 768px) {
+      select,
+      input[type="search"],
+      input[type="text"] {
+        font-size: 16px !important;
+      }
+    }
   </style>
 </head>
 <body>
