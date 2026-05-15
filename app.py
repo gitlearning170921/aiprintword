@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 import zipfile
+from pathlib import Path
 from queue import Queue, Empty
 from dataclasses import dataclass, field
 from typing import Optional
@@ -116,8 +117,12 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY") or "aiprintword-dev-secret-c
 # Project root
 ROOT = os.path.dirname(os.path.abspath(__file__))
 # 与 /api/aiprintword-build 中 build 字段一致；用于确认 5050 是否加载了当前这份 app.py
-AIPRINTWORD_WEB_BUILD = 6
+AIPRINTWORD_WEB_BUILD = 8
 BATCH_EXPORT_ROOT = os.path.join(ROOT, "data", "batch_exports")
+HANDOFF_DIR = os.path.join(ROOT, "data", "aiword_handoff")
+_HANDOFF_LOCK = threading.Lock()
+_HANDOFF_TTL_SEC = 30 * 60
+_HANDOFF_MAX_BYTES = 80 * 1024 * 1024
 BATCH_HISTORY_ROOT = os.path.join(ROOT, "data", "batch_history")
 _BATCH_EXPORT_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 # 可选：单行口令文件（与 .env 二选一即可，适合服务账号无 .env 拷贝权限时）
@@ -2467,6 +2472,331 @@ def _sign_process_document_bytes(
         return {"ok": False, "error": str(e)}
 
 
+def _aiword_handoff_secret_expected() -> str:
+    v = (os.environ.get("AIWORD_HANDOFF_SECRET") or "").strip()
+    if v:
+        return v
+    try:
+        from runtime_settings.resolve import get_setting
+
+        return (str(get_setting("AIWORD_HANDOFF_SECRET") or "")).strip()
+    except Exception:
+        return ""
+
+
+def _handoff_safe_token(tok: str) -> bool:
+    return bool(tok) and len(tok) <= 64 and re.match(r"^[0-9a-fA-F]+$", tok)
+
+
+def _handoff_validate_reuse_ftp_path(p: str) -> str:
+    """返回规范化后的可复用 FTP 路径；无效则返回空串。"""
+    s = (p or "").strip()
+    if not s or len(s) > 768 or ".." in s:
+        return ""
+    if "\x00" in s or "\r" in s or "\n" in s:
+        return ""
+    if s.startswith("ftp://") or s.startswith("http://") or s.startswith("https://"):
+        return ""
+    return s
+
+
+def _handoff_prune_stale() -> None:
+    """删除过期交接文件（best-effort）。"""
+    if not os.path.isdir(HANDOFF_DIR):
+        return
+    now = time.time()
+    try:
+        for name in os.listdir(HANDOFF_DIR):
+            if not name.endswith(".json"):
+                continue
+            jp = os.path.join(HANDOFF_DIR, name)
+            try:
+                with open(jp, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                exp = float(meta.get("expires_at") or 0)
+                if exp and now > exp + 3600:
+                    tok = meta.get("token") or name[:-5]
+                    for suf in (".json", ".dat"):
+                        p = os.path.join(HANDOFF_DIR, str(tok) + suf)
+                        if os.path.isfile(p):
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+@app.route("/api/handoff", methods=["POST"])
+def api_handoff_create():
+    """
+    aiword 服务端将任务文档 POST 到此接口，换取一次性 token；浏览器再带 token 打开 /sign 或 / 由前端拉取文件。
+    鉴权：请求头 X-Aiword-Handoff-Secret 须与环境变量 AIWORD_HANDOFF_SECRET（或 runtime_settings）一致。
+    若提供 reuse_ftp_path（与 aiword 任务模板同一套 FTP），可不传文件体，由签字端直接登记该路径，避免重复上传。
+    """
+    expected = _aiword_handoff_secret_expected()
+    got = (request.headers.get("X-Aiword-Handoff-Secret") or "").strip()
+    if not expected or got != expected:
+        return jsonify({"ok": False, "error": "未授权或未配置 AIWORD_HANDOFF_SECRET"}), 401
+
+    purpose = (request.form.get("purpose") or "sign").strip().lower()
+    if purpose not in ("sign", "print"):
+        purpose = "sign"
+    filename = (request.form.get("filename") or "document.docx").strip() or "document.docx"
+    reuse_raw = (request.form.get("reuse_ftp_path") or "").strip()
+    reuse_ok = _handoff_validate_reuse_ftp_path(reuse_raw)
+
+    aiword_ctx: dict = {}
+    ctx_raw = (request.form.get("handoff_context") or "").strip()
+    if ctx_raw:
+        try:
+            parsed_ctx = json.loads(ctx_raw)
+        except Exception:
+            parsed_ctx = None
+        if isinstance(parsed_ctx, dict):
+            for k in ("editor", "writer", "reviewer", "approver", "doc_date", "country"):
+                v = parsed_ctx.get(k)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s and len(s) <= 500:
+                    aiword_ctx[k] = s
+
+    token = uuid.uuid4().hex
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+    _handoff_prune_stale()
+    data_path = os.path.join(HANDOFF_DIR, token + ".dat")
+    meta_path = os.path.join(HANDOFF_DIR, token + ".json")
+    expires_at = time.time() + _HANDOFF_TTL_SEC
+
+    if reuse_ok:
+        try:
+            with open(meta_path, "w", encoding="utf-8") as mf:
+                meta_obj: dict = {
+                    "token": token,
+                    "filename": filename,
+                    "purpose": purpose,
+                    "expires_at": expires_at,
+                    "reuse_ftp_path": reuse_ok,
+                }
+                if aiword_ctx:
+                    meta_obj["aiword_context"] = aiword_ctx
+                json.dump(meta_obj, mf, ensure_ascii=False)
+        except OSError as e:
+            return jsonify({"ok": False, "error": f"无法写入交接目录：{e}"}), 500
+        return jsonify({"ok": True, "token": token, "expires_in_sec": _HANDOFF_TTL_SEC, "reuse_ftp": True})
+
+    up = request.files.get("file") or request.files.get("files")
+    if not up or not getattr(up, "filename", None):
+        return jsonify({"ok": False, "error": "缺少文件字段 file"}), 400
+    raw = up.read()
+    if not raw:
+        return jsonify({"ok": False, "error": "文件为空"}), 400
+    if len(raw) > _HANDOFF_MAX_BYTES:
+        return jsonify({"ok": False, "error": "文件过大"}), 400
+
+    try:
+        with open(data_path, "wb") as out:
+            out.write(raw)
+        with open(meta_path, "w", encoding="utf-8") as mf:
+            meta_obj = {
+                "token": token,
+                "filename": filename,
+                "purpose": purpose,
+                "expires_at": expires_at,
+            }
+            if aiword_ctx:
+                meta_obj["aiword_context"] = aiword_ctx
+            json.dump(meta_obj, mf, ensure_ascii=False)
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"无法写入交接目录：{e}"}), 500
+
+    return jsonify({"ok": True, "token": token, "expires_in_sec": _HANDOFF_TTL_SEC})
+
+
+@app.route("/api/handoff/<token>/claim-sign", methods=["POST"])
+def api_handoff_claim_sign(token: str):
+    """浏览器一次性将「FTP 复用」交接登记进签字文件列表，避免先下载再上传导致重复 FTP。"""
+    tok = (token or "").strip()
+    if not _handoff_safe_token(tok):
+        return jsonify({"ok": False, "error": "无效的 token"}), 400
+    meta_path = os.path.join(HANDOFF_DIR, tok + ".json")
+    data_path = os.path.join(HANDOFF_DIR, tok + ".dat")
+    snap: dict = {}
+    with _HANDOFF_LOCK:
+        if not os.path.isfile(meta_path):
+            return jsonify({"ok": False, "error": "交接不存在或已使用"}), 404
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return jsonify({"ok": False, "error": "交接元数据损坏"}), 500
+        if float(meta.get("expires_at") or 0) < time.time():
+            try:
+                if os.path.isfile(data_path):
+                    os.remove(data_path)
+                os.remove(meta_path)
+            except OSError:
+                pass
+            return jsonify({"ok": False, "error": "交接已过期"}), 410
+        reuse_p = (meta.get("reuse_ftp_path") or "").strip()
+        if not reuse_p:
+            return jsonify({"ok": False, "error": "not_reuse", "detail": "请改用下载交接文件"}), 400
+        if (meta.get("purpose") or "sign") != "sign":
+            return jsonify({"ok": False, "error": "非签字交接"}), 400
+        fname = (meta.get("filename") or "document.docx").strip() or "document.docx"
+        ac = meta.get("aiword_context")
+        ctx_out: dict = {}
+        if isinstance(ac, dict):
+            ctx_out = dict(ac)
+        snap = {"reuse_p": reuse_p, "fname": fname, "ctx": ctx_out}
+
+    fname = snap["fname"]
+    reuse_p = snap["reuse_p"]
+    ctx_out = snap.get("ctx") or {}
+
+    ext = os.path.splitext(fname)[1].lower() or ".docx"
+    if ext not in SIGN_ALLOWED_EXT:
+        return jsonify({"ok": False, "error": f"不支持的扩展名：{ext}"}), 400
+
+    file_id = uuid.uuid4().hex
+    try:
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            cur_n = mysql_store.count_files()
+            _max_f = _sign_mysql_max_files()
+            if cur_n + 1 > _max_f:
+                return jsonify({"ok": False, "error": f"文件数已达上限 {_max_f}"}), 400
+            mysql_store.insert_file_from_external_ftp(file_id, fname, ext, reuse_p)
+            last_rec = {"id": file_id, "name": fname, "ext": ext}
+            out = {
+                "ok": True,
+                "file": last_rec,
+                "files": mysql_store.list_files(),
+                "context": ctx_out,
+            }
+        else:
+            from ftp_store import download_bytes
+
+            raw = download_bytes(reuse_p)
+            if not raw:
+                return jsonify({"ok": False, "error": "FTP 下载结果为空"}), 502
+            sid, inbox_dir = _sign_ensure_session_inbox()
+            # 无 MySQL：同任务多次「去签字」会重复追加同名文件；去掉旧同名条仅保留本次
+            fname_norm = (fname or "").strip()
+            prev = list(session.get("sign_files") or [])
+            kept = []
+            for old in prev:
+                oname = ((old or {}).get("name") or "").strip()
+                if fname_norm and oname == fname_norm:
+                    oid = (old or {}).get("id")
+                    if oid:
+                        _sign_remove_disk_files_for_id(sid, str(oid), (old or {}).get("ext"))
+                    continue
+                kept.append(old)
+            if len(kept) >= SIGN_MAX_SAVED_FILES:
+                return jsonify({"ok": False, "error": f"文件数已达上限 {SIGN_MAX_SAVED_FILES}"}), 400
+            last_rec = {"id": file_id, "name": fname, "ext": ext}
+            kept.append(last_rec)
+            records = kept
+            dest = os.path.join(inbox_dir, file_id + ext)
+            with open(dest, "wb") as fp:
+                fp.write(raw)
+            session["sign_files"] = records
+            session.modified = True
+            out = {"ok": True, "file": last_rec, "files": records, "context": ctx_out}
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    with _HANDOFF_LOCK:
+        try:
+            if os.path.isfile(data_path):
+                os.remove(data_path)
+            if os.path.isfile(meta_path):
+                os.remove(meta_path)
+        except OSError:
+            pass
+    return jsonify(out)
+
+
+@app.route("/api/handoff/<token>/file", methods=["GET"])
+def api_handoff_download(token: str):
+    """一次性下载：返回文件流后立即删除交接文件。支持仅 meta + reuse_ftp_path（无 .dat）时从 FTP 拉流。"""
+    tok = (token or "").strip()
+    if not _handoff_safe_token(tok):
+        return jsonify({"ok": False, "error": "无效的 token"}), 400
+    meta_path = os.path.join(HANDOFF_DIR, tok + ".json")
+    data_path = os.path.join(HANDOFF_DIR, tok + ".dat")
+    meta: dict = {}
+    blob: bytes = b""
+    fname = "document.docx"
+    with _HANDOFF_LOCK:
+        if not os.path.isfile(meta_path):
+            return jsonify({"ok": False, "error": "交接不存在或已使用"}), 404
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return jsonify({"ok": False, "error": "交接元数据损坏"}), 500
+        if float(meta.get("expires_at") or 0) < time.time():
+            try:
+                if os.path.isfile(data_path):
+                    os.remove(data_path)
+                os.remove(meta_path)
+            except OSError:
+                pass
+            return jsonify({"ok": False, "error": "交接已过期"}), 410
+        fname = (meta.get("filename") or "document.docx").strip() or "document.docx"
+        reuse_p = (meta.get("reuse_ftp_path") or "").strip()
+        if reuse_p:
+            try:
+                from ftp_store import download_bytes
+
+                blob = download_bytes(reuse_p)
+            except Exception as e:
+                try:
+                    os.remove(meta_path)
+                except OSError:
+                    pass
+                return jsonify({"ok": False, "error": f"FTP 读取失败：{e}"}), 502
+        else:
+            if not os.path.isfile(data_path):
+                return jsonify({"ok": False, "error": "交接不存在或已使用"}), 404
+            try:
+                blob = Path(data_path).read_bytes()
+            except OSError as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+        try:
+            if os.path.isfile(data_path):
+                os.remove(data_path)
+            os.remove(meta_path)
+        except OSError:
+            pass
+
+    from urllib.parse import quote
+
+    safe = os.path.basename(fname.replace("\\", "/")) or "document.docx"
+    disp = f"attachment; filename*=UTF-8''{quote(safe)}"
+    hdrs = {"Content-Disposition": disp}
+    ctx_out = meta.get("aiword_context") if isinstance(meta, dict) else None
+    if isinstance(ctx_out, dict) and ctx_out:
+        try:
+            b64 = base64.b64encode(json.dumps(ctx_out, ensure_ascii=False).encode("utf-8")).decode("ascii")
+            if len(b64) <= 6144:
+                hdrs["X-Aiword-Handoff-Context"] = b64
+        except Exception:
+            pass
+    return Response(
+        blob,
+        mimetype="application/octet-stream",
+        headers=hdrs,
+    )
+
+
 @app.route("/sign")
 def sign_page():
     """Serve online signature page (default: file signing)."""
@@ -3500,6 +3830,9 @@ def api_sign_file_role_map_put(file_id):
 
         local_set_map(SIGN_INBOX_ROOT, sid, file_id, clean)
         return jsonify({"ok": True, "map": local_get_map(SIGN_INBOX_ROOT, sid, file_id)})
+    except ValueError as e:
+        # set_file_role_signer_map：拼接日期缺少签名/日期、或日期格式非法
+        return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

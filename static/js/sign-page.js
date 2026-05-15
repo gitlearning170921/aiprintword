@@ -1,6 +1,10 @@
 /* 在线签名页逻辑；由 sign.html 以 <script src> 引入，勿在聊天里复制粘贴覆盖 */
 (function () {
   'use strict';
+  // 供 sign_file.html 的 watchSignBoot 区分「脚本未加载」与「异步初始化仍在进行」
+  try {
+    window.__SIGN_PAGE_JS_EXECUTED = true;
+  } catch (_) {}
 
   // 兼容部分老旧移动端 WebView：避免 Object.assign / Array.from 缺失导致整页脚本中断。
   if (!Object.assign) {
@@ -245,6 +249,10 @@
         var src = (ev && ev.filename) ? String(ev.filename).split('/').pop() : '';
         var ln = (ev && ev.lineno) ? String(ev.lineno) : '';
         b.textContent = '前端脚本异常：' + msg + (src ? ' @' + src : '') + (ln ? ':' + ln : '');
+        try {
+          var m = document.getElementById('aiwordHandoffLoadingMask');
+          if (m) m.classList.remove('show');
+        } catch (_) {}
       } catch (_) {}
     });
     window.addEventListener('unhandledrejection', function (ev) {
@@ -254,6 +262,10 @@
         b.style.display = 'block';
         var reason = (ev && ev.reason) ? String(ev.reason.message || ev.reason) : 'Promise 未处理异常';
         b.textContent = '前端脚本异常：' + reason;
+        try {
+          var m = document.getElementById('aiwordHandoffLoadingMask');
+          if (m) m.classList.remove('show');
+        } catch (_) {}
       } catch (_) {}
     });
   }
@@ -563,6 +575,15 @@
   var detectRequestSeq = 0;
   /** 交错请求时仅「当前这一轮」结束才清除 detectInFlightFor，避免长时间运行后按钮/状态卡死 */
   var detectEpoch = 0;
+  /** aiword 交接透传的编审批/日期（handoff 响应头 JSON），用于首文件识别后预填签署人 */
+  var __aiwordHandoffCtx = null;
+  var __aiwordHandoffTargetFileId = null;
+  /** aiword 首入：推迟一次自动识别，避免列表刚写入时与首次 detect 竞态导致识别不准 */
+  var __aiwordDeferDetectFileId = null;
+  /** aiword 交接后 detect 失败时的剩余重试次数（由 kickoff 传入） */
+  var __aiwordHandoffDetectRetries = 3;
+  /** aiword 首次自动识别后再做一次“等效手动重识别”，提高稳定性（fileId -> bool）。 */
+  var __aiwordHandoffAutoRedetectDoneFor = {};
   var currentRoleMap = {};
   var signersList = [];
   var signersDbShare = false;
@@ -575,6 +596,8 @@
   var signedListPageSize = 10;
   var signedListQ = '';
   var strokeItemPage = 1;
+  /** 并发 refreshFileList 时忽略过期响应，避免列表一直停在「正在加载…」 */
+  var _fileListRefreshGen = 0;
   // 已存储签字图片：默认 3 条/页（可翻页）
   var strokeItemPageSize = 3;
   var strokeItemQ = '';
@@ -1988,7 +2011,38 @@
         }
       });
     });
+    // aiword 交接场景：任务只建模 编制/审核/批准，executor / reviewer_tail
+    // 即便 detect 误命中（如「经手人 / 检验人」关键词）也不展示，避免出现“多余”签字位。
+    if (_isFromAiwordHandoff()) {
+      out = out.filter(function (r) {
+        return r && r.id !== 'executor' && r.id !== 'reviewer_tail';
+      });
+    }
     return out;
+  }
+
+  function _isFromAiwordHandoff() {
+    try {
+      return !!(document.body && document.body.classList.contains('from-aiword'));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function _hideAiwordHandoffLoadingMask() {
+    try {
+      var el = document.getElementById('aiwordHandoffLoadingMask');
+      if (el) el.classList.remove('show');
+    } catch (_) {}
+  }
+
+  function _setAiwordHandoffLoadingText(title, sub) {
+    try {
+      var t = document.getElementById('aiwordHandoffLoadingTitle');
+      if (t && title) t.textContent = title;
+      var s = document.getElementById('aiwordHandoffLoadingSub');
+      if (s && sub) s.textContent = sub;
+    } catch (_) {}
   }
 
   function _parseBlockSourceOrder(hint) {
@@ -3848,21 +3902,29 @@
       });
       delBtn.addEventListener('click', function () {
         withButtonBusy(delBtn, '删除中…', function () {
-          return fetchJson(apiUrl('/api/sign/files/' + rec.id), { method: 'DELETE' }).then(
-            function (result) {
-              var j = result.data;
-              if (!j.ok) {
-                setFileListActionFeedback(j.error || '删除失败', true);
-                return;
-              }
-              setFileListActionFeedback('', false);
-              savedFiles = j.files || [];
-              if (selectedFileId === rec.id) {
-                selectedFileId = null;
-              }
-              renderFileList();
+          return fetchJson(apiUrl('/api/sign/files/' + rec.id), { method: 'DELETE' }).then(function (
+            result
+          ) {
+            var j = result.data;
+            if (!j.ok) {
+              setFileListActionFeedback(j.error || '删除失败', true);
+              return;
             }
-          );
+            setFileListActionFeedback('', false);
+            if (
+              __aiwordHandoffTargetFileId != null &&
+              String(__aiwordHandoffTargetFileId) === String(rec.id)
+            ) {
+              clearAiwordHandoffState();
+            }
+            if (selectedFileId === rec.id) {
+              selectedFileId = null;
+            }
+            return refreshFileList().catch(function () {
+              savedFiles = j.files || [];
+              renderFileList();
+            });
+          });
         }).catch(function (e) {
           setFileListActionFeedback(e.message || String(e), true);
         });
@@ -3885,7 +3947,17 @@
     // 首次进入页面：仅首次选中时自动识别；若曾识别过（缓存里有标记），不再自动识别
     if (sid) {
       var st = fileUiCache[sid] || {};
-      if (!st.detectedOnce) {
+      var deferAi =
+        typeof __aiwordDeferDetectFileId !== 'undefined' &&
+        __aiwordDeferDetectFileId != null &&
+        String(__aiwordDeferDetectFileId) === String(sid);
+      if (deferAi) {
+        __aiwordDeferDetectFileId = null;
+        setTimeout(function () {
+          if (String(selectedFileId) !== String(sid)) return;
+          kickoffAiwordHandoffPipeline(sid);
+        }, 520);
+      } else if (!st.detectedOnce) {
         detectAndAutoSelectRoles(sid);
       } else {
         // 有缓存则恢复；并刷新 role-map
@@ -4532,10 +4604,16 @@
   }
 
   function refreshFileList() {
-    if (!IS_FILE_SIGN_PAGE || !fileListEl || !listHint) return;
+    if (!IS_FILE_SIGN_PAGE || !fileListEl || !listHint) {
+      return Promise.resolve();
+    }
+    var myGen = ++_fileListRefreshGen;
     showFileListLoading();
-    fetchJson(apiUrl('/api/sign/files'))
+    return fetchJson(apiUrl('/api/sign/files'))
       .then(function (result) {
+        if (myGen !== _fileListRefreshGen) {
+          return;
+        }
         var j = result.data;
         if (!j.ok || !Array.isArray(j.files)) {
           savedFiles = [];
@@ -4547,14 +4625,20 @@
           return;
         }
         savedFiles = j.files;
-        if (selectedFileId && !savedFiles.some(function (f) {
-          return f.id === selectedFileId;
-        })) {
+        if (
+          selectedFileId &&
+          !savedFiles.some(function (f) {
+            return f.id === selectedFileId;
+          })
+        ) {
           selectedFileId = null;
         }
         renderFileList();
       })
       .catch(function (e) {
+        if (myGen !== _fileListRefreshGen) {
+          return;
+        }
         savedFiles = [];
         if (selectedFileId) selectedFileId = null;
         renderFileList();
@@ -4579,7 +4663,383 @@
     });
   }
 
-  function detectAndAutoSelectRoles(fileId) {
+  function _decodeHandoffCtxB64(b64) {
+    if (!b64 || typeof b64 !== 'string') return null;
+    try {
+      var raw = atob(b64.replace(/\s+/g, ''));
+      var len = raw.length;
+      var bytes = new Uint8Array(len);
+      for (var i = 0; i < len; i++) {
+        bytes[i] = raw.charCodeAt(i) & 0xff;
+      }
+      var txt;
+      try {
+        if (typeof TextDecoder !== 'undefined') {
+          txt = new TextDecoder('utf-8').decode(bytes);
+        } else {
+          var bin = '';
+          for (var k = 0; k < len; k++) {
+            bin += String.fromCharCode(bytes[k]);
+          }
+          txt = decodeURIComponent(escape(bin));
+        }
+      } catch (_) {
+        return null;
+      }
+      var o = JSON.parse(txt);
+      return typeof o === 'object' && o ? o : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function _normSignerHint(s) {
+    var x = String(s || '')
+      .replace(/（[^）]*）/g, '')
+      .replace(/\([^)]*\)/g, '')
+      .replace(/[\/／、，,;；|]+/g, ' ')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '');
+    return x;
+  }
+
+  function _signerMatchTokens(hint) {
+    var raw = String(hint || '').trim();
+    if (!raw) return [];
+    var parts = raw.split(/[\/／、，,;；|]+/).map(function (p) {
+      return _normSignerHint(p);
+    });
+    var out = [];
+    var seen = {};
+    parts.forEach(function (p) {
+      if (p && !seen[p]) {
+        seen[p] = true;
+        out.push(p);
+      }
+    });
+    var whole = _normSignerHint(raw);
+    if (whole && !seen[whole]) {
+      out.unshift(whole);
+    }
+    return out;
+  }
+
+  function _findSignerByNameHint(hint) {
+    if (!hint || !signersList || !signersList.length) return null;
+    var tokens = _signerMatchTokens(hint);
+    if (!tokens.length) return null;
+    var i;
+    var k;
+    for (k = 0; k < tokens.length; k++) {
+      var t = tokens[k];
+      if (!t) continue;
+      for (i = 0; i < signersList.length; i++) {
+        var s = signersList[i];
+        var nm = _normSignerHint(s && s.name);
+        if (nm && nm === t) return s;
+      }
+    }
+    for (k = 0; k < tokens.length; k++) {
+      t = tokens[k];
+      if (!t) continue;
+      for (i = 0; i < signersList.length; i++) {
+        s = signersList[i];
+        nm = _normSignerHint(s && s.name);
+        if (nm && (nm.indexOf(t) >= 0 || t.indexOf(nm) >= 0)) return s;
+      }
+    }
+    return null;
+  }
+
+  /** 将任务日期统一为 YYYY-MM-DD，供 date_iso 与正则使用 */
+  function _parseAiwordDocDateIso(s) {
+    var t = String(s || '').trim();
+    if (!t) return '';
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
+    if (m) return t;
+    m = /^(\d{4})[/.](\d{1,2})[/.](\d{1,2})$/.exec(t);
+    if (m) {
+      var y = m[1];
+      var mo = ('0' + m[2]).slice(-2);
+      var d = ('0' + m[3]).slice(-2);
+      return y + '-' + mo + '-' + d;
+    }
+    m = /^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?$/.exec(t);
+    if (m) {
+      var y2 = m[1];
+      var mo2 = ('0' + m[2]).slice(-2);
+      var d2 = ('0' + m[3]).slice(-2);
+      return y2 + '-' + mo2 + '-' + d2;
+    }
+    return '';
+  }
+
+  function _firstStrokeId(signer, kind, preferredLocale) {
+    if (!signer) return '';
+    var arr = kind === 'date' ? signer.date_items || [] : signer.sig_items || [];
+    if (!arr.length || !arr[0]) return '';
+    var pl =
+      preferredLocale === 'en' || preferredLocale === 'zh' ? preferredLocale : null;
+    if (pl) {
+      for (var i = 0; i < arr.length; i++) {
+        var it = arr[i] || {};
+        if ((it.locale || 'zh') === pl) {
+          return String(it.id || '');
+        }
+      }
+    }
+    return String(arr[0].id || '');
+  }
+
+  function _isLikelyEnglishCountry(s) {
+    var raw = String(s || '').trim();
+    if (!raw) return false; // 业务规则：未指明注册国家时，默认中文拼接
+    // 含中文字符（如「中国 / 中華人民共和国 / 中国 NMPA」）=> 中文
+    if (/[\u4e00-\u9fff]/.test(raw)) return false;
+    var t = raw.toLowerCase();
+    if (t.indexOf('nmpa') >= 0 || t.indexOf('china') >= 0) return false;
+    return true;
+  }
+
+  /** aiword 入口：按项目注册国家默认「签字版本」（各角色 loc + 素材库 libLocale） */
+  function applyAiwordHandoffSignLocaleDefaults(ctx) {
+    if (!_isFromAiwordHandoff()) return;
+    var c = ctx && typeof ctx === 'object' ? ctx : {};
+    var loc = _isLikelyEnglishCountry(c.country != null ? c.country : '') ? 'en' : 'zh';
+    try {
+      ROLES.forEach(function (r) {
+        if (!r || !r.id) return;
+        roleLocaleMap[r.id] = loc;
+      });
+    } catch (_) {}
+    try {
+      if (libLocaleSelect) {
+        libLocaleSelect.value = loc;
+        if (typeof renderLibLocaleQuickPick === 'function') {
+          renderLibLocaleQuickPick();
+        }
+      }
+    } catch (_) {}
+  }
+
+  function clearAiwordHandoffState() {
+    __aiwordHandoffCtx = null;
+    __aiwordHandoffTargetFileId = null;
+    __aiwordDeferDetectFileId = null;
+    _hideAiwordHandoffLoadingMask();
+  }
+
+  function aiwordRolesFromCtx(ctx) {
+    var ids = [];
+    if (!ctx || typeof ctx !== 'object') return ids;
+    var w = String(ctx.writer != null ? ctx.writer : '').trim();
+    var e = String(ctx.editor != null ? ctx.editor : '').trim();
+    if (w || e) {
+      ids.push('author');
+      ids.push('executor');
+    }
+    if (String(ctx.reviewer != null ? ctx.reviewer : '').trim()) ids.push('reviewer');
+    if (String(ctx.approver != null ? ctx.approver : '').trim()) ids.push('approver');
+    return ids;
+  }
+
+  function applyAiwordRoleChecksFromCtx(ctx) {
+    // 按用户要求：签字位必须先由文档 detect 命中，再展示/自动勾选；
+    // 因此 aiword 上下文不再直接驱动角色勾选。
+    return;
+  }
+
+  function aiwordHandoffActiveRoleIds(ctx) {
+    var active = [];
+    var seen = {};
+    function add(rid) {
+      if (!rid || seen[rid]) return;
+      seen[rid] = true;
+      active.push(rid);
+    }
+    // 仅以 detect 命中角色为准，不再把 aiword 上下文角色并入 active。
+    mergeDetectedRolesForUi().forEach(function (x) {
+      add(x && x.id);
+    });
+    return active;
+  }
+
+  function registerAiwordHandoffFile(fid, ctxObj, filesOpt) {
+    var rawCtx = ctxObj && typeof ctxObj === 'object' ? ctxObj : null;
+    if (rawCtx && rawCtx.docDate != null && rawCtx.doc_date == null) {
+      rawCtx = Object.assign({}, rawCtx, { doc_date: rawCtx.docDate });
+    }
+    var hasAnyHint =
+      rawCtx &&
+      (String(rawCtx.editor || '').trim() ||
+        String(rawCtx.writer || '').trim() ||
+        String(rawCtx.reviewer || '').trim() ||
+        String(rawCtx.approver || '').trim() ||
+        String(rawCtx.doc_date || '').trim() ||
+        String(rawCtx.country || '').trim());
+    selectedFileId = fid;
+    if (Array.isArray(filesOpt) && filesOpt.length) {
+      savedFiles = filesOpt;
+    }
+    __aiwordHandoffCtx = hasAnyHint ? rawCtx : null;
+    __aiwordHandoffTargetFileId = hasAnyHint && fid ? fid : null;
+    __aiwordDeferDetectFileId = fid || null;
+    if (fid) {
+      __aiwordHandoffAutoRedetectDoneFor[String(fid)] = false;
+    }
+    try {
+      if (document.body && document.body.classList.contains('from-aiword')) {
+        applyAiwordHandoffSignLocaleDefaults(rawCtx || {});
+      }
+    } catch (_) {}
+  }
+
+  function kickoffAiwordHandoffPipeline(fileId) {
+    if (!fileId) return;
+    if (!fileUiCache[fileId]) {
+      fileUiCache[fileId] = {};
+    }
+    fileUiCache[fileId].detectedOnce = false;
+    detectAndAutoSelectRoles(fileId, __aiwordHandoffDetectRetries);
+  }
+
+  function scheduleAiwordHandoffHintsAfterDetect(fileId) {
+    if (!__aiwordHandoffCtx || fileId == null || __aiwordHandoffTargetFileId == null) {
+      return Promise.resolve();
+    }
+    if (String(fileId) !== String(__aiwordHandoffTargetFileId)) {
+      return Promise.resolve();
+    }
+    var ctxSnap = null;
+    try {
+      ctxSnap = JSON.parse(JSON.stringify(__aiwordHandoffCtx));
+    } catch (_) {
+      ctxSnap = __aiwordHandoffCtx;
+    }
+    if (!ctxSnap || typeof ctxSnap !== 'object') {
+      return Promise.resolve();
+    }
+    return refreshSigners()
+      .then(function () {
+        if (String(selectedFileId) !== String(fileId)) return;
+        return applyAiwordHandoffHintsOnce(fileId, ctxSnap).then(function () {
+          setNeedSignActionFeedback('');
+        });
+      })
+      .catch(function () {})
+      .then(function () {
+        clearAiwordHandoffState();
+      });
+  }
+
+  function applyAiwordHandoffHintsOnce(fileId, ctxOpt) {
+    var ctx =
+      ctxOpt && typeof ctxOpt === 'object' ? ctxOpt : __aiwordHandoffCtx;
+    if (!ctx || fileId == null) {
+      return Promise.resolve();
+    }
+    if (String(selectedFileId) !== String(fileId)) {
+      return Promise.resolve();
+    }
+    var writerHint = String(ctx.writer != null ? ctx.writer : '').trim();
+    var editorHint = String(ctx.editor != null ? ctx.editor : '').trim();
+    // 编写人员匹配：先用「体现编写人员」（多为中文姓名，更易命中签名库），
+    // 找不到再回退到 author（拼音/原名）。
+    var compileHint = editorHint || writerHint;
+    var compileHintAlt = writerHint && writerHint !== compileHint ? writerHint : '';
+    var hintMap = {
+      author: compileHint,
+      reviewer: String(ctx.reviewer != null ? ctx.reviewer : '').trim(),
+      approver: String(ctx.approver != null ? ctx.approver : '').trim(),
+    };
+    var hintMapAlt = {
+      author: compileHintAlt,
+    };
+    var active = aiwordHandoffActiveRoleIds(ctx);
+    if (!active.length) {
+      return Promise.resolve();
+    }
+
+    var docDate = _parseAiwordDocDateIso(ctx.doc_date != null ? ctx.doc_date : '');
+    var isoOk = !!docDate;
+    var useEnDate = _isLikelyEnglishCountry(ctx.country);
+    var preferredDateMode = useEnDate ? 'composite_en_space' : 'composite_zh_ymd';
+    var wantStrokeLocale = useEnDate ? 'en' : 'zh';
+    try {
+      if (_isFromAiwordHandoff()) {
+        applyAiwordHandoffSignLocaleDefaults(ctx);
+      }
+    } catch (_) {}
+
+    var nextMap = Object.assign({}, currentRoleMap || {});
+    var touched = false;
+
+    function _resolveSigner(rid) {
+      var hint = hintMap[rid];
+      var alt = hintMapAlt[rid] || '';
+      var signer = hint ? _findSignerByNameHint(hint) : null;
+      if (!signer && alt) signer = _findSignerByNameHint(alt);
+      return { hint: hint || alt, signer: signer };
+    }
+
+    ['author', 'reviewer', 'approver'].forEach(function (rid) {
+      if (active.indexOf(rid) < 0) return;
+      var resolved = _resolveSigner(rid);
+      var hint = resolved.hint;
+      var signer = resolved.signer;
+      var p =
+        nextMap[rid] && typeof nextMap[rid] === 'object' ? Object.assign({}, nextMap[rid]) : {};
+      if (signer) {
+        var sigId = _firstStrokeId(signer, 'sig', wantStrokeLocale);
+        if (sigId && !p.sig) p.sig = sigId;
+        // 未启用 MySQL（不能用 composite 拼接）时，仍按签署人的「整张日期手写图」
+        // 兜底为日期，避免日期下拉为空。
+        var dItemId = _firstStrokeId(signer, 'date', wantStrokeLocale);
+        if (dItemId && !p.date) p.date = dItemId;
+        var fq = _ensureRoleFilterState(rid);
+        if (hint) fq.sig = hint;
+        fq.date = (signer && signer.id) || fq.date || '';
+      }
+      // 拼接日期（composite_*）：后端强校验 sig + date_iso 必须同时存在，否则抛错 500。
+      // 因此仅当已匹配到签名素材 p.sig 时才写 date_mode；否则只保留 item 日期或等用户选素材后再拼接。
+      if (isoOk && signersDbShare && p.sig) {
+        p.date_mode = preferredDateMode;
+        p.date_iso = docDate;
+      } else if (isoOk && !signersDbShare) {
+        p.date_iso = docDate;
+      }
+      if (roleMapEntryNonEmpty(p)) {
+        nextMap[rid] = p;
+        touched = true;
+      }
+    });
+
+    if (!touched) {
+      renderNeedSignTable();
+      updateSubmitState();
+      return Promise.resolve();
+    }
+
+    return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map'), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ map: nextMap }),
+    })
+      .then(function (r) {
+        if (String(selectedFileId) !== String(fileId)) return;
+        var jj = r.data || {};
+        if (!jj.ok) return;
+        currentRoleMap = jj.map || nextMap;
+        cachePatchCurrentRoleMap(fileId, currentRoleMap);
+        renderNeedSignTable();
+        updateSubmitState();
+      })
+      .catch(function () {});
+  }
+
+  function detectAndAutoSelectRoles(fileId, retryLeft) {
+    retryLeft = typeof retryLeft === 'number' ? retryLeft : 0;
     if (!fileId) return false;
     if (String(detectInFlightFor) === String(fileId)) return false;
     detectInFlightFor = fileId;
@@ -4593,7 +5053,14 @@
     redetectRolesBtn.innerHTML =
       '<span class="spinner" aria-hidden="true"></span> 分析中…';
     needSignTable.innerHTML = '';
-    needSignTable.textContent = '正在分析模板与角色映射…';
+    needSignTable.textContent =
+      retryLeft < __aiwordHandoffDetectRetries
+        ? '正在分析模板与角色映射（重试 ' +
+          (__aiwordHandoffDetectRetries - retryLeft) +
+          '/' +
+          __aiwordHandoffDetectRetries +
+          '）…'
+        : '正在分析模板与角色映射…';
     fetchJson(apiUrl('/api/sign/detect?file_id=' + encodeURIComponent(fileId)))
       .then(function (result) {
         if (String(selectedFileId) !== String(fileId)) {
@@ -4608,27 +5075,42 @@
           lastDetectData = null;
           lastDetectFileId = null;
           lastDetectError = (j && j.error) || '识别接口返回失败';
+          if (
+            retryLeft > 0 &&
+            __aiwordHandoffTargetFileId != null &&
+            String(fileId) === String(__aiwordHandoffTargetFileId)
+          ) {
+            var delayMs = 450 + (__aiwordHandoffDetectRetries - retryLeft) * 400;
+            setTimeout(function () {
+              if (String(selectedFileId) !== String(fileId)) return;
+              if (myEpoch !== detectEpoch) return;
+              detectInFlightFor = null;
+              detectAndAutoSelectRoles(fileId, retryLeft - 1);
+            }, delayMs);
+            return { __retrying: true, __abort: true };
+          }
         }
-        // 标记：该文件已执行过识别（不论成功/失败），后续切换不再自动识别
         cacheMarkDetected(fileId);
+        var roles = [];
         if (j.ok) {
-          var roles = mergeDetectedRolesForUi();
+          roles = mergeDetectedRolesForUi();
           if (roles.length) {
             roles.forEach(function (r) {
               if (r && r.id) setRoleChecked(r.id, true);
             });
-            requestAnimationFrame(function () {
-              requestAnimationFrame(function () {
-                resizeCanvasesForRoles(
-                  roles
-                    .map(function (x) {
-                      return x && x.id;
-                    })
-                    .filter(Boolean)
-                );
-              });
-            });
           }
+        }
+        var resizeIds = roles
+          .map(function (x) {
+            return x && x.id;
+          })
+          .filter(Boolean);
+        if (resizeIds.length) {
+          requestAnimationFrame(function () {
+            requestAnimationFrame(function () {
+              resizeCanvasesForRoles(resizeIds);
+            });
+          });
         }
         return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map')).then(function (rm) {
           if (String(selectedFileId) !== String(fileId)) {
@@ -4642,20 +5124,36 @@
         });
       })
       .then(function (pack) {
-        if (pack && pack.__abort) return;
+        if (pack && (pack.__abort || pack.__retrying)) return;
         renderNeedSignTable();
         updateSubmitState();
+        return scheduleAiwordHandoffHintsAfterDetect(fileId);
       })
       .catch(function (err) {
-        if (String(selectedFileId) === String(fileId)) {
-          lastDetectData = null;
-          lastDetectFileId = null;
-          lastDetectError =
-            (err && err.message) ||
-            '识别请求失败（网络或服务异常）。请稍后重试「重新识别」。';
-          renderNeedSignTable();
-          updateSubmitState();
+        if (String(selectedFileId) !== String(fileId)) return;
+        if (
+          retryLeft > 0 &&
+          __aiwordHandoffTargetFileId != null &&
+          String(fileId) === String(__aiwordHandoffTargetFileId)
+        ) {
+          var delayMs2 = 450 + (__aiwordHandoffDetectRetries - retryLeft) * 400;
+          setTimeout(function () {
+            if (String(selectedFileId) !== String(fileId)) return;
+            if (myEpoch !== detectEpoch) return;
+            detectInFlightFor = null;
+            detectAndAutoSelectRoles(fileId, retryLeft - 1);
+          }, delayMs2);
+          return;
         }
+        lastDetectData = null;
+        lastDetectFileId = null;
+        lastDetectError =
+          (err && err.message) ||
+          '识别请求失败（网络或服务异常）。请稍后重试「重新识别」。';
+        cacheMarkDetected(fileId);
+        renderNeedSignTable();
+        updateSubmitState();
+        return scheduleAiwordHandoffHintsAfterDetect(fileId);
       })
       .then(function () {
         if (myEpoch === detectEpoch) {
@@ -5129,27 +5627,204 @@
       });
   });
 
+  function maybeApplyAiwordHandoffFromQuery() {
+    if (!IS_FILE_SIGN_PAGE) return Promise.resolve();
+    try {
+      var sp = new URLSearchParams(window.location.search || '');
+      if ((sp.get('from') || '').toLowerCase() !== 'aiword') {
+        return Promise.resolve();
+      }
+      try {
+        document.body.classList.add('from-aiword');
+      } catch (_) {}
+      var token = (sp.get('handoff_token') || '').trim();
+      if (!token) return Promise.resolve();
+
+      return fetchJson(apiUrl('/api/handoff/' + encodeURIComponent(token) + '/claim-sign'), {
+        method: 'POST',
+        credentials: 'same-origin',
+      })
+        .then(function (claimRes) {
+          var j = claimRes.data || {};
+          if (j.ok && j.file && j.file.id) {
+            setSaveUploadFeedback('');
+            registerAiwordHandoffFile(j.file.id, j.context, j.files);
+            pendingSignFiles = [];
+            if (fileInput) fileInput.value = '';
+            if (dirInput) dirInput.value = '';
+            if (fileHint) {
+              fileHint.textContent = '已从 aiword 登记文件（复用 FTP），可在下方继续签字';
+            }
+            if (saveBtn) saveBtn.disabled = true;
+            setNeedSignActionFeedback('正在自动识别签字位并匹配编写/审核/批准人员，请稍候…');
+            return refreshFileList().then(function () {
+              try {
+                if (window.history && window.history.replaceState) {
+                  window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+                }
+              } catch (_) {}
+              return { __handoff_done: true };
+            });
+          }
+          return fetch(apiUrl('/api/handoff/' + encodeURIComponent(token) + '/file'), {
+            credentials: 'same-origin',
+          }).then(function (r) {
+            var ctxHdr = (
+              r.headers.get('X-Aiword-Handoff-Context') ||
+              r.headers.get('x-aiword-handoff-context') ||
+              ''
+            ).trim();
+            var parsedCtx = _decodeHandoffCtxB64(ctxHdr);
+            if (!r.ok) {
+              return r.text().then(function (t) {
+                throw new Error(
+                  '交接文件获取失败（HTTP ' +
+                    r.status +
+                    '）' +
+                    (t ? '：' + String(t).slice(0, 200) : '')
+                );
+              });
+            }
+            var cd = r.headers.get('Content-Disposition') || '';
+            return r.blob().then(function (blob) {
+              return { blob: blob, cd: cd, ctx: parsedCtx };
+            });
+          });
+        })
+        .then(function (o) {
+          if (o && o.__handoff_done) {
+            return;
+          }
+          if (!o || !o.blob) {
+            return;
+          }
+          var blob = o.blob;
+          var cd = o.cd;
+          var name = 'document.docx';
+          var m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
+          if (m) {
+            try {
+              name = decodeURIComponent(m[1].replace(/['"]/g, ''));
+            } catch (_) {
+              name = m[1];
+            }
+          }
+          var F = window.File;
+          if (!F) throw new Error('浏览器不支持 File 构造');
+          var file = new F([blob], name, { type: blob.type || 'application/octet-stream' });
+          mergePendingSignFiles(filterSignFiles([file]));
+          updatePendingHint();
+          if (!pendingSignFiles.length) {
+            throw new Error('交接文件不是可签名的 .docx / .xlsx');
+          }
+          var form = new FormData();
+          pendingSignFiles.forEach(function (f) {
+            var n =
+              f.webkitRelativePath && String(f.webkitRelativePath).length
+                ? f.webkitRelativePath
+                : f.name;
+            form.append('files', f, n);
+          });
+          return fetchJson(apiUrl('/api/sign/upload'), { method: 'POST', body: form }).then(function (result) {
+            var jj = result.data;
+            if (!jj || !jj.ok) {
+              throw new Error((jj && jj.error) || '保存到列表失败');
+            }
+            setSaveUploadFeedback('');
+            var files = jj.files || [];
+            var fid =
+              (jj.file && jj.file.id) || (files.length ? files[files.length - 1].id : null) || null;
+            var ctxObj = o.ctx && typeof o.ctx === 'object' ? o.ctx : null;
+            registerAiwordHandoffFile(fid, ctxObj, files);
+            pendingSignFiles = [];
+            if (fileInput) fileInput.value = '';
+            if (dirInput) dirInput.value = '';
+            if (fileHint) {
+              fileHint.textContent = '已从 aiword 传入并保存，可在下方选择文件继续签字';
+            }
+            if (saveBtn) saveBtn.disabled = true;
+            setNeedSignActionFeedback('正在自动识别签字位并匹配编写/审核/批准人员，请稍候…');
+            return refreshFileList().then(function () {
+              try {
+                if (window.history && window.history.replaceState) {
+                  window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+                }
+              } catch (_) {}
+              return { __handoff_done: true };
+            });
+          });
+        })
+        .catch(function (e) {
+          clearAiwordHandoffState();
+          return Promise.reject(e);
+        });
+    } catch (e) {
+      clearAiwordHandoffState();
+      return Promise.reject(e);
+    }
+  }
+
   try {
     buildUI();
-    // 两页复用：按容器存在决定拉取哪些数据与同步哪些 UI
-    if (IS_FILE_SIGN_PAGE || IS_MATERIALS_PAGE) {
-      // 文件签名页和素材页都需要「签署人/素材」数据（文件页用于 role→素材下拉选择）
-      refreshSigners();
-    }
-    if (IS_FILE_SIGN_PAGE) {
-      refreshFileList();
-      refreshSignedList();
-      syncLibraryRolesModeRow();
-      updateSubmitState();
-    }
-    if (IS_MATERIALS_PAGE) {
-      // 素材页：仅同步本页相关的按钮状态
-      updateSubmitState();
-      renderLibLocaleQuickPick();
-    }
-    try {
-      window.__SIGN_PAGE_BOOT_OK = true;
-    } catch (_) {}
+    var spBoot = new URLSearchParams(window.location.search || '');
+    var deferRefreshForHandoff =
+      IS_FILE_SIGN_PAGE &&
+      (spBoot.get('from') || '').toLowerCase() === 'aiword' &&
+      !!(spBoot.get('handoff_token') || '').trim();
+
+    var signersFirst =
+      IS_FILE_SIGN_PAGE || IS_MATERIALS_PAGE ? refreshSigners() : Promise.resolve();
+
+    signersFirst
+      .then(function () {
+        if (IS_FILE_SIGN_PAGE) {
+          if (!deferRefreshForHandoff) {
+            return refreshFileList().then(function () {
+              refreshSignedList();
+              syncLibraryRolesModeRow();
+              updateSubmitState();
+              return maybeApplyAiwordHandoffFromQuery();
+            });
+          }
+        }
+        if (IS_MATERIALS_PAGE) {
+          updateSubmitState();
+          renderLibLocaleQuickPick();
+        }
+        return maybeApplyAiwordHandoffFromQuery();
+      })
+      .then(
+        function () {
+          if (IS_FILE_SIGN_PAGE && deferRefreshForHandoff) {
+            refreshSignedList();
+            syncLibraryRolesModeRow();
+            updateSubmitState();
+          }
+          try {
+            window.__SIGN_PAGE_BOOT_OK = true;
+          } catch (_) {}
+        },
+        function (e) {
+          if (IS_FILE_SIGN_PAGE && deferRefreshForHandoff) {
+            refreshFileList();
+            refreshSignedList();
+            syncLibraryRolesModeRow();
+            updateSubmitState();
+          }
+          try {
+            var msg = e && e.message ? e.message : String(e);
+            var b = document.getElementById('signBootstrapBanner');
+            if (b) {
+              b.style.display = 'block';
+              b.textContent = 'aiword 交接失败：' + msg;
+            }
+            if (typeof setSaveUploadFeedback === 'function') setSaveUploadFeedback(msg || '交接失败');
+          } catch (_) {}
+          try {
+            window.__SIGN_PAGE_BOOT_OK = true;
+          } catch (_) {}
+        }
+      );
   } catch (bootEx) {
     var _em = bootEx && bootEx.message ? bootEx.message : String(bootEx);
     window.__SIGN_PAGE_BOOT_FAIL_MSG = '脚本运行异常：' + _em;

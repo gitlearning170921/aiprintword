@@ -294,7 +294,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js';
+      s.src = (p || '') + '/js/sign-page.js?v=14';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +
@@ -306,6 +306,7 @@
       var bootCheckTry = 0;
       function watchSignBoot() {
         if (window.__SIGN_PAGE_BOOT_OK || window.__SIGN_PAGE_BOOT_HALTED) return;
+        if (window.__SIGN_PAGE_JS_EXECUTED) return;
         bootCheckTry += 1;
         // 弱网或首次冷启动时给更长缓冲，减少偶发误报
         if (bootCheckTry < 8) {

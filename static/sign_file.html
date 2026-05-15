@@ -170,9 +170,82 @@
         font-size: 16px !important;
       }
     }
+    /* aiword 入口：隐藏素材录入等管理员向链接 */
+    body.from-aiword a[href="/sign/materials"] { display: none !important; }
+    /* aiword 交接 loading 遮罩：覆盖整页，避免在「自动识别+预填」完成前用户误操作 */
+    #aiwordHandoffLoadingMask {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(15, 23, 42, 0.42);
+      backdrop-filter: blur(2px);
+      align-items: center;
+      justify-content: center;
+    }
+    #aiwordHandoffLoadingMask.show { display: flex; }
+    #aiwordHandoffLoadingMask .ai-loading-card {
+      background: #fff;
+      padding: 22px 26px;
+      border-radius: 12px;
+      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.25);
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      max-width: 80vw;
+    }
+    #aiwordHandoffLoadingMask .ai-loading-spinner {
+      width: 24px;
+      height: 24px;
+      border: 3px solid rgba(0, 0, 0, 0.15);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    #aiwordHandoffLoadingMask .ai-loading-title {
+      font-weight: 600;
+      color: #0f172a;
+      margin-bottom: 4px;
+      font-size: 0.96rem;
+    }
+    #aiwordHandoffLoadingMask .ai-loading-sub {
+      color: #475569;
+      font-size: 0.85rem;
+    }
   </style>
 </head>
 <body>
+  <div id="aiwordHandoffLoadingMask" aria-live="polite" aria-busy="true">
+    <div class="ai-loading-card">
+      <span class="ai-loading-spinner" aria-hidden="true"></span>
+      <div>
+        <div class="ai-loading-title" id="aiwordHandoffLoadingTitle">正在载入 aiword 任务并自动识别签字位…</div>
+        <div class="ai-loading-sub" id="aiwordHandoffLoadingSub">首次自动识别可能需要数秒，请勿手动操作。</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      try {
+        var sp = new URLSearchParams(window.location.search || '');
+        var fromAiword = (sp.get('from') || '').toLowerCase() === 'aiword';
+        var token = (sp.get('handoff_token') || '').trim();
+        if (fromAiword && token) {
+          var mask = document.getElementById('aiwordHandoffLoadingMask');
+          if (mask) mask.classList.add('show');
+          // 兜底：30 秒后无论如何隐藏，避免遮罩卡死
+          window.__aiwordHandoffLoadingShown = true;
+          setTimeout(function () {
+            try {
+              var m2 = document.getElementById('aiwordHandoffLoadingMask');
+              if (m2) m2.classList.remove('show');
+            } catch (_) {}
+          }, 30000);
+        }
+      } catch (_) {}
+    })();
+  </script>
   <div class="container">
     <div class="nav-top">
       <a href="/">返回批量打印</a>
@@ -308,11 +381,15 @@
           e.style.display = 'block';
           e.textContent = msg;
         }
+        try {
+          var m = document.getElementById('aiwordHandoffLoadingMask');
+          if (m) m.classList.remove('show');
+        } catch (_) {}
       }
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js';
+      s.src = (p || '') + '/js/sign-page.js?v=14';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +
@@ -324,6 +401,8 @@
       var bootCheckTry = 0;
       function watchSignBoot() {
         if (window.__SIGN_PAGE_BOOT_OK || window.__SIGN_PAGE_BOOT_HALTED) return;
+        // sign-page.js 已执行：异步握手/aiword 交接/识别可能超过 15s，不应误报「脚本未启动」
+        if (window.__SIGN_PAGE_JS_EXECUTED) return;
         bootCheckTry += 1;
         // 弱网或首次冷启动时给更长缓冲，减少偶发误报
         if (bootCheckTry < 8) {

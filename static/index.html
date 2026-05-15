@@ -442,13 +442,16 @@
     }
     #downloadWrap { margin-top: 14px; }
     #downloadWrap a { text-decoration: none; }
+    body.from-aiword #aiprintwordTopExtraLinks { display: none !important; }
+    body.from-aiword #batchRecordsCard { display: none !important; }
+    body.from-aiword #btnRefreshHistory { display: none !important; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>批量打印</h1>
     <p class="subtitle">上传 Word、Excel、PDF，按所选方式仅保存或打印</p>
-    <p class="subtitle" style="margin-top:-12px;">
+    <p class="subtitle" style="margin-top:-12px;" id="aiprintwordTopExtraLinks">
       <a href="/sign" style="color:var(--accent);text-decoration:none;font-weight:600;">在线签名（Word / Excel）</a>
       <span style="color:var(--text-muted);margin:0 8px;">·</span>
       <a href="/settings" style="color:var(--accent);text-decoration:none;font-weight:600;">系统设置</a>
@@ -1679,6 +1682,50 @@
     btnFormalSave.addEventListener('click', () => runBatch('formal_save'));
     btnStandardPrint.addEventListener('click', () => runBatch('standard_print'));
     btnRawPrint.addEventListener('click', () => runBatch('raw_print'));
+
+    (function applyAiwordPrintHandoffFromQuery() {
+      const sp = new URLSearchParams(window.location.search || '');
+      if ((sp.get('from') || '').toLowerCase() !== 'aiword') return;
+      document.body.classList.add('from-aiword');
+      if (dryRun) dryRun.checked = true;
+      const token = (sp.get('handoff_token') || '').trim();
+      if (!token) return;
+      fetch('/api/handoff/' + encodeURIComponent(token) + '/file', { credentials: 'same-origin' })
+        .then((r) => {
+          if (!r.ok) throw new Error('交接文件获取失败（HTTP ' + r.status + '）');
+          const cd = r.headers.get('Content-Disposition') || '';
+          return r.blob().then((blob) => ({ blob, cd }));
+        })
+        .then(({ blob, cd }) => {
+          let name = 'document.docx';
+          const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
+          if (m) {
+            try {
+              name = decodeURIComponent(m[1].replace(/['"]/g, ''));
+            } catch (_) {
+              name = m[1];
+            }
+          }
+          const file = new File([blob], name, {
+            type: blob.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          });
+          mergePendingFiles([file]);
+          updateFileHint();
+          appendRunLog('已从 aiword 传入：' + name);
+          try {
+            if (window.history && window.history.replaceState) {
+              window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+            }
+          } catch (_) {}
+        })
+        .catch((e) => {
+          if (batchErrorBanner) {
+            batchErrorBanner.className = 'result-summary fail';
+            batchErrorBanner.style.display = 'block';
+            batchErrorBanner.textContent = (e && e.message) ? e.message : String(e);
+          }
+        });
+    })();
 
     function escapeHtml(s) {
       const div = document.createElement('div');

@@ -362,6 +362,12 @@ def _ensure_sign_file_columns(conn) -> None:
                     cur.execute(sql)
                 except Exception:
                     pass
+            try:
+                cur.execute(
+                    "ALTER TABLE sign_uploaded_file ADD COLUMN ftp_owned_by_sign TINYINT(1) NOT NULL DEFAULT 1"
+                )
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -474,19 +480,54 @@ def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) ->
             )
 
 
+def insert_file_from_external_ftp(file_id: str, original_name: str, ext: str, external_ftp_path: str) -> None:
+    """将 aiword 等外部已存在的 FTP 路径登记为待签文件，不再向 sign/inbox 重复上传。"""
+    ensure_sign_mysql()
+    p = (external_ftp_path or "").strip()
+    if not p or ".." in p or len(p) > 768:
+        raise ValueError("invalid external ftp path")
+    ext = (ext or ".docx").strip() or ".docx"
+    if not ext.startswith("."):
+        ext = "." + ext
+    sha = hashlib.sha256(p.encode("utf-8", errors="ignore")).hexdigest()
+    size = 0
+    # aiword 同任务多次「去签字」会重复登记同一 external_ftp_path：先删旧行再插入，列表只保留本次
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM sign_uploaded_file WHERE ftp_path=%s", (p,))
+            dup_rows = cur.fetchall() or []
+    for row in dup_rows:
+        oid = (row or {}).get("id")
+        if oid:
+            delete_file(str(oid))
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sign_uploaded_file (id, original_name, ext, ftp_path, file_size, sha256, file_data, ftp_last_error, ftp_owned_by_sign) "
+                "VALUES (%s, %s, %s, %s, %s, %s, NULL, NULL, 0)",
+                (file_id, original_name, ext, p, size, sha),
+            )
+
+
 def delete_file(file_id: str) -> int:
     ensure_sign_mysql()
     with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
         # best-effort delete FTP
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT ftp_path FROM sign_uploaded_file WHERE id=%s",
+                    "SELECT ftp_path, ftp_owned_by_sign FROM sign_uploaded_file WHERE id=%s",
                     (file_id,),
                 )
                 row = cur.fetchone()
             p = (row or {}).get("ftp_path")
-            if p:
+            owned = (row or {}).get("ftp_owned_by_sign")
+            if owned is None:
+                owned = 1
+            if p and int(owned) != 0:
                 try:
                     from ftp_store import delete_path
 
