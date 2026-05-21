@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from sign_handlers.config import ROLE_ID_TO_KEYWORD, role_keywords
+from sign_handlers.config import ROLE_ID_TO_KEYWORD, canonical_sign_role_id, role_keywords
 from sign_handlers.label_match import cell_text_matches_keyword, xlsx_cell_has_leading_role_keyword
 
 _DATE_TOKENS = (
@@ -29,6 +29,15 @@ _DATE_TOKENS = (
     "Sign Date",
 )
 _ACTION_TOKENS = ("签字", "签名", "签章", "盖章", "签 字", "签 名")
+_EN_TRIAD_TOKENS = (
+    "author",
+    "reviewer",
+    "approver",
+    "prepared by",
+    "reviewed by",
+    "approved by",
+)
+_ZH_TRIAD_TOKENS = ("编制人", "编制", "审核人", "审核", "批准人", "批准", "编写", "作者")
 
 
 def _norm(s: str) -> str:
@@ -52,40 +61,56 @@ def _contains_any(text: str, tokens: Sequence[str]) -> bool:
     return False
 
 
+def _match_role_in_short_line(line: str) -> List[str]:
+    """单行内角色识别：整行=标签 或 行首=标签+冒号/占位；长关键词优先，避免重复。"""
+    out: List[str] = []
+    seen: set = set()
+    pairs: List[Tuple[str, str]] = []
+    for rid in ROLE_ID_TO_KEYWORD:
+        for kw in role_keywords(rid):
+            pairs.append((rid, kw))
+    pairs.sort(key=lambda p: len(p[1]), reverse=True)
+    for rid, kw in pairs:
+        if cell_text_matches_keyword(line, kw) or xlsx_cell_has_leading_role_keyword(line, kw):
+            rid2 = canonical_sign_role_id(rid, kw)
+            if rid2 in seen:
+                continue
+            seen.add(rid2)
+            out.append(rid2)
+    return out
+
+
 def _paragraph_role_ids(text: str) -> List[str]:
     """段落/短文本中的角色标签（避免在长句中子串误匹配）。"""
     t = _norm(text or "")
     if not t:
         return []
     out: List[str] = []
-    if len(t) <= 56:
-        for rid in ROLE_ID_TO_KEYWORD:
-            for kw in role_keywords(rid):
-                if cell_text_matches_keyword(t, kw):
-                    out.append(rid)
-                    break
-        return out
+    seen: set = set()
+    if len(t) <= 96:
+        for rid in _match_role_in_short_line(t):
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
+        if out:
+            return out
     for line in re.split(r"[\r\n]+", t):
         line = _norm(line)
-        if not line or len(line) > 72:
+        if not line or len(line) > 120:
             continue
-        for rid in ROLE_ID_TO_KEYWORD:
-            for kw in role_keywords(rid):
-                if cell_text_matches_keyword(line, kw):
-                    out.append(rid)
-                    break
+        for rid in _match_role_in_short_line(line):
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
     return out
 
 
 def _role_ids_for_text_label(label: str) -> List[str]:
-    """把命中的标签映射成 role_id（按 ROLE_ID_TO_KEYWORD 反查）。"""
-    out: List[str] = []
-    for rid in ROLE_ID_TO_KEYWORD:
-        for kw in role_keywords(rid):
-            if cell_text_matches_keyword(label, kw):
-                out.append(rid)
-                break
-    return out
+    """把命中的标签映射成 role_id（按 ROLE_ID_TO_KEYWORD 反查；同时支持「标签:任意内容」形式）。"""
+    s = _norm(label or "")
+    if not s:
+        return []
+    return _match_role_in_short_line(s)
 
 
 @dataclass
@@ -95,15 +120,19 @@ class DetectedBlock:
     matched_rules: List[str]
     fields: List[Dict[str, str]]
     source_hint: str
+    label_preview: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "block_id": self.block_id,
             "confidence": self.confidence,
             "matched_rules": self.matched_rules,
             "fields": self.fields,
             "source_hint": self.source_hint,
         }
+        if self.label_preview:
+            d["label_preview"] = self.label_preview
+        return d
 
 
 def _score_block(
@@ -117,8 +146,12 @@ def _score_block(
         matched.append("strong_block_rule")
     if {"author", "reviewer", "approver"}.issubset(rset):
         matched.append("triad_rule")
-    elif _contains_any(jt, ("编制人", "编制", "审核人", "审核", "批准人", "批准")) and len(rset) >= 2:
+    elif _contains_any(jt, _ZH_TRIAD_TOKENS) and len(rset) >= 2:
         matched.append("triad_text_hint")
+    elif _contains_any(jt.lower(), _EN_TRIAD_TOKENS) and len(rset) >= 2:
+        matched.append("triad_text_hint_en")
+    elif len(rset) >= 2 and rset.intersection({"author", "reviewer", "approver"}):
+        matched.append("multi_role_rule")
     if _contains_any(jt, ("企业负责人", "法定代表人", "法人代表")) and (has_date or has_action):
         matched.append("org_seal_rule")
     if has_action and has_date and rset:
@@ -131,8 +164,10 @@ def _score_block(
     # 置信度：强规则优先
     if "triad_rule" in matched or "strong_block_rule" in matched:
         return 0.93, matched
-    if "triad_text_hint" in matched:
+    if "triad_text_hint" in matched or "triad_text_hint_en" in matched:
         return 0.88, matched
+    if "multi_role_rule" in matched:
+        return 0.8, matched
     if "org_seal_rule" in matched:
         return 0.86, matched
     if "table_header_rule" in matched:
@@ -150,6 +185,31 @@ def _score_block(
     return 0.0, []
 
 
+def _cell_role_ids_multiline(cell_text: str) -> List[str]:
+    """同一单元格多行签批（Author/Reviewer/Approver 纵向排列）逐行识别。"""
+    raw = str(cell_text or "")
+    if not raw.strip():
+        return []
+    parts = [raw]
+    if re.search(r"[\r\n]", raw):
+        parts = [p for p in re.split(r"[\r\n]+", raw) if p and p.strip()]
+    out: List[str] = []
+    seen: set = set()
+    for part in parts:
+        s = _norm(part)
+        if not s:
+            continue
+        for rid in _table_cell_role_ids(s):
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
+        for rid in _role_ids_for_text_label(s):
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
+    return out
+
+
 def _table_cell_role_ids(cell_text: str) -> List[str]:
     """Word/Excel 单元格内匹配到的 role_id（整格或格首同义词）；长关键词优先。"""
     s = _norm(cell_text or "")
@@ -163,11 +223,12 @@ def _table_cell_role_ids(cell_text: str) -> List[str]:
     out: List[str] = []
     seen: set = set()
     for rid, kw in pairs:
-        if rid in seen:
-            continue
         if xlsx_cell_has_leading_role_keyword(s, kw):
-            seen.add(rid)
-            out.append(rid)
+            rid2 = canonical_sign_role_id(rid, kw)
+            if rid2 in seen:
+                continue
+            seen.add(rid2)
+            out.append(rid2)
     return out
 
 
@@ -199,9 +260,44 @@ def _harvest_roles_xlsx_cell(ws, max_scan_rows: int, max_scan_cols: int) -> Dict
             s = _norm(str(v))
             if not s or len(s) > 96:
                 continue
-            for rid in _table_cell_role_ids(s):
+            for rid in _cell_role_ids_multiline(s):
                 found[rid] = max(found.get(rid, 0.0), 0.58)
     return found
+
+
+def _iter_docx_tables(doc) -> List:
+    tables: List = list(getattr(doc, "tables", None) or [])
+    try:
+        for section in doc.sections:
+            for hf in (
+                section.header,
+                section.footer,
+                section.first_page_header,
+                section.first_page_footer,
+            ):
+                if hf is None:
+                    continue
+                tables.extend(list(getattr(hf, "tables", None) or []))
+    except Exception:
+        pass
+    return tables
+
+
+def _apply_docx_table_triad_boost(doc, role_ids_found: Dict[str, float]) -> None:
+    """同一表内凑齐 author+reviewer+approver（或其中两个）时抬高置信度。"""
+    core = {"author", "reviewer", "approver"}
+    for table in _iter_docx_tables(doc):
+        ids: set = set()
+        for row in table.rows:
+            for cell in row.cells:
+                ids.update(_cell_role_ids_multiline(_norm(cell.text or "")))
+        hit = ids & core
+        if not hit:
+            continue
+        conf = 0.92 if core.issubset(ids) else 0.8
+        for rid in ids:
+            if rid in ROLE_ID_TO_KEYWORD:
+                role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
 
 
 def _xlsx_row_sign_signals(
@@ -225,7 +321,7 @@ def _xlsx_row_sign_signals(
         if not s or len(s) < 2:
             continue
         cell_texts.append(s)
-        role_ids.extend(_table_cell_role_ids(s))
+        role_ids.extend(_cell_role_ids_multiline(s))
         if any(cell_text_matches_keyword(s, d) for d in _DATE_TOKENS) or any(
             xlsx_cell_has_leading_role_keyword(s, d) for d in _dtoks
         ):
@@ -284,6 +380,7 @@ def _append_xlsx_block(
         matched_rules=matched,
         fields=fields,
         source_hint=f"{sheet_title}!row{row_index}",
+        label_preview=(joined or "")[:200],
     )
     blocks.append(b)
     for rid in set(role_ids):
@@ -392,14 +489,41 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
 
 def _harvest_roles_docx_tables(doc) -> Dict[str, float]:
     found: Dict[str, float] = {}
-    for table in doc.tables:
+    for table in _iter_docx_tables(doc):
         for row in table.rows:
             for cell in row.cells:
                 s = _norm(cell.text or "")
-                if not s or len(s) > 96:
+                if not s or len(s) > 120:
                     continue
-                for rid in _table_cell_role_ids(s):
+                for rid in _cell_role_ids_multiline(s):
                     found[rid] = max(found.get(rid, 0.0), 0.58)
+    return found
+
+
+def _harvest_roles_docx_headers_footers(doc) -> Dict[str, float]:
+    """页眉/页脚中的签字表（需求规范等常把签批栏放在页脚）。"""
+    found: Dict[str, float] = {}
+    try:
+        for section in doc.sections:
+            for hf in (section.header, section.footer, section.first_page_header, section.first_page_footer):
+                if hf is None:
+                    continue
+                for p in hf.paragraphs:
+                    t = _norm(p.text or "")
+                    if not t:
+                        continue
+                    for rid in _paragraph_role_ids(t):
+                        found[rid] = max(found.get(rid, 0.0), 0.55)
+                for table in hf.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            s = _norm(cell.text or "")
+                            if not s or len(s) > 120:
+                                continue
+                            for rid in _cell_role_ids_multiline(s):
+                                found[rid] = max(found.get(rid, 0.0), 0.58)
+    except Exception:
+        pass
     return found
 
 
@@ -413,25 +537,41 @@ def detect_docx(path: str, max_paragraphs: int = 1200) -> dict:
 
     for rid, conf in _harvest_roles_docx_tables(doc).items():
         role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+    for rid, conf in _harvest_roles_docx_headers_footers(doc).items():
+        role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+    _apply_docx_table_triad_boost(doc, role_ids_found)
 
-    # 1) 表格行：强场景
-    for ti, table in enumerate(doc.tables):
-        for ri, row in enumerate(table.rows):
+    # 1) 表格行：强场景（含页眉页脚表；签批栏常「角色行 + 下一行 Date」）
+    for ti, table in enumerate(_iter_docx_tables(doc)):
+        rows_list = list(table.rows)
+        for ri, row in enumerate(rows_list):
             texts = [_norm(c.text or "") for c in row.cells]
             joined = " | ".join(t for t in texts if t)
+            if ri + 1 < len(rows_list):
+                texts_next = [_norm(c.text or "") for c in rows_list[ri + 1].cells]
+                joined_next = " | ".join(t for t in texts_next if t)
+                if joined_next:
+                    joined = (joined + " | " + joined_next) if joined else joined_next
             if not joined:
                 continue
             role_ids: List[str] = []
             for t in texts:
                 if not t:
                     continue
-                role_ids.extend(_table_cell_role_ids(t))
+                role_ids.extend(_cell_role_ids_multiline(t))
             has_date = _contains_any(joined, _DATE_TOKENS)
             has_action = _contains_any(joined, _ACTION_TOKENS)
 
             conf, matched = _score_block(role_ids, joined, has_date, has_action)
             if conf < 0.5:
-                continue
+                if len(set(role_ids)) >= 1 and has_date:
+                    conf = 0.72
+                    matched = list(matched or []) + ["docx_role_with_date_row"]
+                elif len(set(role_ids)) >= 2:
+                    conf = 0.76
+                    matched = list(matched or []) + ["docx_multi_role_row"]
+                else:
+                    continue
             fields: List[Dict[str, str]] = []
             for rid in sorted(set(role_ids)):
                 fields.append({"name": rid, "type": "role_id"})
@@ -445,6 +585,7 @@ def detect_docx(path: str, max_paragraphs: int = 1200) -> dict:
                 matched_rules=matched,
                 fields=fields,
                 source_hint=f"table{ti+1}.row{ri+1}",
+                label_preview=(joined or "")[:200],
             )
             blocks.append(b)
             bi += 1

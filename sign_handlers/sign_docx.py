@@ -19,8 +19,18 @@ from docx.shared import Cm
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from sign_handlers.config import ROLE_ID_TO_KEYWORD, role_keywords
+from sign_handlers.config import (
+    ROLE_ID_TO_KEYWORD,
+    is_replaceable_prefilled_slot_text,
+    role_keywords_for_apply,
+)
 from sign_handlers.label_match import (
+    cell_has_label_inline_reservation,
+    cell_has_role_keyword,
+    cell_has_signoff_inline_reservation,
+    cell_is_bare_role_column_header,
+    cell_is_role_signoff_label_slot,
+    cell_looks_like_signoff_date_label,
     cell_text_matches_keyword,
     paragraph_text_keyword_end_offset,
     xlsx_cell_has_leading_role_keyword,
@@ -49,6 +59,11 @@ def _is_emptyish_text(s: str) -> bool:
     if _PLACEHOLDER_CHARS.match(t):
         return True
     return len(t) < 2
+
+
+def _is_slot_target_text(s: str) -> bool:
+    """签名/日期可落位目标：空白占位，或可替换的电脑输入值。"""
+    return _is_emptyish_text(s) or is_replaceable_prefilled_slot_text(s)
 
 
 def _cell_text(cell) -> str:
@@ -317,6 +332,14 @@ def _insert_sig_and_date_in_empty_cell(cell, sig_png: Optional[bytes], date_png:
         p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
 
 
+def _append_date_to_cell(cell, date_png: bytes) -> None:
+    """在已有签名图的空白格后追加日期图（签批栏签名/日期分列）。"""
+    p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+    if p.runs:
+        p.add_run(" ")
+    p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
+
+
 def _next_distinct_cell(cells, idx: int):
     """返回同一行里 idx 之后第一个“不同的 cell”（按合并单元格去重）。"""
     try:
@@ -344,12 +367,15 @@ def _try_table_adjacent_date_column(
     - 三列：角色+姓名 | 空签字列 | 日期列 → 签名优先插左格关键词/冒号后（更贴近字段标记），日期插右格。
     避免两段图都落在左侧姓名后。
     """
-    for row in table.rows:
-        cells = row.cells
+    rows_list = list(table.rows)
+    for ri in _table_row_scan_order(table):
+        cells = rows_list[ri].cells
         for ci in range(len(cells) - 1):
             left = cells[ci]
             lt = _cell_text(left)
             if not xlsx_cell_has_leading_role_keyword(lt, keyword):
+                continue
+            if cell_is_bare_role_column_header(lt, keyword):
                 continue
             date_idx = None
             if ci + 1 < len(cells) and _cell_looks_like_date_header_cell(_cell_text(cells[ci + 1])):
@@ -373,7 +399,7 @@ def _try_table_adjacent_date_column(
                         if not _insert_sig_in_role_cell_for_adjacent_date_column(left, keyword, sig_png):
                             continue
                     else:
-                        if not _is_emptyish_text(_cell_text(mid)):
+                        if not _is_slot_target_text(_cell_text(mid)):
                             continue
                         _insert_sig_only_in_empty_cell(mid, sig_png)
                 placed_any = True
@@ -384,7 +410,7 @@ def _try_table_adjacent_date_column(
                     date_target = _next_distinct_cell(cells, date_idx)
                 except Exception:
                     date_target = None
-                if date_target is not None and _is_emptyish_text(_cell_text(date_target)):
+                if date_target is not None and _is_slot_target_text(_cell_text(date_target)):
                     _insert_sig_and_date_in_empty_cell(date_target, None, date_png)
                     placed_any = True
                 elif not _insert_date_only_in_date_cell(date_cell, date_png):
@@ -444,66 +470,247 @@ def _try_paragraph_inline(
     return True
 
 
+def _table_row_scan_order(table: Table) -> range:
+    """宽表（如用例表）从下往上找签批行，避免先命中列头「测试人」。"""
+    n = len(table.rows)
+    if n > 10:
+        return range(n - 1, -1, -1)
+    return range(n)
+
+
+def _find_date_label_cell_in_row(cells, label_ci: int, rows_list, ri: int):
+    """同行或下一行找「日期/Date」列表头格。"""
+    date_cell = None
+    for j in range(label_ci + 1, len(cells)):
+        if _cell_looks_like_date_header_cell(_cell_text(cells[j])):
+            date_cell = cells[j]
+            break
+    if date_cell is None and ri + 1 < len(rows_list):
+        nrow = rows_list[ri + 1]
+        for cand_col in (label_ci, label_ci + 1, label_ci + 2):
+            if cand_col < len(nrow.cells) and _cell_looks_like_date_header_cell(
+                _cell_text(nrow.cells[cand_col])
+            ):
+                date_cell = nrow.cells[cand_col]
+                break
+    return date_cell
+
+
+def _iter_reserved_blank_cells_same_row(cells, label_ci: int, keyword: str):
+    """标签格右侧连续空白格（签批栏：第一格签名、第二格日期，遇下一角色标签则停止）。"""
+    try:
+        base_tc = getattr(cells[label_ci], "_tc", None)
+    except Exception:
+        base_tc = None
+    for j in range(label_ci + 1, len(cells)):
+        c2 = cells[j]
+        try:
+            if base_tc is not None and getattr(c2, "_tc", None) == base_tc:
+                continue
+        except Exception:
+            pass
+        t = _cell_text(c2)
+        if _cell_looks_like_date_header_cell(t):
+            continue
+        if (
+            cell_looks_like_signoff_date_label(t)
+            and not cell_has_role_keyword(t, keyword)
+        ):
+            break
+        if _is_emptyish_text(t):
+            yield c2
+            continue
+        if is_replaceable_prefilled_slot_text(t):
+            yield c2
+            continue
+        if cell_has_role_keyword(t, keyword):
+            continue
+        break
+
+
+def _first_reserved_blank_cell_same_row(cells, label_ci: int, keyword: str):
+    """标签格右侧：第一个空白 distinct 格（签字区，跳过日期列标题格）。"""
+    for c2 in _iter_reserved_blank_cells_same_row(cells, label_ci, keyword):
+        return c2
+    return None
+
+
+def _first_reserved_blank_cell_below(rows_list, ri: int, label_ci: int):
+    """标签格正下方（或略偏右）的空白格。"""
+    if ri + 1 >= len(rows_list):
+        return None
+    nrow = rows_list[ri + 1]
+    for cand_col in (label_ci, label_ci + 1, label_ci + 2):
+        if cand_col < len(nrow.cells):
+            t = _cell_text(nrow.cells[cand_col])
+            if _is_slot_target_text(t) and not _cell_looks_like_date_header_cell(t):
+                return nrow.cells[cand_col]
+    return None
+
+
+def _cell_has_table_signoff_reservation(
+    cell_text: str,
+    keyword: str,
+    cells,
+    label_ci: int,
+    rows_list,
+    ri: int,
+) -> bool:
+    """
+    表格签字锚点：有角色标签，且存在留位证据（同格下划线/空格、右侧空白格、下方空白格、角色/日期）。
+    作者/审核/批准/测试人等统一规则。
+    """
+    if not cell_has_role_keyword(cell_text, keyword):
+        return False
+    if cell_is_bare_role_column_header(cell_text, keyword):
+        return False
+    if cell_is_role_signoff_label_slot(cell_text, keyword):
+        return True
+    if cell_has_signoff_inline_reservation(cell_text, keyword):
+        return True
+    if cell_has_label_inline_reservation(cell_text, keyword):
+        return True
+    date_nearby = _find_date_label_cell_in_row(cells, label_ci, rows_list, ri) is not None
+    same_row_slot = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
+    if same_row_slot is not None:
+        slot_t = _cell_text(same_row_slot)
+        if _is_emptyish_text(slot_t):
+            return True
+        if is_replaceable_prefilled_slot_text(slot_t) and date_nearby:
+            return True
+    below_slot = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
+    if below_slot is not None:
+        slot_t = _cell_text(below_slot)
+        if _is_emptyish_text(slot_t):
+            return True
+        if is_replaceable_prefilled_slot_text(slot_t) and date_nearby:
+            return True
+    return False
+
+
+def _place_sig_date_at_signoff_anchor(
+    label_cell,
+    keyword: str,
+    cells,
+    label_ci: int,
+    rows_list,
+    ri: int,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """
+    在签批锚点落位（顺序固定）：
+    1) 签批栏「角色/日期」：同行第 1 个空白格签名、第 2 个空白格日期（与复核人一致）；
+    2) 其它：同行/下方空白格；同格下划线留白；独立 Date/日期 列。
+    """
+    placed_any = False
+    ct = _cell_text(label_cell)
+    date_cell = _find_date_label_cell_in_row(cells, label_ci, rows_list, ri)
+    signoff_slot = cell_is_role_signoff_label_slot(ct, keyword)
+    row_blanks = (
+        list(_iter_reserved_blank_cells_same_row(cells, label_ci, keyword))
+        if signoff_slot
+        else []
+    )
+
+    if sig_png:
+        if row_blanks:
+            _insert_sig_and_date_in_empty_cell(row_blanks[0], sig_png, None)
+            placed_any = True
+        else:
+            sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
+            if sig_blank is not None:
+                _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, None)
+                placed_any = True
+        if not placed_any:
+            below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
+            if below is not None:
+                _insert_sig_and_date_in_empty_cell(below, sig_png, None)
+                placed_any = True
+        if not placed_any and cell_has_label_inline_reservation(ct, keyword):
+            if _insert_sig_in_role_cell_for_adjacent_date_column(label_cell, keyword, sig_png):
+                placed_any = True
+        if not placed_any and signoff_slot:
+            sig_blank = _next_distinct_cell(cells, label_ci)
+            if sig_blank is not None and _is_slot_target_text(_cell_text(sig_blank)):
+                if date_cell is None or sig_blank._tc != date_cell._tc:
+                    _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, None)
+                    placed_any = True
+        if not placed_any and signoff_slot and cell_has_signoff_inline_reservation(
+            ct, keyword
+        ):
+            for p0 in label_cell.paragraphs:
+                if _try_paragraph_inline(p0, keyword, sig_png, None):
+                    placed_any = True
+                    break
+
+    if date_png:
+        date_placed = False
+        if date_cell is not None and not signoff_slot:
+            dt_target = None
+            try:
+                dt_target = _next_distinct_cell(cells, cells.index(date_cell))
+            except Exception:
+                dt_target = None
+            if dt_target is not None and _is_slot_target_text(_cell_text(dt_target)):
+                _insert_sig_and_date_in_empty_cell(dt_target, None, date_png)
+                date_placed = True
+            elif _insert_date_only_in_date_cell(date_cell, date_png):
+                date_placed = True
+        elif signoff_slot and row_blanks:
+            if sig_png and len(row_blanks) > 1:
+                _insert_sig_and_date_in_empty_cell(row_blanks[1], None, date_png)
+                date_placed = True
+            elif sig_png and row_blanks:
+                _append_date_to_cell(row_blanks[0], date_png)
+                date_placed = True
+            elif row_blanks:
+                _insert_sig_and_date_in_empty_cell(row_blanks[0], None, date_png)
+                date_placed = True
+        elif signoff_slot and cell_has_signoff_inline_reservation(ct, keyword):
+            for p0 in label_cell.paragraphs:
+                if _try_paragraph_inline(p0, keyword, sig_png, date_png):
+                    return True
+        elif not sig_png:
+            for p0 in label_cell.paragraphs:
+                off = _find_keyword_in_paragraph(p0, keyword)
+                if off >= 0:
+                    _clear_runs_after_offset(p0, off)
+                    _insert_pictures_in_paragraph(p0, None, date_png)
+                    date_placed = True
+                    break
+        if date_placed:
+            placed_any = True
+
+    if (sig_png or date_png) and not placed_any:
+        sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
+        if sig_blank is not None:
+            _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, date_png)
+            placed_any = True
+
+    return placed_any
+
+
 def _try_table_role(
     table: Table,
     keyword: str,
     sig_png: Optional[bytes],
     date_png: Optional[bytes],
+    role_id: str = "",
 ) -> bool:
     if _try_table_adjacent_date_column(table, keyword, sig_png, date_png):
         return True
     rows_list = list(table.rows)
-    for ri, row in enumerate(rows_list):
+    for ri in _table_row_scan_order(table):
+        row = rows_list[ri]
         cells = row.cells
         for ci, cell in enumerate(cells):
-            if not cell_text_matches_keyword(_cell_text(cell), keyword):
+            ct = _cell_text(cell)
+            if not _cell_has_table_signoff_reservation(ct, keyword, cells, ci, rows_list, ri):
                 continue
-            sig_cell = _next_distinct_cell(cells, ci)
-            # 优先找同一行 Date/日期 标签格，保证日期贴在字段标题后，而非整段点线末端
-            date_cell = None
-            for j in range(ci + 1, len(cells)):
-                if _cell_looks_like_date_header_cell(_cell_text(cells[j])):
-                    date_cell = cells[j]
-                    break
-            if date_cell is None and ri + 1 < len(rows_list):
-                # 次选：下一行同列/右邻列若出现 Date/日期 标签格
-                nrow = rows_list[ri + 1]
-                for cand_col in (ci, ci + 1, ci + 2):
-                    if cand_col < len(nrow.cells) and _cell_looks_like_date_header_cell(_cell_text(nrow.cells[cand_col])):
-                        date_cell = nrow.cells[cand_col]
-                        break
-            placed_any = False
-            if sig_png:
-                # 优先写在“字段后紧接的预留空白格”（按合并单元格后的 next distinct cell）
-                if sig_cell is not None and _is_emptyish_text(_cell_text(sig_cell)) and (date_cell is None or sig_cell._tc != date_cell._tc):
-                    _insert_sig_and_date_in_empty_cell(sig_cell, sig_png, None)
-                    placed_any = True
-                else:
-                    # 无预留空白格时才写回字段格关键词后（保持正文逻辑不变）
-                    if _insert_sig_in_role_cell_for_adjacent_date_column(cell, keyword, sig_png):
-                        placed_any = True
-            if date_png and date_cell is not None:
-                # 日期：优先写到 Date 标签格右侧空白格
-                dt_target = _next_distinct_cell(cells, cells.index(date_cell)) if date_cell in cells else None
-                if dt_target is not None and _is_emptyish_text(_cell_text(dt_target)):
-                    _insert_sig_and_date_in_empty_cell(dt_target, None, date_png)
-                    placed_any = True
-                elif _insert_date_only_in_date_cell(date_cell, date_png):
-                    placed_any = True
-            if date_png and date_cell is None and (not sig_png):
-                # 只有日期但没找到 Date 标签时，退化：尝试该角色格关键词后插入
-                for p0 in cell.paragraphs:
-                    off = _find_keyword_in_paragraph(p0, keyword)
-                    if off >= 0:
-                        _clear_runs_after_offset(p0, off)
-                        _insert_pictures_in_paragraph(p0, None, date_png)
-                        placed_any = True
-                        break
-            # 若标签为 “Reviewer/Date” 这类同格字段且后面有预留空白格：把签名+日期都插到预留格里
-            if (sig_png or date_png) and (date_cell is None) and sig_cell is not None and _is_emptyish_text(_cell_text(sig_cell)):
-                _insert_sig_and_date_in_empty_cell(sig_cell, sig_png, date_png)
-                placed_any = True
-            if placed_any:
+            if _place_sig_date_at_signoff_anchor(
+                cell, keyword, cells, ci, rows_list, ri, sig_png, date_png
+            ):
                 return True
     return False
 
@@ -516,6 +723,32 @@ def _iter_tables(doc: DocumentObject) -> list[Table]:
     except Exception:
         pass
     return out
+
+
+def _iter_all_tables(doc: DocumentObject, *, footers_first: bool = False) -> list[Table]:
+    """正文表 + 页眉页脚表（用例表签批栏常在每页页脚）。"""
+    body: list[Table] = []
+    hf: list[Table] = []
+    try:
+        body = list(doc.tables)
+    except Exception:
+        pass
+    try:
+        for section in doc.sections:
+            for part in (
+                section.footer,
+                section.first_page_footer,
+                section.header,
+                section.first_page_header,
+            ):
+                if part is None:
+                    continue
+                hf.extend(list(getattr(part, "tables", None) or []))
+    except Exception:
+        pass
+    if footers_first:
+        return hf + body
+    return body + hf
 
 
 def _iter_body_paragraphs(doc: DocumentObject) -> list[Paragraph]:
@@ -557,11 +790,13 @@ def sign_docx(
         if not sig and not dt:
             continue
         done = False
-        for kw in role_keywords(role_id):
+        kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
+        tables = _iter_all_tables(doc, footers_first=True)
+        for kw in kws:
             if done:
                 break
-            for table in _iter_tables(doc):
-                if _try_table_role(table, kw, sig, dt):
+            for table in tables:
+                if _try_table_role(table, kw, sig, dt, role_id=role_id):
                     done = True
                     break
             if done:
@@ -574,9 +809,16 @@ def sign_docx(
                     break
             if done:
                 break
-            for table in _iter_tables(doc):
+            for table in tables:
                 for row in table.rows:
                     for cell in row.cells:
+                        ct = _cell_text(cell)
+                        if not cell_has_role_keyword(ct, kw):
+                            continue
+                        if cell_is_bare_role_column_header(ct, kw):
+                            continue
+                        if not cell_has_label_inline_reservation(ct, kw):
+                            continue
                         for p in cell.paragraphs:
                             if _find_keyword_in_paragraph(p, kw) < 0:
                                 continue

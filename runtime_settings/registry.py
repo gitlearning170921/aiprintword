@@ -198,6 +198,32 @@ _reg(
 )
 _reg(
     SettingMeta(
+        "SIGN_DETECT_TIMEOUT_MS",
+        43200000,
+        "int",
+        "sign",
+        "签字识别请求超时（毫秒）",
+        description=(
+            "前端调用 /api/sign/detect 的最大等待时间。范围 30000–86400000；"
+            "默认 43200000（12 小时）。文件量大或远端 MySQL/FTP 较慢时可适当调大。"
+        ),
+    )
+)
+_reg(
+    SettingMeta(
+        "SIGN_DETECT_RETRY_TIMES",
+        1,
+        "int",
+        "sign",
+        "签字识别失败重试次数",
+        description=(
+            "前端识别失败时的额外重试次数。超时/取消类错误不会再重试（无意义）。"
+            "范围 0–3；默认 1。重试越多，单文件失败时占用越久，看起来「日志一直刷」。"
+        ),
+    )
+)
+_reg(
+    SettingMeta(
         "MYSQL_HOST",
         "",
         "str",

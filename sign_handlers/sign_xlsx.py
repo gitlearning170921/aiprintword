@@ -15,8 +15,22 @@ from openpyxl.utils.cell import coordinate_to_tuple
 from openpyxl.utils.units import pixels_to_EMU
 from openpyxl import load_workbook
 
-from sign_handlers.config import ROLE_ID_TO_KEYWORD, role_keywords
-from sign_handlers.label_match import cell_text_matches_keyword, paragraph_text_keyword_end_offset
+from sign_handlers.config import (
+    ROLE_ID_TO_KEYWORD,
+    is_replaceable_prefilled_slot_text,
+    role_keywords_for_apply,
+)
+from sign_handlers.label_match import (
+    cell_has_label_inline_reservation,
+    cell_has_role_keyword,
+    cell_has_signoff_inline_reservation,
+    cell_inline_insert_offset_px,
+    cell_is_bare_role_column_header,
+    cell_is_role_signoff_label_slot,
+    cell_looks_like_signoff_date_label,
+    cell_text_matches_keyword,
+    xlsx_cell_has_leading_role_keyword,
+)
 from sign_handlers.png_word_compat import (
     prepare_png_for_word,
     prepare_signature_date_pair_for_word,
@@ -28,7 +42,6 @@ from sign_handlers.png_word_compat import (
 _EXCEL_ABS_MAX_IMG_WIDTH_PX = 1600
 _EXCEL_MAX_UPSCALE = 2.5
 _DATE_LABEL_KEYWORDS = ("日期", "Date")
-_PLACEHOLDER_TAIL = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·…．~～]+$")
 _GAP_PX = 6
 
 
@@ -127,6 +140,36 @@ def _is_emptyish(v) -> bool:
     return len(s) < 2
 
 
+def _is_slot_target(v) -> bool:
+    """签名/日期可落位目标：空白占位，或可替换的电脑输入值。"""
+    return _is_emptyish(v) or is_replaceable_prefilled_slot_text(str(v or ""))
+
+
+def _has_date_context_nearby(ws, r: int, c: int, val) -> bool:
+    """
+    限制“可替换已有值”只在签批语境生效，避免把普通业务表格列（如风险分析里的“审核”）误判为签字位。
+    """
+    if _find_date_cell_same_row(ws, r, c)[0] is not None:
+        return True
+    max_c = int(ws.max_column or 1)
+    for dc in (c + 1, c + 2, c + 3):
+        if dc > max_c:
+            continue
+        if cell_text_matches_keyword(ws.cell(row=r, column=dc).value, "日期") or cell_text_matches_keyword(
+            ws.cell(row=r, column=dc).value, "Date"
+        ):
+            return True
+    if r + 1 <= int(ws.max_row or 1):
+        for dc in (c, c + 1, c + 2):
+            if dc > max_c:
+                continue
+            if cell_text_matches_keyword(ws.cell(row=r + 1, column=dc).value, "日期") or cell_text_matches_keyword(
+                ws.cell(row=r + 1, column=dc).value, "Date"
+            ):
+                return True
+    return False
+
+
 def _add_png(
     ws,
     png_bytes: bytes,
@@ -172,33 +215,6 @@ def _merged_top_left_coordinate(ws, cell) -> str:
     except Exception:
         pass
     return cell.coordinate
-
-
-def _cell_inline_insert_offset_px(cell_value, keyword: str) -> Optional[int]:
-    """
-    若单元格是「Author:......」这类同格标签+占位，返回应紧跟标签后插图的 x 偏移（px）。
-    """
-    if cell_value is None:
-        return None
-    txt = str(cell_value)
-    off = paragraph_text_keyword_end_offset(txt, keyword)
-    if off < 0:
-        return None
-    tail = txt[off:]
-    if tail and not _PLACEHOLDER_TAIL.match(tail):
-        return None
-    pre = txt[:off]
-    px = 4
-    for ch in pre:
-        if ch in ("\t",):
-            px += 12
-        elif ch == " ":
-            px += 4
-        elif ord(ch) > 127:
-            px += 10
-        else:
-            px += 7
-    return min(max(px, 4), 300)
 
 
 def _add_png_after_label_in_cell(
@@ -308,55 +324,158 @@ def sign_xlsx(
         if not sig and not dt:
             continue
         placed = False
-        for kw in role_keywords(role_id):
+        kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
+        for kw in kws:
             if placed:
                 break
             for ws in wb.worksheets:
                 if placed:
                     break
-                for row in ws.iter_rows():
+                max_r = int(ws.max_row or 1)
+                row_range = (
+                    range(max_r, 0, -1) if max_r > 10 else range(1, max_r + 1)
+                )
+                for r in row_range:
                     if placed:
                         break
-                    for cell in row:
-                        if not cell_text_matches_keyword(cell.value, kw):
+                    for c in range(1, min(int(ws.max_column or 1), 128) + 1):
+                        cell = ws.cell(row=r, column=c)
+                        val = cell.value
+                        ct = str(val).strip() if val is not None else ""
+                        if not (
+                            cell_text_matches_keyword(val, kw)
+                            or xlsx_cell_has_leading_role_keyword(val, kw)
+                        ):
                             continue
-                        r, c = cell.row, cell.column
+                        if cell_is_bare_role_column_header(val, kw):
+                            continue
+                        has_blank_right = c + 1 <= int(ws.max_column or 1) and _is_emptyish(
+                            ws.cell(row=r, column=c + 1).value
+                        )
+                        has_blank_below = r + 1 <= max_r and _is_emptyish(
+                            ws.cell(row=r + 1, column=c).value
+                        )
+                        signoff_slot = cell_is_role_signoff_label_slot(val, kw)
+                        inline_slot = cell_has_label_inline_reservation(val, kw)
+                        date_ctx = _has_date_context_nearby(ws, r, c, val)
+                        if not (signoff_slot or inline_slot or ((has_blank_right or has_blank_below) and date_ctx)):
+                            continue
                         sig_cell = ws.cell(row=r, column=c + 1)
-                        # 若要贴签名，签名格必须为空；若只贴日期，则不强制要求签名格为空
-                        if sig and (not _is_emptyish(sig_cell.value)):
-                            continue
+                        inline_x = (
+                            cell_inline_insert_offset_px(val, kw)
+                            if signoff_slot
+                            else None
+                        )
+                        # 若要贴签名，签名格必须为空；签批栏同格留位时允许在标签格内拼接
+                        if sig and (not _is_slot_target(sig_cell.value)):
+                            if inline_x is None:
+                                continue
                         date_label_cell, date_cell = _find_date_cell_same_row(ws, r, c)
                         if date_cell is None:
                             c2 = ws.cell(row=r, column=c + 2)
-                            if _is_emptyish(c2.value):
+                            if _is_slot_target(c2.value):
                                 date_cell = c2
                             else:
                                 d1 = ws.cell(row=r + 1, column=c + 1)
-                                if _is_emptyish(d1.value):
+                                if _is_slot_target(d1.value):
                                     date_cell = d1
                                 else:
                                     d0 = ws.cell(row=r + 1, column=c)
-                                    if _is_emptyish(d0.value):
+                                    if _is_slot_target(d0.value):
                                         date_cell = d0
                         placed_any = False
-                        if sig:
-                            # 优先：字段后紧接的空白单元格（按用户期望“插在字段后的单元格里”）
-                            if _is_emptyish(sig_cell.value):
-                                sig_cell.value = None
-                                _add_png(ws, sig, _merged_top_left_coordinate(ws, sig_cell), sig_cell)
-                            else:
-                                # 仅当“同一单元格内留空占位”且没有可用的后续空白格时，才退化为同格插入
-                                sig_inline_x = _cell_inline_insert_offset_px(cell.value, kw)
-                                if sig_inline_x is not None:
-                                    _add_png_after_label_in_cell(ws, sig, cell, sig_inline_x)
+                        if inline_x is not None and sig and dt:
+                            _add_sig_and_date_after_label_in_cell(
+                                ws, sig, dt, cell, inline_x
+                            )
                             placed_any = True
-                        if dt:
-                            # 优先：Date/日期 标签右侧空白格；其次：启发式找到的 date_cell
-                            if date_cell is not None and _is_emptyish(date_cell.value):
+                        elif inline_x is not None and sig:
+                            _add_png_after_label_in_cell(ws, sig, cell, inline_x)
+                            placed_any = True
+                        if sig and not placed_any:
+                            # 1) 右侧空白格（签批栏「测试人/日期：」等）
+                            if _is_slot_target(sig_cell.value):
+                                sig_cell.value = None
+                                _add_png(
+                                    ws,
+                                    sig,
+                                    _merged_top_left_coordinate(ws, sig_cell),
+                                    sig_cell,
+                                )
+                                placed_any = True
+                            # 2) 下方空白格
+                            if not placed_any and has_blank_below:
+                                below = ws.cell(row=r + 1, column=c)
+                                below.value = None
+                                _add_png(
+                                    ws,
+                                    sig,
+                                    _merged_top_left_coordinate(ws, below),
+                                    below,
+                                )
+                                placed_any = True
+                            # 3) 同格标签后留白/下划线 → 紧挨标签
+                            if not placed_any:
+                                sig_inline_x = cell_inline_insert_offset_px(cell.value, kw)
+                                if sig_inline_x is not None:
+                                    if dt and cell_has_signoff_inline_reservation(val, kw):
+                                        _add_sig_and_date_after_label_in_cell(
+                                            ws, sig, dt, cell, sig_inline_x
+                                        )
+                                    else:
+                                        _add_png_after_label_in_cell(
+                                            ws, sig, cell, sig_inline_x
+                                        )
+                                    placed_any = True
+                        if dt and not placed_any:
+                            # 签批栏「测试人/日期」：签名在 c+1，日期在 c+2（与复核人一致）
+                            if signoff_slot:
+                                max_c = int(ws.max_column or 1)
+                                for dc in range(c + 2, min(c + 8, max_c + 1)):
+                                    dcell = ws.cell(row=r, column=dc)
+                                    dv = dcell.value
+                                    if (
+                                        cell_looks_like_signoff_date_label(dv)
+                                        and not cell_has_role_keyword(dv, kw)
+                                    ):
+                                        break
+                                    if _is_slot_target(dv):
+                                        dcell.value = None
+                                        _add_png(
+                                            ws,
+                                            dt,
+                                            _merged_top_left_coordinate(ws, dcell),
+                                            dcell,
+                                        )
+                                        placed_any = True
+                                        break
+                            if (
+                                not placed_any
+                                and signoff_slot
+                                and cell_has_signoff_inline_reservation(val, kw)
+                            ):
+                                inline_dt_x = cell_inline_insert_offset_px(val, kw)
+                                if inline_dt_x is not None:
+                                    if sig:
+                                        _add_sig_and_date_after_label_in_cell(
+                                            ws, sig, dt, cell, inline_dt_x
+                                        )
+                                    else:
+                                        _add_png_after_label_in_cell(
+                                            ws, dt, cell, inline_dt_x
+                                        )
+                                    placed_any = True
+                            # 非签批栏：Date/日期 标签右侧空白格；签批栏勿误落到独立 Date 列
+                            if (
+                                not placed_any
+                                and not signoff_slot
+                                and date_cell is not None
+                                and _is_slot_target(date_cell.value)
+                            ):
                                 date_cell.value = None
                                 _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
                                 placed_any = True
-                            else:
+                            elif not placed_any:
                                 # 若 Date/日期 标签格本身是“同格留空占位”，且没有可用的右侧空白格，才退化为同格插入
                                 date_inline_x = None
                                 if date_label_cell is not None:
@@ -371,7 +490,19 @@ def sign_xlsx(
                                     date_cell.value = None
                                     _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
                                     placed_any = True
-                                else:
+                                elif (not _is_slot_target(sig_cell.value)) and sig:
+                                    # 仅一格留白：日期紧跟签名格后一列
+                                    dnext = ws.cell(row=r, column=c + 2)
+                                    if _is_slot_target(dnext.value):
+                                        dnext.value = None
+                                        _add_png(
+                                            ws,
+                                            dt,
+                                            _merged_top_left_coordinate(ws, dnext),
+                                            dnext,
+                                        )
+                                        placed_any = True
+                                if not placed_any:
                                     # 找不到日期单元格时：放到签名格下方（兜底）
                                     below = f"{get_column_letter(c + 1)}{r + 1}"
                                     below_cell = ws.cell(row=r + 1, column=c + 1)

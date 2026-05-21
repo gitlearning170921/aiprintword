@@ -102,3 +102,72 @@ def role_keywords(role_id: str) -> Tuple[str, ...]:
     if v is None:
         raise KeyError(f"未知 role_id: {role_id}")
     return v
+
+
+# 文末「审核人员/复核人员」与 reviewer 同义；QA/会签等仍用 reviewer_tail 单独识别
+_REVIEWER_TAIL_CANONICAL_TO_REVIEWER = frozenset(
+    {
+        "审核人员",
+        "复核人员",
+        "审核组员",
+        "审核成员",
+    }
+)
+
+# 签字落位时：为 reviewer / executor 合并额外同义词（长词优先由调用方排序）
+_ROLE_APPLY_EXTRA_IDS: Dict[str, Tuple[str, ...]] = {
+    "reviewer": ("reviewer_tail",),
+    "executor": (),
+}
+
+
+def canonical_sign_role_id(role_id: str, matched_keyword: str | None = None) -> str:
+    """将 detect/映射中的 role_id 规范为签字用的 author/reviewer/approver/executor。"""
+    rid = str(role_id or "").strip()
+    if not rid:
+        return rid
+    if rid == "reviewer_tail":
+        kw = str(matched_keyword or "").strip()
+        if not kw:
+            return "reviewer_tail"
+        if kw in _REVIEWER_TAIL_CANONICAL_TO_REVIEWER:
+            return "reviewer"
+        for x in _REVIEWER_TAIL_CANONICAL_TO_REVIEWER:
+            if kw.startswith(x):
+                return "reviewer"
+        return "reviewer_tail"
+    return rid
+
+
+def normalize_role_signer_map(mapping: dict | None) -> Dict[str, Any]:
+    """读库后合并 reviewer_tail→reviewer，避免旧映射缺 executor/reviewer 落位。"""
+    if not isinstance(mapping, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for rid, pair in mapping.items():
+        rid2 = canonical_sign_role_id(str(rid))
+        if rid2 not in ROLE_ID_TO_KEYWORD:
+            continue
+        if not isinstance(pair, dict):
+            continue
+        if rid2 not in out:
+            out[rid2] = dict(pair)
+            continue
+        cur = out[rid2]
+        for k, v in pair.items():
+            if v and not cur.get(k):
+                cur[k] = v
+    return out
+
+
+def role_keywords_for_apply(role_id: str) -> Tuple[str, ...]:
+    """生成文档时使用的同义词（含 reviewer_tail 中 QA/会签等，便于表格多标签落位）。"""
+    rid = canonical_sign_role_id(role_id)
+    merged: List[str] = list(role_keywords(rid))
+    seen = set(merged)
+    for extra_rid in _ROLE_APPLY_EXTRA_IDS.get(rid, ()):
+        for kw in role_keywords(extra_rid):
+            if kw not in seen:
+                seen.add(kw)
+                merged.append(kw)
+    return tuple(merged)

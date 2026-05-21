@@ -17,6 +17,8 @@ import threading
 import time
 import uuid
 import zipfile
+import functools
+from contextlib import contextmanager
 from pathlib import Path
 from queue import Queue, Empty
 from dataclasses import dataclass, field
@@ -121,6 +123,60 @@ AIPRINTWORD_WEB_BUILD = 8
 BATCH_EXPORT_ROOT = os.path.join(ROOT, "data", "batch_exports")
 HANDOFF_DIR = os.path.join(ROOT, "data", "aiword_handoff")
 _HANDOFF_LOCK = threading.Lock()
+_HEAVY_SEM: Optional[threading.Semaphore] = None
+_HEAVY_SEM_SIZE = 0
+
+
+class _SignHeavyBusyError(Exception):
+    """上传/签名等重任务并发槽位已满。"""
+
+
+def _sign_heavy_semaphore() -> threading.Semaphore:
+    global _HEAVY_SEM, _HEAVY_SEM_SIZE
+    if _HEAVY_SEM is None:
+        try:
+            n = int((os.environ.get("SIGN_HEAVY_CONCURRENCY") or "3").strip() or "3")
+        except ValueError:
+            n = 3
+        _HEAVY_SEM_SIZE = max(1, min(n, 16))
+        _HEAVY_SEM = threading.Semaphore(_HEAVY_SEM_SIZE)
+    return _HEAVY_SEM
+
+
+@contextmanager
+def _sign_heavy_op_slot():
+    try:
+        wait = int((os.environ.get("SIGN_HEAVY_WAIT_SEC") or "90").strip() or "90")
+    except ValueError:
+        wait = 90
+    wait = max(5, min(wait, 600))
+    sem = _sign_heavy_semaphore()
+    if not sem.acquire(timeout=wait):
+        raise _SignHeavyBusyError(
+            "服务器正忙于其它上传/批量签名任务（同时最多 "
+            + str(_HEAVY_SEM_SIZE)
+            + " 个重任务）。请稍后再试，或让另一客户端先完成当前批次。"
+        )
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+def sign_heavy_route(fn):
+    """限制并发的重路由：素材上传、保存笔迹、生成/批量签名文档。"""
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        try:
+            with _sign_heavy_op_slot():
+                return fn(*args, **kwargs)
+        except _SignHeavyBusyError as e:
+            return jsonify({"ok": False, "error": str(e), "error_code": "server_busy"}), 503
+
+    return _wrapped
+
+
 _HANDOFF_TTL_SEC = 30 * 60
 _HANDOFF_MAX_BYTES = 80 * 1024 * 1024
 BATCH_HISTORY_ROOT = os.path.join(ROOT, "data", "batch_history")
@@ -1613,6 +1669,178 @@ def api_admin_sign_migrate_mysql_blobs_to_ftp():
         return jsonify({"ok": False, "error": _format_com_error(e)}), 500
 
 
+@app.route("/api/admin/sign/reload-slot-layout-rules", methods=["POST"])
+def api_admin_sign_reload_slot_layout_rules():
+    """运行时热重载签字位版式规则（sign_slot_layout_rules.json）。"""
+    err, code = _admin_settings_auth_error()
+    if err:
+        if isinstance(err, dict):
+            return jsonify({"ok": False, **err}), code
+        return jsonify({"ok": False, "error": err}), code
+    try:
+        from sign_handlers import config as sign_config
+
+        sign_config.reload_sign_slot_layout_rules_from_disk()
+        rules = sign_config.SIGN_SLOT_LAYOUT_RULES
+        slot = rules.get("replace_prefilled_slot") or {}
+        cfg_path = os.path.join(
+            ROOT, "sign_handlers", "sign_slot_layout_rules.json"
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "reloaded": True,
+                "config_path": cfg_path,
+                "schema_version": int(rules.get("schema_version", 1) or 1),
+                "replace_prefilled_slot": {
+                    "enabled": bool(slot.get("enabled", True)),
+                    "max_text_len": int(slot.get("max_text_len", 48) or 48),
+                    "fullmatch_patterns_count": len(slot.get("fullmatch_patterns") or []),
+                    "search_patterns_count": len(slot.get("search_patterns") or []),
+                },
+            }
+        )
+    except Exception as e:
+        logger.exception("reload slot layout rules failed")
+        return jsonify({"ok": False, "error": _format_com_error(e)}), 500
+
+
+@app.route("/api/admin/sign/slot-layout-rules", methods=["GET"])
+def api_admin_sign_slot_layout_rules_get():
+    """查看当前生效的签字位版式规则与磁盘配置。"""
+    err, code = _admin_settings_auth_error()
+    if err:
+        if isinstance(err, dict):
+            return jsonify({"ok": False, **err}), code
+        return jsonify({"ok": False, "error": err}), code
+    try:
+        import json as _json
+        from sign_handlers import config as sign_config
+
+        rules = sign_config.SIGN_SLOT_LAYOUT_RULES
+        slot = rules.get("replace_prefilled_slot") or {}
+        cfg_path = os.path.join(ROOT, "sign_handlers", "sign_slot_layout_rules.json")
+
+        disk_rules = None
+        disk_load_error = None
+        disk_validation_error = None
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                disk_rules = _json.load(f)
+            from sign_handlers import config as _scfg
+
+            _scfg.validate_sign_slot_layout_rules_payload(disk_rules)
+        except Exception as e:
+            if disk_rules is None:
+                disk_load_error = _format_com_error(e)
+            else:
+                disk_validation_error = _format_com_error(e)
+
+        return jsonify(
+            {
+                "ok": True,
+                "config_path": cfg_path,
+                "config_exists": os.path.isfile(cfg_path),
+                "disk_load_error": disk_load_error,
+                "disk_validation_error": disk_validation_error,
+                "runtime_rules": {
+                    "schema_version": int(rules.get("schema_version", 1) or 1),
+                    "replace_prefilled_slot": {
+                        "enabled": bool(slot.get("enabled", True)),
+                        "max_text_len": int(slot.get("max_text_len", 48) or 48),
+                        "fullmatch_patterns": [
+                            getattr(p, "pattern", str(p))
+                            for p in (slot.get("fullmatch_patterns") or [])
+                        ],
+                        "search_patterns": [
+                            getattr(p, "pattern", str(p))
+                            for p in (slot.get("search_patterns") or [])
+                        ],
+                    },
+                },
+                "disk_rules": disk_rules,
+            }
+        )
+    except Exception as e:
+        logger.exception("get slot layout rules failed")
+        return jsonify({"ok": False, "error": _format_com_error(e)}), 500
+
+
+@app.route("/api/admin/sign/slot-layout-rules/download", methods=["GET"])
+def api_admin_sign_slot_layout_rules_download():
+    """下载当前磁盘上的签字位版式规则 JSON。"""
+    err, code = _admin_settings_auth_error()
+    if err:
+        if isinstance(err, dict):
+            return jsonify({"ok": False, **err}), code
+        return jsonify({"ok": False, "error": err}), code
+    cfg_path = os.path.join(ROOT, "sign_handlers", "sign_slot_layout_rules.json")
+    if not os.path.isfile(cfg_path):
+        return jsonify({"ok": False, "error": "规则文件不存在"}), 404
+    return send_file(
+        cfg_path,
+        as_attachment=True,
+        download_name="sign_slot_layout_rules.json",
+        mimetype="application/json",
+        max_age=0,
+    )
+
+
+@app.route("/api/admin/sign/slot-layout-rules/upload", methods=["POST"])
+def api_admin_sign_slot_layout_rules_upload():
+    """上传并覆盖签字位版式规则 JSON；默认上传后立即热加载。"""
+    err, code = _admin_settings_auth_error()
+    if err:
+        if isinstance(err, dict):
+            return jsonify({"ok": False, **err}), code
+        return jsonify({"ok": False, "error": err}), code
+    cfg_path = os.path.join(ROOT, "sign_handlers", "sign_slot_layout_rules.json")
+    try:
+        f = request.files.get("file")
+        if not f:
+            return jsonify({"ok": False, "error": "缺少上传文件（file）"}), 400
+        raw = f.read()
+        if not raw:
+            return jsonify({"ok": False, "error": "上传文件为空"}), 400
+        try:
+            text = raw.decode("utf-8")
+        except Exception:
+            text = raw.decode("utf-8-sig")
+        obj = json.loads(text)
+        from sign_handlers import config as sign_config
+
+        normalized = sign_config.validate_sign_slot_layout_rules_payload(obj)
+        with open(cfg_path, "w", encoding="utf-8") as fp:
+            json.dump(normalized, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+
+        sign_config.reload_sign_slot_layout_rules_from_disk()
+        rules = sign_config.SIGN_SLOT_LAYOUT_RULES
+        slot = rules.get("replace_prefilled_slot") or {}
+        return jsonify(
+            {
+                "ok": True,
+                "uploaded": True,
+                "reloaded": True,
+                "config_path": cfg_path,
+                "schema_version": int(rules.get("schema_version", 1) or 1),
+                "replace_prefilled_slot": {
+                    "enabled": bool(slot.get("enabled", True)),
+                    "max_text_len": int(slot.get("max_text_len", 48) or 48),
+                    "fullmatch_patterns_count": len(slot.get("fullmatch_patterns") or []),
+                    "search_patterns_count": len(slot.get("search_patterns") or []),
+                },
+            }
+        )
+    except json.JSONDecodeError as e:
+        return jsonify({"ok": False, "error": f"JSON 格式错误: {e}"}), 400
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.exception("upload slot layout rules failed")
+        return jsonify({"ok": False, "error": _format_com_error(e)}), 500
+
+
 @app.route("/api/batch-export/<token>")
 def api_batch_export(token):
     """?????????? ZIP?token ???????????"""
@@ -2251,6 +2479,11 @@ def api_batch_history_retry(hid):
 
 # ---------- ????????????????????----------
 SIGN_ALLOWED_EXT = {".docx", ".xlsx"}
+SIGN_WORD_SOURCE_EXT = {".doc", ".docx", ".docm"}
+SIGN_EXCEL_SOURCE_EXT = {".xls", ".xlsx", ".xlsm"}
+SIGN_SOURCE_DOC_EXT = SIGN_WORD_SOURCE_EXT | SIGN_EXCEL_SOURCE_EXT
+SIGN_ARCHIVE_ALLOWED_EXT = {".zip", ".7z", ".rar"}
+SIGN_UPLOAD_ALLOWED_EXT = SIGN_SOURCE_DOC_EXT | SIGN_ARCHIVE_ALLOWED_EXT
 SIGN_INBOX_ROOT = os.path.join(ROOT, "data", "sign_inbox")
 SIGN_MAX_SAVED_FILES = 50
 _SIGN_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -2282,9 +2515,9 @@ def _sign_saved_disk_path(sid: str, file_id: str, ext: str) -> str:
     return os.path.join(SIGN_INBOX_ROOT, sid, file_id + ext.lower())
 
 
-def _sign_upload_display_name(client_filename):
+def _sign_upload_display_name(client_filename, allowed_exts=None):
     """
-    ??multipart ????????????????????????????    ??.docx/.xlsx ?? (None, None)??    """
+    ??multipart ????????????????????????????    ??.doc/.docx/.docm/.xls/.xlsx/.xlsm ?? (None, None)??    """
     if not client_filename:
         return None, None
     norm = str(client_filename).replace("\\", "/").strip()
@@ -2295,12 +2528,301 @@ def _sign_upload_display_name(client_filename):
         return None, None
     last = parts[-1]
     ext = os.path.splitext(last)[1].lower()
-    if ext not in SIGN_ALLOWED_EXT:
+    allowed = allowed_exts or SIGN_ALLOWED_EXT
+    if ext not in allowed:
         return None, None
     display = "/".join(parts)
     if len(display) > 200:
         display = display[-200:]
     return display, ext
+
+
+def _sign_extract_zip_upload_items(zip_display_name: str, zip_bytes: bytes) -> tuple[list, list, dict]:
+    """从 zip 字节中提取签字候选文档（Word/Excel）。"""
+    out = []
+    warnings = []
+    stats = {
+        "archive_name": zip_display_name,
+        "archive_ext": ".zip",
+        "total_members": 0,
+        "source_members": 0,
+        "added_candidates": 0,
+        "skipped_members": 0,
+        "skipped_by_ext": {},
+    }
+
+    def _inc_skip(ext_key: str):
+        ek = ext_key or "(no_ext)"
+        stats["skipped_by_ext"][ek] = int(stats["skipped_by_ext"].get(ek) or 0) + 1
+        stats["skipped_members"] += 1
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            total_uncompressed = 0
+            hit_file_cap = False
+            hit_total_cap = False
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                stats["total_members"] += 1
+                if len(out) >= _ARCHIVE_EXTRACT_MAX_FILES:
+                    hit_file_cap = True
+                    break
+                inner = _zip_inner_path_safe(info.filename)
+                if not inner:
+                    _inc_skip("(invalid_path)")
+                    continue
+                ext = os.path.splitext(inner)[1].lower()
+                if ext not in SIGN_SOURCE_DOC_EXT:
+                    _inc_skip(ext or "(no_ext)")
+                    continue
+                stats["source_members"] += 1
+                fsize = int(getattr(info, "file_size", 0) or 0)
+                if fsize <= 0:
+                    _inc_skip(ext or "(empty)")
+                    continue
+                if fsize > _ARCHIVE_EXTRACT_SINGLE_MAX:
+                    warnings.append(f"压缩包成员过大，已跳过：{inner}")
+                    _inc_skip(ext or "(oversize)")
+                    continue
+                if total_uncompressed + fsize > _ARCHIVE_EXTRACT_MAX_TOTAL_UNCOMPRESSED:
+                    hit_total_cap = True
+                    break
+                try:
+                    raw = zf.read(info)
+                except Exception as e:
+                    warnings.append(f"读取压缩包成员失败，已跳过：{inner}（{e}）")
+                    _inc_skip(ext or "(read_error)")
+                    continue
+                if not raw:
+                    _inc_skip(ext or "(empty)")
+                    continue
+                if len(raw) > _ARCHIVE_EXTRACT_SINGLE_MAX:
+                    warnings.append(f"压缩包成员解压后超限，已跳过：{inner}")
+                    _inc_skip(ext or "(oversize)")
+                    continue
+                total_uncompressed += len(raw)
+                disp = (zip_display_name.rstrip("/") + "/" + inner).replace("\\", "/")
+                if len(disp) > 200:
+                    disp = disp[-200:]
+                out.append({"name": disp, "ext": ext, "raw": raw})
+                stats["added_candidates"] += 1
+            if hit_file_cap:
+                warnings.append(f"压缩包可提取文件数超过上限（{_ARCHIVE_EXTRACT_MAX_FILES}），其余已跳过")
+            if hit_total_cap:
+                warnings.append("压缩包解压总量超过上限，部分成员已跳过")
+    except (zipfile.BadZipFile, OSError) as e:
+        warnings.append(f"压缩包无法读取：{zip_display_name}（{e}）")
+    return out, warnings, stats
+
+
+def _sign_extract_archive_upload_items(
+    archive_display_name: str, archive_bytes: bytes, archive_ext: str
+) -> tuple[list, list, dict]:
+    """从压缩包字节中提取签字候选文档（Word/Excel）。"""
+    ext = (archive_ext or "").lower().strip()
+    if ext == ".zip":
+        return _sign_extract_zip_upload_items(archive_display_name, archive_bytes)
+
+    warnings = []
+    out = []
+    stats = {
+        "archive_name": archive_display_name,
+        "archive_ext": ext or "(unknown)",
+        "total_members": 0,
+        "source_members": 0,
+        "added_candidates": 0,
+        "skipped_members": 0,
+        "skipped_by_ext": {},
+    }
+    tmp_dir = tempfile.mkdtemp(prefix="aiprintword_sign_archive_")
+    archive_path = os.path.join(tmp_dir, "upload" + ext)
+    try:
+        with open(archive_path, "wb") as fp:
+            fp.write(archive_bytes or b"")
+        expanded = _expand_archive_for_batch(tmp_dir, archive_path, archive_display_name)
+        for p, rel in expanded:
+            try:
+                stats["total_members"] += 1
+                e = os.path.splitext(str(rel or ""))[1].lower()
+                if e not in SIGN_SOURCE_DOC_EXT:
+                    ek = e or "(no_ext)"
+                    stats["skipped_by_ext"][ek] = int(stats["skipped_by_ext"].get(ek) or 0) + 1
+                    stats["skipped_members"] += 1
+                    continue
+                stats["source_members"] += 1
+                if not p or not os.path.isfile(p):
+                    stats["skipped_members"] += 1
+                    stats["skipped_by_ext"][e or "(missing)"] = int(
+                        stats["skipped_by_ext"].get(e or "(missing)") or 0
+                    ) + 1
+                    continue
+                raw = Path(p).read_bytes()
+                if not raw:
+                    stats["skipped_members"] += 1
+                    stats["skipped_by_ext"][e or "(empty)"] = int(
+                        stats["skipped_by_ext"].get(e or "(empty)") or 0
+                    ) + 1
+                    continue
+                if len(raw) > _ARCHIVE_EXTRACT_SINGLE_MAX:
+                    warnings.append(f"压缩包成员解压后超限，已跳过：{rel}")
+                    stats["skipped_members"] += 1
+                    stats["skipped_by_ext"][e or "(oversize)"] = int(
+                        stats["skipped_by_ext"].get(e or "(oversize)") or 0
+                    ) + 1
+                    continue
+                disp = str(rel or "").replace("\\", "/").strip()
+                if not disp:
+                    stats["skipped_members"] += 1
+                    stats["skipped_by_ext"][e or "(invalid_path)"] = int(
+                        stats["skipped_by_ext"].get(e or "(invalid_path)") or 0
+                    ) + 1
+                    continue
+                if len(disp) > 200:
+                    disp = disp[-200:]
+                out.append({"name": disp, "ext": e, "raw": raw})
+                stats["added_candidates"] += 1
+            except Exception as ie:
+                warnings.append(f"读取压缩包成员失败，已跳过：{rel}（{ie}）")
+                ek = os.path.splitext(str(rel or ""))[1].lower() or "(read_error)"
+                stats["skipped_members"] += 1
+                stats["skipped_by_ext"][ek] = int(stats["skipped_by_ext"].get(ek) or 0) + 1
+        if not out:
+            if ext in (".7z", ".rar") and not _resolve_7zip_cli():
+                warnings.append(
+                    f"未检测到 7-Zip 命令行，无法解包：{archive_display_name}（请安装 7z/7za 并加入 PATH）"
+                )
+            else:
+                warnings.append(f"压缩包内未找到可签字文档：{archive_display_name}")
+    except Exception as e:
+        warnings.append(f"压缩包无法读取：{archive_display_name}（{e}）")
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+    return out, warnings, stats
+
+
+def _sign_convert_source_item_to_signable(item: dict) -> tuple[Optional[dict], Optional[str]]:
+    """将 .doc/.docm/.xls/.xlsm 转为 .docx/.xlsx；原生 .docx/.xlsx 直接透传。"""
+    name = str((item or {}).get("name") or "").strip()
+    ext = str((item or {}).get("ext") or "").lower().strip()
+    raw = (item or {}).get("raw")
+    if not name or not ext or not isinstance(raw, (bytes, bytearray)):
+        return None, "无效上传项"
+    if ext in SIGN_ALLOWED_EXT:
+        return {"name": name, "ext": ext, "raw": bytes(raw)}, None
+
+    tmp_dir = tempfile.mkdtemp(prefix="aiprintword_sign_convert_")
+    try:
+        src_name = os.path.basename(name.replace("\\", "/")) or ("document" + ext)
+        src_path = os.path.join(tmp_dir, src_name)
+        with open(src_path, "wb") as fp:
+            fp.write(bytes(raw))
+
+        out_path = None
+        if ext in SIGN_WORD_SOURCE_EXT:
+            from doc_handlers.word_handler import convert_doc_to_docx
+
+            out_path = convert_doc_to_docx(src_path)
+        elif ext in SIGN_EXCEL_SOURCE_EXT:
+            from doc_handlers.excel_handler import convert_xls_to_xlsx
+
+            out_path = convert_xls_to_xlsx(src_path)
+        else:
+            return None, f"暂不支持的文档类型：{ext}"
+
+        if not out_path or not os.path.isfile(out_path):
+            return None, f"转换失败（未生成输出文件）：{name}"
+
+        out_ext = os.path.splitext(out_path)[1].lower()
+        if out_ext not in SIGN_ALLOWED_EXT:
+            return None, f"转换后格式不支持：{name} -> {out_ext}"
+        out_raw = Path(out_path).read_bytes()
+        if not out_raw:
+            return None, f"转换结果为空：{name}"
+
+        stem = os.path.splitext(name)[0]
+        disp = (stem + out_ext).replace("\\", "/")
+        if len(disp) > 200:
+            disp = disp[-200:]
+        return {"name": disp, "ext": out_ext, "raw": out_raw}, None
+    except Exception as e:
+        return None, f"文档转换失败：{name}（{e}）"
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _sign_collect_upload_items(uploads: list) -> tuple[list, list, bool, int]:
+    """统一收集上传项（普通文档 + zip 内文档）。"""
+    items = []
+    warnings = []
+    upload_has_archive = False
+    archive_expanded = 0
+    archive_summary = {
+        "archives": 0,
+        "total_members": 0,
+        "source_members": 0,
+        "added_candidates": 0,
+        "added_signable": 0,
+        "skipped_members": 0,
+        "skipped_by_ext": {},
+        "per_archive": [],
+    }
+
+    def _merge_skip_counts(dst: dict, src: dict):
+        for k, v in (src or {}).items():
+            kk = str(k or "(unknown)")
+            dst[kk] = int(dst.get(kk) or 0) + int(v or 0)
+    for upload in uploads:
+        if not upload or not upload.filename:
+            continue
+        display_name, ext = _sign_upload_display_name(upload.filename, SIGN_UPLOAD_ALLOWED_EXT)
+        if not display_name:
+            warnings.append(f"已忽略不支持类型：{upload.filename}")
+            continue
+        raw = upload.read()
+        if not raw:
+            warnings.append(f"空文件已忽略：{display_name}")
+            continue
+        if ext in SIGN_SOURCE_DOC_EXT:
+            one, err = _sign_convert_source_item_to_signable(
+                {"name": display_name, "ext": ext, "raw": raw}
+            )
+            if one:
+                items.append(one)
+            elif err:
+                warnings.append(err)
+            continue
+        if ext in SIGN_ARCHIVE_ALLOWED_EXT:
+            upload_has_archive = True
+            ex_items, ex_warn, ex_stats = _sign_extract_archive_upload_items(display_name, raw, ext)
+            archive_summary["archives"] += 1
+            archive_summary["total_members"] += int((ex_stats or {}).get("total_members") or 0)
+            archive_summary["source_members"] += int((ex_stats or {}).get("source_members") or 0)
+            archive_summary["added_candidates"] += int((ex_stats or {}).get("added_candidates") or 0)
+            archive_summary["skipped_members"] += int((ex_stats or {}).get("skipped_members") or 0)
+            _merge_skip_counts(archive_summary["skipped_by_ext"], (ex_stats or {}).get("skipped_by_ext") or {})
+            if ex_stats:
+                archive_summary["per_archive"].append(ex_stats)
+            if ex_warn:
+                warnings.extend(ex_warn)
+            if ex_items:
+                archive_expanded += len(ex_items)
+                for ex in ex_items:
+                    one, err = _sign_convert_source_item_to_signable(ex)
+                    if one:
+                        items.append(one)
+                        archive_summary["added_signable"] += 1
+                    elif err:
+                        warnings.append(err)
+            continue
+        warnings.append(f"暂不支持该压缩格式：{display_name}")
+    return items, warnings, upload_has_archive, archive_expanded, archive_summary
 
 
 def _safe_display_filename_keep_unicode(name: str) -> str:
@@ -2515,6 +3037,12 @@ def _handoff_prune_stale() -> None:
                     meta = json.load(f)
                 exp = float(meta.get("expires_at") or 0)
                 if exp and now > exp + 3600:
+                    if (meta.get("kind") or "").strip().lower() == "batch":
+                        try:
+                            os.remove(jp)
+                        except OSError:
+                            pass
+                        continue
                     tok = meta.get("token") or name[:-5]
                     for suf in (".json", ".dat"):
                         p = os.path.join(HANDOFF_DIR, str(tok) + suf)
@@ -2527,6 +3055,101 @@ def _handoff_prune_stale() -> None:
                 continue
     except Exception:
         pass
+
+
+def _handoff_parse_aiword_context(raw_ctx: object) -> dict:
+    parsed_ctx = None
+    if isinstance(raw_ctx, dict):
+        parsed_ctx = raw_ctx
+    elif isinstance(raw_ctx, str):
+        s = raw_ctx.strip()
+        if s:
+            try:
+                parsed_ctx = json.loads(s)
+            except Exception:
+                parsed_ctx = None
+    out: dict = {}
+    if isinstance(parsed_ctx, dict):
+        for k in ("editor", "writer", "reviewer", "approver", "doc_date", "country", "phase"):
+            v = parsed_ctx.get(k)
+            if v is None:
+                continue
+            sv = str(v).strip()
+            if sv and len(sv) <= 500:
+                out[k] = sv
+    return out
+
+
+def _normalize_handoff_display_filename(name: str) -> str:
+    from sign_handlers.filename_util import normalize_display_filename
+
+    return normalize_display_filename(name or "")
+
+
+def _handoff_resolve_filename(meta: dict) -> str:
+    """交接展示名；内部缓存名时尝试从 reuse_ftp_path 末段恢复中文名。"""
+    from sign_handlers.filename_util import is_internal_cache_filename
+
+    fname = _normalize_handoff_display_filename(
+        (meta.get("filename") or "document.docx").strip() or "document.docx"
+    )
+    if not is_internal_cache_filename(fname):
+        return fname
+    reuse = (meta.get("reuse_ftp_path") or "").strip()
+    if reuse:
+        base = os.path.basename(reuse.replace("\\", "/"))
+        if base and not is_internal_cache_filename(base):
+            return _normalize_handoff_display_filename(base)
+    return fname
+
+
+def _handoff_create_one_token(
+    *,
+    purpose: str,
+    filename: str,
+    aiword_ctx: dict,
+    reuse_ftp_path: str = "",
+    raw: Optional[bytes] = None,
+) -> dict:
+    p = (purpose or "sign").strip().lower()
+    if p not in ("sign", "print"):
+        p = "sign"
+    name = _normalize_handoff_display_filename(filename or "document.docx")
+    reuse_ok = _handoff_validate_reuse_ftp_path(reuse_ftp_path or "")
+    if not reuse_ok:
+        if raw is None:
+            raise ValueError("缺少文件内容")
+        if not raw:
+            raise ValueError("文件为空")
+        if len(raw) > _HANDOFF_MAX_BYTES:
+            raise ValueError("文件过大")
+
+    token = uuid.uuid4().hex
+    data_path = os.path.join(HANDOFF_DIR, token + ".dat")
+    meta_path = os.path.join(HANDOFF_DIR, token + ".json")
+    expires_at = time.time() + _HANDOFF_TTL_SEC
+    meta_obj: dict = {
+        "token": token,
+        "filename": name,
+        "purpose": p,
+        "expires_at": expires_at,
+    }
+    if reuse_ok:
+        meta_obj["reuse_ftp_path"] = reuse_ok
+    if aiword_ctx:
+        meta_obj["aiword_context"] = aiword_ctx
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        json.dump(meta_obj, mf, ensure_ascii=False)
+    if (not reuse_ok) and raw is not None:
+        with open(data_path, "wb") as out:
+            out.write(raw)
+    return {
+        "token": token,
+        "filename": name,
+        "purpose": p,
+        "expires_at": expires_at,
+        "reuse_ftp": bool(reuse_ok),
+    }
 
 
 @app.route("/api/handoff", methods=["POST"])
@@ -2544,95 +3167,193 @@ def api_handoff_create():
     purpose = (request.form.get("purpose") or "sign").strip().lower()
     if purpose not in ("sign", "print"):
         purpose = "sign"
-    filename = (request.form.get("filename") or "document.docx").strip() or "document.docx"
+    filename = _normalize_handoff_display_filename(
+        (request.form.get("filename") or "document.docx").strip() or "document.docx"
+    )
     reuse_raw = (request.form.get("reuse_ftp_path") or "").strip()
     reuse_ok = _handoff_validate_reuse_ftp_path(reuse_raw)
 
-    aiword_ctx: dict = {}
-    ctx_raw = (request.form.get("handoff_context") or "").strip()
-    if ctx_raw:
-        try:
-            parsed_ctx = json.loads(ctx_raw)
-        except Exception:
-            parsed_ctx = None
-        if isinstance(parsed_ctx, dict):
-            for k in ("editor", "writer", "reviewer", "approver", "doc_date", "country"):
-                v = parsed_ctx.get(k)
-                if v is None:
-                    continue
-                s = str(v).strip()
-                if s and len(s) <= 500:
-                    aiword_ctx[k] = s
-
-    token = uuid.uuid4().hex
+    aiword_ctx = _handoff_parse_aiword_context((request.form.get("handoff_context") or "").strip())
     os.makedirs(HANDOFF_DIR, exist_ok=True)
     _handoff_prune_stale()
-    data_path = os.path.join(HANDOFF_DIR, token + ".dat")
-    meta_path = os.path.join(HANDOFF_DIR, token + ".json")
-    expires_at = time.time() + _HANDOFF_TTL_SEC
-
-    if reuse_ok:
-        try:
-            with open(meta_path, "w", encoding="utf-8") as mf:
-                meta_obj: dict = {
-                    "token": token,
-                    "filename": filename,
-                    "purpose": purpose,
-                    "expires_at": expires_at,
-                    "reuse_ftp_path": reuse_ok,
-                }
-                if aiword_ctx:
-                    meta_obj["aiword_context"] = aiword_ctx
-                json.dump(meta_obj, mf, ensure_ascii=False)
-        except OSError as e:
-            return jsonify({"ok": False, "error": f"无法写入交接目录：{e}"}), 500
-        return jsonify({"ok": True, "token": token, "expires_in_sec": _HANDOFF_TTL_SEC, "reuse_ftp": True})
-
-    up = request.files.get("file") or request.files.get("files")
-    if not up or not getattr(up, "filename", None):
-        return jsonify({"ok": False, "error": "缺少文件字段 file"}), 400
-    raw = up.read()
-    if not raw:
-        return jsonify({"ok": False, "error": "文件为空"}), 400
-    if len(raw) > _HANDOFF_MAX_BYTES:
-        return jsonify({"ok": False, "error": "文件过大"}), 400
-
+    raw = None
+    if not reuse_ok:
+        up = request.files.get("file") or request.files.get("files")
+        if not up or not getattr(up, "filename", None):
+            return jsonify({"ok": False, "error": "缺少文件字段 file"}), 400
+        raw = up.read()
     try:
-        with open(data_path, "wb") as out:
-            out.write(raw)
-        with open(meta_path, "w", encoding="utf-8") as mf:
-            meta_obj = {
-                "token": token,
-                "filename": filename,
-                "purpose": purpose,
-                "expires_at": expires_at,
-            }
-            if aiword_ctx:
-                meta_obj["aiword_context"] = aiword_ctx
-            json.dump(meta_obj, mf, ensure_ascii=False)
+        created = _handoff_create_one_token(
+            purpose=purpose,
+            filename=filename,
+            aiword_ctx=aiword_ctx,
+            reuse_ftp_path=reuse_ok,
+            raw=raw,
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     except OSError as e:
         return jsonify({"ok": False, "error": f"无法写入交接目录：{e}"}), 500
 
-    return jsonify({"ok": True, "token": token, "expires_in_sec": _HANDOFF_TTL_SEC})
+    return jsonify(
+        {
+            "ok": True,
+            "token": created["token"],
+            "expires_in_sec": _HANDOFF_TTL_SEC,
+            "reuse_ftp": bool(created.get("reuse_ftp")),
+        }
+    )
+
+
+@app.route("/api/handoff/batch", methods=["POST"])
+def api_handoff_batch_create():
+    expected = _aiword_handoff_secret_expected()
+    got = (request.headers.get("X-Aiword-Handoff-Secret") or "").strip()
+    if not expected or got != expected:
+        return jsonify({"ok": False, "error": "未授权或未配置 AIWORD_HANDOFF_SECRET"}), 401
+
+    manifest_raw = (request.form.get("manifest") or "").strip()
+    if not manifest_raw:
+        return jsonify({"ok": False, "error": "缺少 manifest"}), 400
+    try:
+        manifest = json.loads(manifest_raw)
+    except Exception:
+        return jsonify({"ok": False, "error": "manifest 不是有效 JSON"}), 400
+    if not isinstance(manifest, list) or not manifest:
+        return jsonify({"ok": False, "error": "manifest 需为非空数组"}), 400
+    if len(manifest) > 200:
+        return jsonify({"ok": False, "error": "manifest 条目过多（最多 200）"}), 400
+
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+    _handoff_prune_stale()
+
+    items: list[dict] = []
+    failures: list[dict] = []
+    with _HANDOFF_LOCK:
+        for idx, it in enumerate(manifest):
+            if not isinstance(it, dict):
+                failures.append({"index": idx, "error": "条目必须为对象"})
+                continue
+            purpose = (it.get("purpose") or request.form.get("purpose") or "sign").strip().lower()
+            filename = _normalize_handoff_display_filename(
+                (it.get("filename") or f"document_{idx+1}.docx").strip() or f"document_{idx+1}.docx"
+            )
+            aiword_ctx = _handoff_parse_aiword_context(it.get("handoff_context"))
+            reuse_ok = _handoff_validate_reuse_ftp_path(str(it.get("reuse_ftp_path") or ""))
+            raw = None
+            if not reuse_ok:
+                ff = str(it.get("file_field") or f"file_{idx}")
+                up = request.files.get(ff)
+                if not up or not getattr(up, "filename", None):
+                    failures.append({"index": idx, "filename": filename, "error": f"缺少文件字段 {ff}"})
+                    continue
+                raw = up.read()
+            try:
+                created = _handoff_create_one_token(
+                    purpose=purpose,
+                    filename=filename,
+                    aiword_ctx=aiword_ctx,
+                    reuse_ftp_path=reuse_ok,
+                    raw=raw,
+                )
+            except ValueError as e:
+                failures.append({"index": idx, "filename": filename, "error": str(e)})
+                continue
+            except OSError as e:
+                failures.append({"index": idx, "filename": filename, "error": f"无法写入交接目录：{e}"})
+                continue
+            items.append(
+                {
+                    "index": idx,
+                    "token": created["token"],
+                    "filename": created["filename"],
+                    "purpose": created["purpose"],
+                    "reuse_ftp": bool(created.get("reuse_ftp")),
+                }
+            )
+
+        if not items:
+            return jsonify({"ok": False, "error": "批量交接失败", "failures": failures}), 400
+
+        batch_token = uuid.uuid4().hex
+        batch_meta_path = os.path.join(HANDOFF_DIR, f"batch_{batch_token}.json")
+        exp = time.time() + _HANDOFF_TTL_SEC
+        try:
+            with open(batch_meta_path, "w", encoding="utf-8") as bf:
+                json.dump(
+                    {
+                        "kind": "batch",
+                        "token": batch_token,
+                        "expires_at": exp,
+                        "items": items,
+                    },
+                    bf,
+                    ensure_ascii=False,
+                )
+        except OSError as e:
+            return jsonify({"ok": False, "error": f"无法写入批量交接目录：{e}"}), 500
+
+    return jsonify(
+        {
+            "ok": True,
+            "batch_token": batch_token,
+            "items": items,
+            "failures": failures,
+            "success_count": len(items),
+            "failure_count": len(failures),
+            "expires_in_sec": _HANDOFF_TTL_SEC,
+        }
+    )
+
+
+@app.route("/api/handoff/batch/<batch_token>", methods=["GET"])
+def api_handoff_batch_get(batch_token: str):
+    tok = (batch_token or "").strip()
+    if not _handoff_safe_token(tok):
+        return jsonify({"ok": False, "error": "无效的 batch_token"}), 400
+    p = os.path.join(HANDOFF_DIR, f"batch_{tok}.json")
+    with _HANDOFF_LOCK:
+        if not os.path.isfile(p):
+            return jsonify({"ok": False, "error": "批量交接不存在或已过期"}), 404
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return jsonify({"ok": False, "error": "批量交接元数据损坏"}), 500
+        if float(meta.get("expires_at") or 0) < time.time():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            return jsonify({"ok": False, "error": "批量交接已过期"}), 410
+        items = meta.get("items")
+        if not isinstance(items, list):
+            return jsonify({"ok": False, "error": "批量交接元数据损坏"}), 500
+    return jsonify({"ok": True, "batch_token": tok, "items": items})
 
 
 @app.route("/api/handoff/<token>/claim-sign", methods=["POST"])
 def api_handoff_claim_sign(token: str):
-    """浏览器一次性将「FTP 复用」交接登记进签字文件列表，避免先下载再上传导致重复 FTP。"""
+    """浏览器一次性将交接登记进签字文件列表。"""
+    out, status = _handoff_claim_sign_token(token)
+    return jsonify(out), status
+
+
+def _handoff_claim_sign_token(token: str, *, include_files_list: bool = True) -> tuple[dict, int]:
     tok = (token or "").strip()
     if not _handoff_safe_token(tok):
-        return jsonify({"ok": False, "error": "无效的 token"}), 400
+        return {"ok": False, "error": "无效的 token"}, 400
     meta_path = os.path.join(HANDOFF_DIR, tok + ".json")
     data_path = os.path.join(HANDOFF_DIR, tok + ".dat")
     snap: dict = {}
     with _HANDOFF_LOCK:
         if not os.path.isfile(meta_path):
-            return jsonify({"ok": False, "error": "交接不存在或已使用"}), 404
+            return {"ok": False, "error": "交接不存在或已使用"}, 404
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
         except Exception:
-            return jsonify({"ok": False, "error": "交接元数据损坏"}), 500
+            return {"ok": False, "error": "交接元数据损坏"}, 500
         if float(meta.get("expires_at") or 0) < time.time():
             try:
                 if os.path.isfile(data_path):
@@ -2640,26 +3361,32 @@ def api_handoff_claim_sign(token: str):
                 os.remove(meta_path)
             except OSError:
                 pass
-            return jsonify({"ok": False, "error": "交接已过期"}), 410
-        reuse_p = (meta.get("reuse_ftp_path") or "").strip()
-        if not reuse_p:
-            return jsonify({"ok": False, "error": "not_reuse", "detail": "请改用下载交接文件"}), 400
+            return {"ok": False, "error": "交接已过期"}, 410
         if (meta.get("purpose") or "sign") != "sign":
-            return jsonify({"ok": False, "error": "非签字交接"}), 400
-        fname = (meta.get("filename") or "document.docx").strip() or "document.docx"
+            return {"ok": False, "error": "非签字交接"}, 400
+        reuse_p = (meta.get("reuse_ftp_path") or "").strip()
+        fname = _handoff_resolve_filename(meta)
         ac = meta.get("aiword_context")
         ctx_out: dict = {}
         if isinstance(ac, dict):
             ctx_out = dict(ac)
         snap = {"reuse_p": reuse_p, "fname": fname, "ctx": ctx_out}
+        if not reuse_p:
+            if not os.path.isfile(data_path):
+                return {"ok": False, "error": "交接不存在或已使用"}, 404
+            try:
+                snap["raw"] = Path(data_path).read_bytes()
+            except OSError as e:
+                return {"ok": False, "error": str(e)}, 500
 
     fname = snap["fname"]
     reuse_p = snap["reuse_p"]
     ctx_out = snap.get("ctx") or {}
+    raw = snap.get("raw")
 
     ext = os.path.splitext(fname)[1].lower() or ".docx"
     if ext not in SIGN_ALLOWED_EXT:
-        return jsonify({"ok": False, "error": f"不支持的扩展名：{ext}"}), 400
+        return {"ok": False, "error": f"不支持的扩展名：{ext}"}, 400
 
     file_id = uuid.uuid4().hex
     try:
@@ -2670,21 +3397,20 @@ def api_handoff_claim_sign(token: str):
             cur_n = mysql_store.count_files()
             _max_f = _sign_mysql_max_files()
             if cur_n + 1 > _max_f:
-                return jsonify({"ok": False, "error": f"文件数已达上限 {_max_f}"}), 400
-            mysql_store.insert_file_from_external_ftp(file_id, fname, ext, reuse_p)
+                return {"ok": False, "error": f"文件数已达上限 {_max_f}"}, 400
+            if reuse_p:
+                mysql_store.insert_file_from_external_ftp(file_id, fname, ext, reuse_p)
+            else:
+                mysql_store.insert_file(file_id, fname, ext, raw or b"")
             last_rec = {"id": file_id, "name": fname, "ext": ext}
             out = {
                 "ok": True,
                 "file": last_rec,
-                "files": mysql_store.list_files(),
                 "context": ctx_out,
             }
+            if include_files_list:
+                out["files"] = mysql_store.list_files()
         else:
-            from ftp_store import download_bytes
-
-            raw = download_bytes(reuse_p)
-            if not raw:
-                return jsonify({"ok": False, "error": "FTP 下载结果为空"}), 502
             sid, inbox_dir = _sign_ensure_session_inbox()
             # 无 MySQL：同任务多次「去签字」会重复追加同名文件；去掉旧同名条仅保留本次
             fname_norm = (fname or "").strip()
@@ -2699,18 +3425,25 @@ def api_handoff_claim_sign(token: str):
                     continue
                 kept.append(old)
             if len(kept) >= SIGN_MAX_SAVED_FILES:
-                return jsonify({"ok": False, "error": f"文件数已达上限 {SIGN_MAX_SAVED_FILES}"}), 400
+                return {"ok": False, "error": f"文件数已达上限 {SIGN_MAX_SAVED_FILES}"}, 400
             last_rec = {"id": file_id, "name": fname, "ext": ext}
             kept.append(last_rec)
             records = kept
+            file_blob = raw
+            if reuse_p:
+                from ftp_store import download_bytes
+
+                file_blob = download_bytes(reuse_p)
+                if not file_blob:
+                    return {"ok": False, "error": "FTP 下载结果为空"}, 502
             dest = os.path.join(inbox_dir, file_id + ext)
             with open(dest, "wb") as fp:
-                fp.write(raw)
+                fp.write(file_blob or b"")
             session["sign_files"] = records
             session.modified = True
             out = {"ok": True, "file": last_rec, "files": records, "context": ctx_out}
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return {"ok": False, "error": str(e)}, 500
 
     with _HANDOFF_LOCK:
         try:
@@ -2720,7 +3453,89 @@ def api_handoff_claim_sign(token: str):
                 os.remove(meta_path)
         except OSError:
             pass
-    return jsonify(out)
+    return out, 200
+
+
+@app.route("/api/handoff/batch/<batch_token>/claim-sign", methods=["POST"])
+def api_handoff_batch_claim_sign(batch_token: str):
+    tok = (batch_token or "").strip()
+    if not _handoff_safe_token(tok):
+        return jsonify({"ok": False, "error": "无效的 batch_token"}), 400
+    p = os.path.join(HANDOFF_DIR, f"batch_{tok}.json")
+    items: list[dict] = []
+    with _HANDOFF_LOCK:
+        if not os.path.isfile(p):
+            return jsonify({"ok": False, "error": "批量交接不存在或已过期"}), 404
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            return jsonify({"ok": False, "error": "批量交接元数据损坏"}), 500
+        if float(meta.get("expires_at") or 0) < time.time():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            return jsonify({"ok": False, "error": "批量交接已过期"}), 410
+        items = meta.get("items") if isinstance(meta, dict) else []
+        if not isinstance(items, list):
+            return jsonify({"ok": False, "error": "批量交接元数据损坏"}), 500
+
+    successes: list[dict] = []
+    failures: list[dict] = []
+    merged_files: list[dict] = []
+    for idx, it in enumerate(items):
+        tk = str((it or {}).get("token") or "").strip() if isinstance(it, dict) else ""
+        if not tk:
+            failures.append({"index": idx, "error": "缺少 token"})
+            continue
+        out, status = _handoff_claim_sign_token(tk, include_files_list=False)
+        if status != 200 or not out.get("ok"):
+            failures.append(
+                {
+                    "index": idx,
+                    "token": tk,
+                    "error": str(out.get("error") or "claim failed"),
+                    "status": status,
+                }
+            )
+            continue
+        one = {
+            "index": idx,
+            "token": tk,
+            "file": out.get("file"),
+            "context": out.get("context") if isinstance(out.get("context"), dict) else {},
+        }
+        successes.append(one)
+
+    if _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            merged_files = mysql_store.list_files()
+        except Exception:
+            merged_files = merged_files or []
+
+    with _HANDOFF_LOCK:
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+    if not successes:
+        return jsonify({"ok": False, "error": "批量认领失败", "failures": failures}), 400
+    return jsonify(
+        {
+            "ok": True,
+            "items": successes,
+            "files": merged_files,
+            "success_count": len(successes),
+            "failure_count": len(failures),
+            "failures": failures,
+        }
+    )
 
 
 @app.route("/api/handoff/<token>/file", methods=["GET"])
@@ -2750,7 +3565,7 @@ def api_handoff_download(token: str):
             except OSError:
                 pass
             return jsonify({"ok": False, "error": "交接已过期"}), 410
-        fname = (meta.get("filename") or "document.docx").strip() or "document.docx"
+        fname = _handoff_resolve_filename(meta)
         reuse_p = (meta.get("reuse_ftp_path") or "").strip()
         if reuse_p:
             try:
@@ -2832,7 +3647,7 @@ def api_sign_files_list():
 
 @app.route("/api/sign/upload", methods=["POST"])
 def api_sign_upload():
-    """Save one or multiple .docx/.xlsx files."""
+    """Save one or multiple sign docs, supports zip expansion."""
     uploads = request.files.getlist("files")
     if not uploads or not any(f.filename for f in uploads):
         one = request.files.get("file")
@@ -2841,20 +3656,14 @@ def api_sign_upload():
     if not uploads or not any(f.filename for f in uploads):
         return jsonify({"ok": False, "error": "?????"}), 400
 
-    parsed = []
-    for upload in uploads:
-        if not upload.filename:
-            continue
-        display_name, ext = _sign_upload_display_name(upload.filename)
-        if not display_name:
-            continue
-        parsed.append((upload, display_name, ext))
-
+    parsed, warnings, upload_has_archive, archive_expanded, archive_summary = _sign_collect_upload_items(uploads)
     if not parsed:
         return jsonify(
             {
                 "ok": False,
-                "error": "???????????? .docx / .xlsx?????????????????",
+                "error": "未找到可签字文档。请上传 .doc/.docx/.docm/.xls/.xlsx/.xlsm，或包含这些文件的压缩包。",
+                "warnings": warnings,
+                "archive_summary": archive_summary,
             }
         ), 400
 
@@ -2870,25 +3679,36 @@ def api_sign_upload():
                     {
                         "ok": False,
                         "error": (
-                            f"???? {cur_n} ?????? {len(parsed)} ??"
-                            f"????????{_max_f} ????????????"
+                            f"当前已保存 {cur_n} 个，本次将新增 {len(parsed)} 个，"
+                            f"超过上限 {_max_f}。请先删除部分文件后重试。"
                         ),
+                        "warnings": warnings,
+                        "archive_summary": archive_summary,
                     }
                 ), 400
             last_rec = None
-            for upload, display_name, ext in parsed:
+            added_ids = []
+            for item in parsed:
                 file_id = uuid.uuid4().hex
-                raw = upload.read()
+                display_name = item["name"]
+                ext = item["ext"]
+                raw = item["raw"]
                 if not raw:
-                    return jsonify({"ok": False, "error": f"?????{display_name}"}), 400
+                    return jsonify({"ok": False, "error": f"文件为空：{display_name}"}), 400
                 mysql_store.insert_file(file_id, display_name, ext, raw)
                 last_rec = {"id": file_id, "name": display_name, "ext": ext}
+                added_ids.append(file_id)
             return jsonify(
                 {
                     "ok": True,
                     "file": last_rec,
                     "files": mysql_store.list_files(),
                     "added": len(parsed),
+                    "added_ids": added_ids,
+                    "warnings": warnings,
+                    "upload_has_archive": upload_has_archive,
+                    "archive_expanded": archive_expanded,
+                    "archive_summary": archive_summary,
                 }
             )
         except Exception as e:
@@ -2901,24 +3721,43 @@ def api_sign_upload():
             {
                 "ok": False,
                 "error": (
-                    f"???? {len(records)} ?????? {len(parsed)} ??"
-                    f"????????{SIGN_MAX_SAVED_FILES} ????????????"
+                    f"当前已保存 {len(records)} 个，本次将新增 {len(parsed)} 个，"
+                    f"超过上限 {SIGN_MAX_SAVED_FILES}。请先删除部分文件后重试。"
                 ),
+                "warnings": warnings,
+                "archive_summary": archive_summary,
             }
         ), 400
 
     last_rec = None
-    for upload, display_name, ext in parsed:
+    added_ids = []
+    for item in parsed:
+        display_name = item["name"]
+        ext = item["ext"]
+        raw = item["raw"]
         file_id = uuid.uuid4().hex
         dest = os.path.join(inbox_dir, file_id + ext)
-        upload.stream.seek(0)
-        upload.save(dest)
+        with open(dest, "wb") as fp:
+            fp.write(raw)
         last_rec = {"id": file_id, "name": display_name, "ext": ext}
         records.append(last_rec)
+        added_ids.append(file_id)
     session["sign_files"] = records
     session.modified = True
 
-    return jsonify({"ok": True, "file": last_rec, "files": records, "added": len(parsed)})
+    return jsonify(
+        {
+            "ok": True,
+            "file": last_rec,
+            "files": records,
+            "added": len(parsed),
+            "added_ids": added_ids,
+            "warnings": warnings,
+            "upload_has_archive": upload_has_archive,
+            "archive_expanded": archive_expanded,
+            "archive_summary": archive_summary,
+        }
+    )
 
 
 @app.route("/api/sign/files/<file_id>", methods=["DELETE"])
@@ -2950,6 +3789,86 @@ def api_sign_file_delete(file_id):
     session.modified = True
     pruned = _sign_prune_session_files_to_disk(sid)
     return jsonify({"ok": True, "files": pruned})
+
+
+@app.route("/api/sign/files/batch-delete", methods=["POST"])
+def api_sign_files_batch_delete():
+    """Batch delete file records from pending sign list."""
+    data = request.get_json(silent=True) or {}
+    arr = data.get("file_ids")
+    if not isinstance(arr, list) or not arr:
+        return jsonify({"ok": False, "error": "缺少 file_ids（数组）"}), 400
+
+    dedup = []
+    seen = set()
+    invalid_ids = []
+    for x in arr:
+        fid = str(x or "").strip()
+        if not fid:
+            continue
+        if fid in seen:
+            continue
+        seen.add(fid)
+        if not _SIGN_FILE_ID_RE.match(fid):
+            invalid_ids.append(fid)
+            continue
+        dedup.append(fid)
+    if not dedup and invalid_ids:
+        return jsonify({"ok": False, "error": "file_ids 均无效", "invalid_ids": invalid_ids}), 400
+
+    deleted_ids = []
+    missing_ids = []
+    if _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            for fid in dedup:
+                n = mysql_store.delete_file(fid)
+                if n:
+                    deleted_ids.append(fid)
+                else:
+                    missing_ids.append(fid)
+            return jsonify(
+                {
+                    "ok": True,
+                    "deleted_ids": deleted_ids,
+                    "missing_ids": missing_ids,
+                    "invalid_ids": invalid_ids,
+                    "files": mysql_store.list_files(),
+                }
+            )
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"MySQL 删除失败: {e}"}), 500
+
+    _sign_ensure_session_inbox()
+    sid = session["sign_inbox_sid"]
+    records = list(session.get("sign_files") or [])
+    by_id = {str(r.get("id") or ""): r for r in records}
+    for fid in dedup:
+        rec = by_id.get(fid)
+        if not rec:
+            missing_ids.append(fid)
+            continue
+        _sign_remove_disk_files_for_id(sid, fid, rec.get("ext"))
+        deleted_ids.append(fid)
+
+    if deleted_ids:
+        deleted_set = set(deleted_ids)
+        session["sign_files"] = [
+            r for r in (session.get("sign_files") or []) if str(r.get("id") or "") not in deleted_set
+        ]
+        session.modified = True
+    pruned = _sign_prune_session_files_to_disk(sid)
+    return jsonify(
+        {
+            "ok": True,
+            "deleted_ids": deleted_ids,
+            "missing_ids": missing_ids,
+            "invalid_ids": invalid_ids,
+            "files": pruned,
+        }
+    )
 
 
 @app.route("/api/sign/detect", methods=["GET"])
@@ -3009,6 +3928,26 @@ def api_sign_detect():
         from sign_handlers.detect_fields import detect_file
 
         result = detect_file(in_path)
+        if isinstance(result, dict):
+            result = dict(result)
+            result["file_id"] = file_id
+            src_name = ""
+            if _sign_using_mysql():
+                src_name = (row.get("name") or "").strip() if row else ""
+            else:
+                src_name = (rec.get("name") or "").strip() if rec else ""
+            result["source_name"] = src_name
+            blob_for_hash = mysql_blob
+            if blob_for_hash is None and source_path and os.path.isfile(source_path):
+                try:
+                    with open(source_path, "rb") as hf:
+                        blob_for_hash = hf.read()
+                except OSError:
+                    blob_for_hash = None
+            if blob_for_hash is not None:
+                import hashlib
+
+                result["content_sha256"] = hashlib.sha256(blob_for_hash).hexdigest()
         return jsonify(result)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3019,7 +3958,67 @@ def api_sign_detect():
             pass
 
 
+@app.route("/api/sign/server-status", methods=["GET"])
+def api_sign_server_status():
+    """轻量状态：列表类接口不受重任务槽位限制；供前端判断服务器是否繁忙。"""
+    sem = _sign_heavy_semaphore()
+    avail = getattr(sem, "_value", None)
+    return jsonify(
+        {
+            "ok": True,
+            "heavy_slots": _HEAVY_SEM_SIZE,
+            "heavy_slots_available": avail,
+            "mysql": _sign_using_mysql(),
+            "threaded": True,
+        }
+    )
+
+
+@app.route("/api/sign/runtime-config", methods=["GET"])
+def api_sign_runtime_config():
+    """前端启动时读取的运行时配置（非敏感）。
+
+    所有项均可在「系统设置」页面调整后立即对新打开页面生效，无需重启服务。
+    取值优先级：数据库 > 环境变量 > 注册表默认值。
+    """
+    try:
+        from runtime_settings.resolve import get_setting
+
+        def _clamp_int(key: str, low: int, high: int, default: int) -> int:
+            try:
+                v = int(get_setting(key))
+            except Exception:
+                v = default
+            if v < low:
+                v = low
+            if v > high:
+                v = high
+            return v
+
+        return jsonify(
+            {
+                "ok": True,
+                "sign_detect_timeout_ms": _clamp_int(
+                    "SIGN_DETECT_TIMEOUT_MS", 30000, 86400000, 43200000
+                ),
+                "sign_detect_retry_times": _clamp_int(
+                    "SIGN_DETECT_RETRY_TIMES", 0, 3, 1
+                ),
+            }
+        )
+    except Exception as e:
+        return jsonify(
+            {
+                "ok": True,
+                "sign_detect_timeout_ms": 43200000,
+                "sign_detect_retry_times": 1,
+                "error_hint": str(e),
+            }
+        )
+
+
 @app.route("/api/sign", methods=["POST"])
+@sign_heavy_route
 def api_sign():
     """
     ??????????PNG ??????PNG??    ???????    - file_id?????????????????
@@ -3102,9 +4101,11 @@ def api_sign():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            mapping = mysql_store.get_file_role_signer_map(file_id) or {}
-            if not isinstance(mapping, dict):
-                mapping = {}
+            from sign_handlers.config import normalize_role_signer_map
+
+            mapping = normalize_role_signer_map(
+                mysql_store.get_file_role_signer_map(file_id) or {}
+            )
             for rid in roles:
                 if rid not in ROLE_ID_TO_KEYWORD:
                     return jsonify({"ok": False, "error": f"无效角色 id: {rid}"}), 400
@@ -3361,15 +4362,36 @@ def api_sign():
     return resp
 
 
+def _mysql_api_error_message(exc: Exception) -> str:
+    msg = str(exc or "").strip()
+    low = msg.lower()
+    if "timed out" in low or "timeout" in low or "10060" in msg or "10061" in msg:
+        host = (os.environ.get("MYSQL_HOST") or "").strip() or "（未配置 MYSQL_HOST）"
+        port = (os.environ.get("MYSQL_PORT") or "3306").strip()
+        return (
+            f"无法连接 MySQL（{host}:{port}）：连接超时或被拒绝。"
+            "请确认数据库服务已启动、本机网络/VPN 可达，且 .env 中 MYSQL_HOST/PORT 正确。"
+        )
+    if msg:
+        return f"MySQL 操作失败：{msg}"
+    return "MySQL 操作失败"
+
+
 @app.route("/api/sign/signers", methods=["GET"])
 def api_sign_signers_list():
     """签署人库列表（MySQL 多机共享；否则存于当前会话目录）。"""
+    brief = (request.args.get("brief") or "").strip().lower() in ("1", "true", "yes")
     try:
         if _sign_using_mysql():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            return jsonify({"ok": True, "db_share": True, "signers": mysql_store.list_signers()})
+            rows = (
+                mysql_store.list_signers_brief()
+                if brief
+                else mysql_store.list_signers()
+            )
+            return jsonify({"ok": True, "db_share": True, "brief": brief, "signers": rows})
         _sign_ensure_session_inbox()
         sid = session["sign_inbox_sid"]
         from sign_handlers.sign_library_local import list_signers as local_list_signers
@@ -3378,7 +4400,8 @@ def api_sign_signers_list():
             {"ok": True, "db_share": False, "signers": local_list_signers(SIGN_INBOX_ROOT, sid)}
         )
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        err = _mysql_api_error_message(e) if _sign_using_mysql() else str(e)
+        return jsonify({"ok": False, "error": err}), 500
 
 
 def _parse_signer_names_from_json(data: dict) -> list[str]:
@@ -3511,9 +4534,12 @@ def api_sign_signers_strokes_put(signer_id):
                     stroke_set_res = mysql_store.upsert_signer_strokes(signer_id, sig_b, date_b, locale=locale)
                 except Exception:
                     stroke_set_res = None
+            signer_nm = mysql_store.get_signer_display_name(signer_id) or ""
             return jsonify(
                 {
                     "ok": True,
+                    "signer_id": signer_id,
+                    "signer_name": signer_nm,
                     "sig_item_id": (sig_res or {}).get("stroke_item_id"),
                     "date_item_id": (date_res or {}).get("stroke_item_id"),
                     "stroke_set_id": (stroke_set_res or {}).get("stroke_set_id"),
@@ -3539,9 +4565,21 @@ def api_sign_signers_strokes_put(signer_id):
                 stroke_set_res = local_upsert(SIGN_INBOX_ROOT, sid, signer_id, sig_b, date_b, locale=locale)
             except Exception:
                 stroke_set_res = None
+        signer_nm = ""
+        try:
+            from sign_handlers.sign_library_local import list_signers as local_list_signers
+
+            for row in local_list_signers(SIGN_INBOX_ROOT, sid) or []:
+                if isinstance(row, dict) and row.get("id") == signer_id:
+                    signer_nm = (row.get("name") or "").strip()
+                    break
+        except Exception:
+            signer_nm = ""
         return jsonify(
             {
                 "ok": True,
+                "signer_id": signer_id,
+                "signer_name": signer_nm,
                 "sig_item_id": (sig_res or {}).get("stroke_item_id"),
                 "date_item_id": (date_res or {}).get("stroke_item_id"),
                 "stroke_set_id": (stroke_set_res or {}).get("stroke_set_id"),
@@ -3555,6 +4593,7 @@ def api_sign_signers_strokes_put(signer_id):
 
 
 @app.route("/api/sign/signers/<signer_id>/stroke-piece", methods=["PUT"])
+@sign_heavy_route
 def api_sign_signer_stroke_piece_put(signer_id):
     """录入英文点分日期笔迹元件：数字 0-9、月份 pm01..pm12、连接符 pdot（locale 固定 en）。"""
     if not _SIGN_FILE_ID_RE.match(signer_id or ""):
@@ -3579,6 +4618,7 @@ def api_sign_signer_stroke_piece_put(signer_id):
 
 
 @app.route("/api/sign/signers/<signer_id>/stroke-pieces", methods=["PUT"])
+@sign_heavy_route
 def api_sign_signer_stroke_pieces_batch_put(signer_id):
     """批量录入笔迹元件：JSON body { items: [ { piece_kind, png }, ... ] }。"""
     if not _SIGN_FILE_ID_RE.match(signer_id or ""):
@@ -3601,8 +4641,9 @@ def api_sign_signer_stroke_pieces_batch_put(signer_id):
             overwrite = bool(data.get("overwrite", True))
         except Exception:
             overwrite = True
-        results = []
+        results: list = []
         seen_kind = set()
+        to_write: list = []
         for it in items:
             if not isinstance(it, dict):
                 results.append({"piece_kind": "", "ok": False, "error": "条目须为 JSON 对象"})
@@ -3625,26 +4666,16 @@ def api_sign_signer_stroke_pieces_batch_put(signer_id):
             if not png_b:
                 results.append({"piece_kind": pk, "ok": False, "error": "缺少 png"})
                 continue
-            try:
+            to_write.append((pk, png_b))
+        if to_write:
+            batch_results = mysql_store.batch_upsert_signer_stroke_pieces(
+                signer_id, to_write, overwrite=overwrite
+            )
+            for br in batch_results:
+                pk = (br.get("piece_kind") or "").strip()
                 _pk_l = pk.lower()
                 _kind_h = piece_kind_label(_pk_l) if _pk_l else "元件"
-                # 覆盖判断按「签署人 + 具体元件 kind」；overwrite=False 时命中即返回 exists，不写库
-                if not overwrite:
-                    ex = mysql_store.get_stroke_item_row_by_signer_kind(
-                        signer_id, "en", pk
-                    )
-                    if ex:
-                        results.append(
-                            {
-                                "piece_kind": pk,
-                                "ok": False,
-                                "error_code": "exists",
-                                "error": f"该签署人的该元件已存在：{_kind_h}（{_pk_l}），请确认是否覆盖",
-                            }
-                        )
-                        continue
-                r = mysql_store.upsert_signer_stroke_piece(signer_id, pk, png_b)
-                if (not overwrite) and r and r.get("overwritten"):
+                if br.get("error_code") == "exists":
                     results.append(
                         {
                             "piece_kind": pk,
@@ -3654,11 +4685,7 @@ def api_sign_signer_stroke_pieces_batch_put(signer_id):
                         }
                     )
                 else:
-                    results.append({"piece_kind": pk, "ok": True, **r})
-            except ValueError as e:
-                results.append({"piece_kind": pk, "ok": False, "error": str(e)})
-            except Exception as e:
-                results.append({"piece_kind": pk, "ok": False, "error": str(e) or type(e).__name__})
+                    results.append(br)
         return jsonify({"ok": True, "results": results})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -3838,6 +4865,7 @@ def api_sign_file_role_map_put(file_id):
 
 
 @app.route("/api/sign/batch", methods=["POST"])
+@sign_heavy_route
 def api_sign_batch():
     """
     按每个文件已保存的 role-map，从签署人库取笔迹批量生成已签名文档。
@@ -3847,6 +4875,10 @@ def api_sign_batch():
         return jsonify({"ok": False, "error": "批量签名需启用 MySQL（MYSQL_HOST）"}), 400
     data = request.get_json(silent=True) or {}
     source = (data.get("source") or "library").strip().lower()
+    apply_person = bool(data.get("apply_person", True))
+    apply_date = bool(data.get("apply_date", True))
+    if (not apply_person) and (not apply_date):
+        return jsonify({"ok": False, "error": "apply_person 与 apply_date 不能同时为 false"}), 400
     if source not in ("library", "canvas"):
         source = "library"
     file_ids = data.get("file_ids")
@@ -3887,6 +4919,23 @@ def api_sign_batch():
     canvas_date_map_raw = data.get("date_map") if isinstance(data, dict) else None
     canvas_sig_map: dict = {}
     canvas_date_map: dict = {}
+    lib_canvas_sig: dict = {}
+    lib_canvas_date: dict = {}
+    if source == "library":
+        if isinstance(canvas_sig_map_raw, dict):
+            for rid, v in canvas_sig_map_raw.items():
+                rid_s = str(rid)
+                if rid_s in ROLE_ID_TO_KEYWORD:
+                    b = _decode_png_data_url_or_b64(v or "")
+                    if b:
+                        lib_canvas_sig[rid_s] = b
+        if isinstance(canvas_date_map_raw, dict):
+            for rid, v in canvas_date_map_raw.items():
+                rid_s = str(rid)
+                if rid_s in ROLE_ID_TO_KEYWORD:
+                    b = _decode_png_data_url_or_b64(v or "")
+                    if b:
+                        lib_canvas_date[rid_s] = b
     if source == "canvas":
         if not isinstance(canvas_sig_map_raw, dict) or not isinstance(canvas_date_map_raw, dict):
             return jsonify({"ok": False, "error": "画布模式需提供 sig_map/date_map 对象"}), 400
@@ -3928,9 +4977,11 @@ def api_sign_batch():
             base_name = _safe_display_filename_keep_unicode(row.get("name") or "document") or "document"
             if not base_name.lower().endswith(ext):
                 base_name = os.path.splitext(base_name)[0] + ext
-            mapping = mysql_store.get_file_role_signer_map(fid) or {}
-            if not isinstance(mapping, dict):
-                mapping = {}
+            from sign_handlers.config import normalize_role_signer_map
+
+            mapping = normalize_role_signer_map(
+                mysql_store.get_file_role_signer_map(fid) or {}
+            )
             if roles_req:
                 roles = [r for r in roles_req if r in ROLE_ID_TO_KEYWORD]
             else:
@@ -3946,16 +4997,16 @@ def api_sign_batch():
                 for rid in roles:
                     sb = canvas_sig_map.get(rid)
                     db = canvas_date_map.get(rid)
-                    if sb:
+                    if sb and apply_person:
                         sig_map[rid] = sb
-                    if db:
+                    if db and apply_date:
                         date_map[rid] = db
-                    if sb or db:
+                    if (sb and apply_person) or (db and apply_date):
                         applied.append(
                             {
                                 "role_id": rid,
-                                "sig": bool(sb),
-                                "date": bool(db),
+                                "sig": bool(sb and apply_person),
+                                "date": bool(db and apply_date),
                                 "date_mode": "canvas",
                             }
                         )
@@ -3974,8 +5025,10 @@ def api_sign_batch():
                     dm = (pair.get("date_mode") if isinstance(pair, dict) else None) or None
                     diso = (pair.get("date_iso") if isinstance(pair, dict) else None) or None
                     if mysql_store.is_composite_date_mode(dm):
+                        if not apply_date:
+                            dm = None
                         # 与单文件 POST /api/sign 一致：拼接失败不整角色放弃，退回「素材签名/整张日期图」能签则签
-                        if not sig_id or not diso:
+                        if (not sig_id) or (not diso) or (not apply_person):
                             skipped.append(
                                 {
                                     "role_id": rid,
@@ -4019,13 +5072,15 @@ def api_sign_batch():
                                 )
                                 dm = None
                             else:
-                                sig_map[rid] = srow["png"]
-                                date_map[rid] = dbytes
+                                if apply_person:
+                                    sig_map[rid] = srow["png"]
+                                if apply_date:
+                                    date_map[rid] = dbytes
                                 applied.append(
                                     {
                                         "role_id": rid,
-                                        "sig": True,
-                                        "date": True,
+                                        "sig": bool(apply_person),
+                                        "date": bool(apply_date),
                                         "date_mode": "composite",
                                     }
                                 )
@@ -4035,20 +5090,30 @@ def api_sign_batch():
                         srow = mysql_store.get_stroke_item_row(sig_id)
                         if srow and srow.get("png"):
                             sb = srow["png"]
-                            sig_map[rid] = sb
+                            if apply_person:
+                                sig_map[rid] = sb
                     db = None
                     if date_id:
                         drow = mysql_store.get_stroke_item_row(date_id)
                         if drow and drow.get("png"):
                             db = drow["png"]
-                            date_map[rid] = db
-                    if sb or db:
+                            if apply_date:
+                                date_map[rid] = db
+                    ov_sb = lib_canvas_sig.get(rid)
+                    ov_db = lib_canvas_date.get(rid)
+                    if ov_sb and apply_person:
+                        sig_map[rid] = ov_sb
+                        sb = ov_sb
+                    if ov_db and apply_date:
+                        date_map[rid] = ov_db
+                        db = ov_db
+                    if (sb and apply_person) or (db and apply_date):
                         applied.append(
                             {
                                 "role_id": rid,
-                                "sig": bool(sb),
-                                "date": bool(db),
-                                "date_mode": "item",
+                                "sig": bool(sb and apply_person),
+                                "date": bool(db and apply_date),
+                                "date_mode": "canvas_override" if (ov_sb or ov_db) else "item",
                             }
                         )
                     else:
@@ -4505,4 +5570,5 @@ if __name__ == "__main__":
             print("  lsof -nP -iTCP:%s -sTCP:LISTEN" % _port)
             print("  kill -9 <PID>")
         raise SystemExit(2)
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    # threaded=True：批量上传/保存笔迹时，其它页面仍可拉取签署人列表，避免整站「请求超时」
+    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)

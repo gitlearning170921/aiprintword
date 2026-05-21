@@ -4,9 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>批量打印 - Word / Excel / PDF</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg: #f5f5f5;
@@ -24,7 +21,7 @@
     }
     * { box-sizing: border-box; }
     body {
-      font-family: 'Noto Sans SC', -apple-system, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
       background: var(--bg);
       color: var(--text);
       min-height: 100vh;
@@ -1689,29 +1686,110 @@
       document.body.classList.add('from-aiword');
       if (dryRun) dryRun.checked = true;
       const token = (sp.get('handoff_token') || '').trim();
-      if (!token) return;
-      fetch('/api/handoff/' + encodeURIComponent(token) + '/file', { credentials: 'same-origin' })
-        .then((r) => {
-          if (!r.ok) throw new Error('交接文件获取失败（HTTP ' + r.status + '）');
-          const cd = r.headers.get('Content-Disposition') || '';
-          return r.blob().then((blob) => ({ blob, cd }));
-        })
-        .then(({ blob, cd }) => {
-          let name = 'document.docx';
-          const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
-          if (m) {
-            try {
-              name = decodeURIComponent(m[1].replace(/['"]/g, ''));
-            } catch (_) {
-              name = m[1];
-            }
-          }
-          const file = new File([blob], name, {
-            type: blob.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      const tokenListRaw = (sp.get('handoff_tokens') || '').trim();
+      const batchToken = (sp.get('handoff_batch_token') || '').trim();
+      const tokens = tokenListRaw
+        ? tokenListRaw.split(',').map((x) => String(x || '').trim()).filter(Boolean)
+        : (token ? [token] : []);
+
+      if (!tokens.length && !batchToken) return;
+
+      function isInternalCacheFileName(name) {
+        const base = String(name || '').trim().replace(/^.*[/\\]/, '');
+        if (!base) return false;
+        if (/^_(?:ftptpl|dbtpl|link)_/i.test(base)) return true;
+        if (/^_ftptpl_[0-9a-f\-]{36}(?:_\d{14})?\.(docx|doc|xlsx|xls)$/i.test(base)) return true;
+        return false;
+      }
+
+      function repairDisplayFileName(name) {
+        const s = String(name || '').trim();
+        if (!s || isInternalCacheFileName(s)) return s;
+        if (/[\u4e00-\u9fff]/.test(s)) return s;
+        if (!/[\u0080-\u00ff]/.test(s)) return s;
+        try {
+          const bytes = new Uint8Array(s.length);
+          for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xff;
+          const dec = new TextDecoder('utf-8').decode(bytes);
+          if (dec && /[\u4e00-\u9fff]/.test(dec)) return dec;
+        } catch (_) {}
+        return s;
+      }
+
+      function parseHandoffFilename(cd, fallback) {
+        let name = fallback || 'document.docx';
+        const cdStr = cd || '';
+        const star = /filename\*\s*=\s*UTF-8''([^;\s]+)/i.exec(cdStr);
+        if (star) {
+          try {
+            name = decodeURIComponent(star[1].trim());
+            return repairDisplayFileName(name);
+          } catch (_) {}
+        }
+        const plain = /filename\s*=\s*"([^"]+)"/i.exec(cdStr);
+        if (plain) {
+          name = repairDisplayFileName(plain[1]);
+        }
+        return name;
+      }
+
+      function downloadHandoffToken(tk, preferredName) {
+        return fetch('/api/handoff/' + encodeURIComponent(tk) + '/file', { credentials: 'same-origin' })
+          .then((r) => {
+            if (!r.ok) throw new Error('交接文件获取失败（HTTP ' + r.status + '）');
+            const cd = r.headers.get('Content-Disposition') || '';
+            return r.blob().then((blob) => ({ blob, cd }));
+          })
+          .then(({ blob, cd }) => {
+            const pref = repairDisplayFileName(preferredName || '');
+            const name = pref && !isInternalCacheFileName(pref)
+              ? pref
+              : parseHandoffFilename(cd, 'document.docx');
+            const file = new File([blob], name, {
+              type: blob.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            });
+            mergePendingFiles([file]);
+            updateFileHint();
+            appendRunLog('已从 aiword 传入：' + name);
           });
-          mergePendingFiles([file]);
-          updateFileHint();
-          appendRunLog('已从 aiword 传入：' + name);
+      }
+
+      const filenameByToken = {};
+      let chain = Promise.resolve();
+      if (!tokens.length && batchToken) {
+        chain = chain
+          .then(() => fetch('/api/handoff/batch/' + encodeURIComponent(batchToken), { credentials: 'same-origin' }))
+          .then((r) => {
+            if (!r.ok) throw new Error('批量交接读取失败（HTTP ' + r.status + '）');
+            return r.json();
+          })
+          .then((j) => {
+            if (!j || !j.ok) throw new Error((j && j.error) || '批量交接读取失败');
+            (Array.isArray(j.items) ? j.items : []).forEach((it) => {
+              const tk = String((it && it.token) || '').trim();
+              if (tk) {
+                tokens.push(tk);
+                if (it.filename) filenameByToken[tk] = repairDisplayFileName(it.filename);
+              }
+            });
+            if (!tokens.length) throw new Error('批量交接中没有可下载的文件');
+          });
+      }
+
+      chain = chain.then(() => {
+        if (!tokens.length) return;
+        let seq = Promise.resolve();
+        tokens.forEach((tk) => {
+          seq = seq.then(() => downloadHandoffToken(tk, filenameByToken[tk] || ''));
+        });
+        return seq;
+      });
+
+      chain
+        .then(() => {
+          if (pendingUploadFiles.length) {
+            appendRunLog('aiword 批量传入完成，共 ' + pendingUploadFiles.length + ' 个文件');
+          }
           try {
             if (window.history && window.history.replaceState) {
               window.history.replaceState(null, '', window.location.pathname + window.location.hash);

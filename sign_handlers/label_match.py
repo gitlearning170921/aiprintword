@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import List
 
 # 关键词后无冒号时，仅空白/下划线/横线/方框等视为「留空签字位」（与 sign_docx 占位语义一致）
 _PLACEHOLDER_TAIL_RE = re.compile(
@@ -85,6 +86,158 @@ def xlsx_cell_has_leading_role_keyword(cell_text, keyword: str) -> bool:
             return False
         return len(s) <= len(kw) + 2
     return True
+
+
+def iter_role_label_lines(cell_text) -> List[str]:
+    """单元格/段落拆行：签批栏常在同一格内纵向排列 Author/Reviewer/Approver。"""
+    raw = str(cell_text or "").strip()
+    if not raw:
+        return []
+    lines: List[str] = [raw]
+    if re.search(r"[\r\n]", raw):
+        lines = [x.strip() for x in re.split(r"[\r\n]+", raw) if x and x.strip()]
+    return lines
+
+
+# 签批栏「测试人/日期」「复核人/日期」；区别于用例表列头仅「测试人」
+_SIGNOFF_DATE_IN_LABEL_RE = re.compile(r"[/／]\s*日期|日期\s*[:：]", re.IGNORECASE)
+
+
+def cell_looks_like_signoff_date_label(cell_text) -> bool:
+    """是否为「测试人/日期」「复核人/日期」类签批栏标签格（非独立 Date 列表头）。"""
+    return bool(_SIGNOFF_DATE_IN_LABEL_RE.search(str(cell_text or "")))
+
+
+def cell_has_label_inline_reservation(cell_text, keyword: str) -> bool:
+    """
+    标签格内留位：关键词后仅空格/下划线/点线（无冒号亦可），签字应紧挨标签后插入。
+    适用于作者/审核/批准/测试人等所有角色。
+    """
+    if cell_text is None or not str(keyword or "").strip():
+        return False
+    kw = str(keyword).strip()
+
+    def _line_has_tail(line: str) -> bool:
+        line = str(line or "").strip()
+        if not line:
+            return False
+        if cell_text_matches_keyword(line, kw):
+            # 「测试人/日期：」等签批栏整格仅标签：签字在右侧/下方空白格，非标签格内
+            if _SIGNOFF_DATE_IN_LABEL_RE.search(line):
+                return False
+            return True
+        esc = re.escape(kw)
+        if all(ord(c) < 128 for c in kw):
+            m = re.match(r"^\s*" + esc + r"(.*)$", line, re.IGNORECASE)
+        else:
+            m = re.match(r"^\s*" + esc + r"(.*)$", line)
+        if m and _rest_is_blank_or_placeholder(m.group(1).lstrip(" ：:\t")):
+            return True
+        return False
+
+    for line in iter_role_label_lines(cell_text):
+        if _line_has_tail(line):
+            return True
+    return False
+
+
+def cell_is_bare_role_column_header(cell_text, keyword: str) -> bool:
+    """
+    宽表列头：整格仅「测试人」「审核」等，无 /日期、无同格下划线留位。
+    不是签字锚点（签在这里会误报成功且看不见）。
+    """
+    if not cell_has_role_keyword(cell_text, keyword):
+        return False
+    raw = str(cell_text or "")
+    if _SIGNOFF_DATE_IN_LABEL_RE.search(raw):
+        return False
+    kw_n = re.sub(r"\s+", "", str(keyword or "").strip())
+    if not kw_n:
+        return False
+    for line in iter_role_label_lines(cell_text):
+        line_n = re.sub(r"\s+", "", line)
+        if re.fullmatch(re.escape(kw_n) + r"[:：]?", line_n, flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def cell_is_role_signoff_label_slot(cell_text, keyword: str) -> bool:
+    """签批栏：标签含「角色/日期」（如测试人/日期、复核人/日期）。"""
+    if not cell_has_role_keyword(cell_text, keyword):
+        return False
+    if _SIGNOFF_DATE_IN_LABEL_RE.search(str(cell_text or "")):
+        return True
+    esc = re.escape(str(keyword or "").strip())
+    if esc and re.search(esc + r"\s*[/／]\s*日期", str(cell_text or ""), re.IGNORECASE):
+        return True
+    return False
+
+
+def cell_has_signoff_inline_reservation(cell_text, keyword: str) -> bool:
+    """
+    签批栏同格留位：「执行人/日期：____」等，签名与日期应紧挨标签后拼接（非右侧分列）。
+    """
+    if not cell_is_role_signoff_label_slot(cell_text, keyword):
+        return False
+    for line in iter_role_label_lines(cell_text):
+        if not cell_has_role_keyword(line, keyword):
+            continue
+        off = paragraph_text_keyword_end_offset(line, keyword)
+        if off < 0:
+            continue
+        tail = line[off:].lstrip(" ：:\t")
+        if not tail or _rest_is_blank_or_placeholder(tail):
+            return True
+    raw = str(cell_text or "")
+    off = paragraph_text_keyword_end_offset(raw, keyword)
+    if off < 0:
+        return False
+    tail = raw[off:].lstrip(" ：:\t")
+    return not tail or _rest_is_blank_or_placeholder(tail)
+
+
+def cell_inline_insert_offset_px(cell_text, keyword: str, *, max_px: int = 300) -> int | None:
+    """
+    同格标签+占位：返回应紧跟标签后插图的 x 偏移（px）；签批栏「角色/日期：____」亦适用。
+    """
+    if cell_text is None:
+        return None
+    txt = str(cell_text)
+    off = paragraph_text_keyword_end_offset(txt, keyword)
+    if off < 0:
+        return None
+    tail = txt[off:].lstrip(" ：:\t")
+    if cell_is_role_signoff_label_slot(txt, keyword):
+        if not tail or not _rest_is_blank_or_placeholder(tail):
+            return None
+    elif tail and not _rest_is_blank_or_placeholder(tail):
+        return None
+    pre = txt[:off]
+    px = 4
+    for ch in pre:
+        if ch in ("\t",):
+            px += 12
+        elif ch == " ":
+            px += 4
+        elif ord(ch) > 127:
+            px += 10
+        else:
+            px += 7
+    return min(max(px, 4), max_px)
+
+
+def cell_has_role_keyword(cell_text, keyword: str) -> bool:
+    """整格或任一行格首/整格匹配角色标签（中英、冒号、留空位）。"""
+    if cell_text is None or not str(keyword or "").strip():
+        return False
+    for line in iter_role_label_lines(cell_text):
+        if cell_text_matches_keyword(line, keyword):
+            return True
+        if xlsx_cell_has_leading_role_keyword(line, keyword):
+            return True
+    return cell_text_matches_keyword(cell_text, keyword) or xlsx_cell_has_leading_role_keyword(
+        cell_text, keyword
+    )
 
 
 def paragraph_text_keyword_end_offset(full_text: str, keyword: str) -> int:

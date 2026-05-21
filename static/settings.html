@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>系统设置 - aiprintword</title>
-  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg: #f5f5f5;
@@ -18,7 +17,7 @@
     }
     * { box-sizing: border-box; }
     body {
-      font-family: 'Noto Sans SC', sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
       background: var(--bg);
       color: var(--text);
       margin: 0;
@@ -63,6 +62,8 @@
     .row { margin-bottom: 4px; }
     .src { font-size: 0.75rem; color: var(--muted); }
     .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 20px; }
+    .toolbar.secondary { margin-top: 8px; margin-bottom: 8px; }
+    .inline-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     button {
       background: var(--accent);
       color: #fff;
@@ -78,6 +79,19 @@
     .msg.ok { background: #e8f5e9; color: #1b5e20; }
     .msg.err { background: #ffebee; color: var(--err); }
     .token-row { margin-bottom: 16px; }
+    .codebox {
+      margin-top: 8px;
+      padding: 12px;
+      background: #111;
+      color: #e8eaed;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.5;
+      max-height: 340px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
   </style>
 </head>
 <body>
@@ -97,7 +111,17 @@
       <button type="button" id="btnSave">保存到数据库</button>
       <button type="button" class="secondary" id="btnClearToken">清除本地口令</button>
     </div>
+    <div class="toolbar secondary">
+      <button type="button" id="btnLoadSignRules">查看签字版式规则</button>
+      <button type="button" class="secondary" id="btnReloadSignRules">热更新签字版式规则</button>
+    </div>
+    <div class="toolbar secondary inline-tools">
+      <button type="button" class="secondary" id="btnDownloadSignRules">下载当前规则 JSON</button>
+      <input type="file" id="signRulesFile" accept=".json,application/json" style="max-width:360px;">
+      <button type="button" id="btnUploadSignRules">上传并更新规则 JSON</button>
+    </div>
     <div id="msg"></div>
+    <pre id="signRulesBox" class="codebox" style="display:none;"></pre>
     <div id="formRoot"></div>
   </div>
 
@@ -272,6 +296,182 @@
         document.getElementById('btnLoad').click();
       } catch (e) {
         showMsg(String(e), false);
+      }
+    });
+
+    async function loadSignRules() {
+      const box = document.getElementById('signRulesBox');
+      box.style.display = 'block';
+      box.textContent = '正在加载签字版式规则...';
+      try {
+        const r = await fetch('/api/admin/sign/slot-layout-rules', { headers: headers() });
+        let j;
+        try {
+          j = await r.json();
+        } catch (e) {
+          showMsg('HTTP ' + r.status + '：签字规则接口响应不是 JSON。', false);
+          box.textContent = '加载失败：响应不是 JSON';
+          return;
+        }
+        if (!j.ok) {
+          showMsg(j.error || r.statusText, false);
+          box.textContent = '加载失败：' + (j.error || r.statusText);
+          return;
+        }
+        showMsg('已加载签字版式规则', true);
+        box.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        showMsg(String(e), false);
+        box.textContent = '加载失败：' + String(e);
+      }
+    }
+
+    document.getElementById('btnLoadSignRules').addEventListener('click', loadSignRules);
+
+    document.getElementById('btnReloadSignRules').addEventListener('click', async () => {
+      const box = document.getElementById('signRulesBox');
+      box.style.display = 'block';
+      box.textContent = '正在热更新签字版式规则...';
+      try {
+        const r = await fetch('/api/admin/sign/reload-slot-layout-rules', {
+          method: 'POST',
+          headers: headers(),
+          body: '{}'
+        });
+        let j;
+        try {
+          j = await r.json();
+        } catch (e) {
+          showMsg('HTTP ' + r.status + '：热更新接口响应不是 JSON。', false);
+          box.textContent = '热更新失败：响应不是 JSON';
+          return;
+        }
+        if (!j.ok) {
+          showMsg(j.error || r.statusText, false);
+          box.textContent = '热更新失败：' + (j.error || r.statusText);
+          return;
+        }
+        showMsg('签字版式规则已热更新', true);
+        await loadSignRules();
+      } catch (e) {
+        showMsg(String(e), false);
+        box.textContent = '热更新失败：' + String(e);
+      }
+    });
+
+    document.getElementById('btnDownloadSignRules').addEventListener('click', async () => {
+      showMsg('', true);
+      const box = document.getElementById('signRulesBox');
+      box.style.display = 'block';
+      box.textContent = '正在下载签字版式规则 JSON...';
+      try {
+        const r = await fetch('/api/admin/sign/slot-layout-rules/download', {
+          headers: { 'X-Admin-Token': (tokenEl.value || '').trim() }
+        });
+        if (!r.ok) {
+          let j = null;
+          try { j = await r.json(); } catch (e) {}
+          const errText = (j && j.error) ? j.error : ('HTTP ' + r.status);
+          showMsg('下载失败：' + errText, false);
+          box.textContent = '下载失败：' + errText;
+          return;
+        }
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'sign_slot_layout_rules.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        showMsg('已下载规则文件 sign_slot_layout_rules.json', true);
+        box.textContent = '下载成功，可在本地修改后上传。';
+      } catch (e) {
+        showMsg('下载失败：' + String(e), false);
+        box.textContent = '下载失败：' + String(e);
+      }
+    });
+
+    function validateSlotRulePayloadLocal(raw) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error('规则文件顶层必须是 JSON 对象');
+      }
+      const slot = raw.replace_prefilled_slot || {};
+      if (slot && typeof slot !== 'object') {
+        throw new Error('replace_prefilled_slot 必须是对象');
+      }
+      const full = slot.fullmatch_patterns || [];
+      const search = slot.search_patterns || [];
+      if (!Array.isArray(full)) {
+        throw new Error('replace_prefilled_slot.fullmatch_patterns 必须是数组');
+      }
+      if (!Array.isArray(search)) {
+        throw new Error('replace_prefilled_slot.search_patterns 必须是数组');
+      }
+      const pats = [...full, ...search].map(x => String(x || '').trim()).filter(Boolean);
+      for (const p of pats) {
+        try {
+          // 前端预校验，后端仍会二次严格校验
+          new RegExp(p, 'i');
+        } catch (e) {
+          throw new Error('非法正则: ' + p + ' (' + (e && e.message ? e.message : 'regex error') + ')');
+        }
+      }
+      return true;
+    }
+
+    document.getElementById('btnUploadSignRules').addEventListener('click', async () => {
+      showMsg('', true);
+      const box = document.getElementById('signRulesBox');
+      box.style.display = 'block';
+      const fileEl = document.getElementById('signRulesFile');
+      const btnUpload = document.getElementById('btnUploadSignRules');
+      const f = fileEl && fileEl.files && fileEl.files[0];
+      if (!f) {
+        showMsg('请先选择要上传的 JSON 文件', false);
+        box.textContent = '上传失败：未选择文件';
+        return;
+      }
+      box.textContent = '正在本地校验 JSON...';
+      try {
+        const text = await f.text();
+        let obj;
+        try {
+          obj = JSON.parse(text);
+        } catch (e) {
+          throw new Error('JSON 格式错误：' + (e && e.message ? e.message : String(e)));
+        }
+        validateSlotRulePayloadLocal(obj);
+        box.textContent = '本地校验通过，正在上传并热更新签字版式规则...';
+        btnUpload.disabled = true;
+        const fd = new FormData();
+        fd.append('file', f);
+        const r = await fetch('/api/admin/sign/slot-layout-rules/upload', {
+          method: 'POST',
+          headers: { 'X-Admin-Token': (tokenEl.value || '').trim() },
+          body: fd
+        });
+        let j;
+        try {
+          j = await r.json();
+        } catch (e) {
+          showMsg('上传失败：响应不是 JSON（HTTP ' + r.status + '）', false);
+          box.textContent = '上传失败：响应不是 JSON';
+          return;
+        }
+        if (!j.ok) {
+          showMsg('上传失败：' + (j.error || r.statusText), false);
+          box.textContent = '上传失败：' + (j.error || r.statusText);
+          return;
+        }
+        showMsg('规则上传并热更新成功', true);
+        await loadSignRules();
+      } catch (e) {
+        showMsg('上传失败：' + String(e), false);
+        box.textContent = '上传失败：' + String(e);
+      } finally {
+        btnUpload.disabled = false;
       }
     });
   </script>

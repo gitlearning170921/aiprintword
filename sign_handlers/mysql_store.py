@@ -144,6 +144,21 @@ def _config() -> Dict[str, Any]:
         }
 
 
+def _mysql_timeout_kwargs() -> dict:
+    """避免 MySQL 不可达时 pymysql 长时间阻塞导致整页 API 无响应。"""
+    try:
+        ct = int((os.environ.get("MYSQL_CONNECT_TIMEOUT") or "5").strip() or "5")
+    except ValueError:
+        ct = 5
+    try:
+        rt = int((os.environ.get("MYSQL_READ_TIMEOUT") or "30").strip() or "30")
+    except ValueError:
+        rt = 30
+    ct = max(1, min(ct, 60))
+    rt = max(5, min(rt, 300))
+    return {"connect_timeout": ct, "read_timeout": rt, "write_timeout": rt}
+
+
 def _connect_server():
     """连接 MySQL 服务器（不指定库），用于 CREATE DATABASE。"""
     c = _config()
@@ -154,6 +169,7 @@ def _connect_server():
         password=c["password"],
         charset=c["charset"],
         cursorclass=DictCursor,
+        **_mysql_timeout_kwargs(),
     )
 
 
@@ -167,6 +183,7 @@ def _connect_db():
         database=c["database"],
         charset=c["charset"],
         cursorclass=DictCursor,
+        **_mysql_timeout_kwargs(),
     )
 
 
@@ -408,13 +425,20 @@ def _conn_commit():
 
 
 def list_files() -> List[dict]:
+    """待签文件列表（仅元数据，不读 BLOB 内容）。避免 LENGTH(file_data) 导致远程库超时。"""
     ensure_sign_mysql()
+    try:
+        limit = int((os.environ.get("SIGN_MYSQL_MAX_FILES") or "500").strip() or "500")
+    except ValueError:
+        limit = 500
+    limit = max(1, min(limit, 2000))
     with _conn_commit() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, original_name AS name, ext, created_at, ftp_path, ftp_last_error, "
-                " (file_data IS NOT NULL AND LENGTH(file_data) > 0) AS has_blob "
-                "FROM sign_uploaded_file ORDER BY created_at DESC"
+                " (file_data IS NOT NULL) AS has_blob "
+                "FROM sign_uploaded_file ORDER BY created_at DESC LIMIT %s",
+                (limit,),
             )
             rows = cur.fetchall()
     out = []
@@ -422,6 +446,7 @@ def list_files() -> List[dict]:
         ts = r.get("created_at")
         ftp_path = (r.get("ftp_path") or "").strip()
         fe = (r.get("ftp_last_error") or "").strip()
+        has_blob = bool(r.get("has_blob")) or bool(ftp_path)
         out.append(
             {
                 "id": r["id"],
@@ -429,7 +454,7 @@ def list_files() -> List[dict]:
                 "ext": r["ext"],
                 "created_at": ts.isoformat(sep=" ") if ts is not None else None,
                 "ftp_uploaded": bool(ftp_path),
-                "blob_stored": bool(r.get("has_blob")),
+                "blob_stored": has_blob,
                 "ftp_last_error": fe or None,
             }
         )
@@ -446,6 +471,9 @@ def count_files() -> int:
 
 
 def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) -> None:
+    from sign_handlers.filename_util import normalize_display_filename
+
+    original_name = normalize_display_filename(original_name or "")
     ensure_sign_mysql()
     size = int(len(file_data or b""))
     sha = hashlib.sha256(file_data or b"").hexdigest()
@@ -482,6 +510,9 @@ def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) ->
 
 def insert_file_from_external_ftp(file_id: str, original_name: str, ext: str, external_ftp_path: str) -> None:
     """将 aiword 等外部已存在的 FTP 路径登记为待签文件，不再向 sign/inbox 重复上传。"""
+    from sign_handlers.filename_util import normalize_display_filename
+
+    original_name = normalize_display_filename(original_name or "")
     ensure_sign_mysql()
     p = (external_ftp_path or "").strip()
     if not p or ".." in p or len(p) > 768:
@@ -495,11 +526,14 @@ def insert_file_from_external_ftp(file_id: str, original_name: str, ext: str, ex
     with _conn_commit() as conn:
         _ensure_sign_file_columns(conn)
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM sign_uploaded_file WHERE ftp_path=%s", (p,))
+            cur.execute(
+                "SELECT id FROM sign_uploaded_file WHERE ftp_path=%s AND original_name=%s",
+                (p, original_name),
+            )
             dup_rows = cur.fetchall() or []
     for row in dup_rows:
         oid = (row or {}).get("id")
-        if oid:
+        if oid and str(oid) != str(file_id):
             delete_file(str(oid))
     with _conn_commit() as conn:
         _ensure_sign_file_columns(conn)
@@ -1664,7 +1698,17 @@ def _upsert_stroke_item_core(
     kind: str,
     png_b: bytes,
     prefer_ftp_path: Optional[str] = None,
+    prepared_item_id: Optional[str] = None,
+    prepared_ftp_path: Optional[str] = None,
+    prepared_ftp_err: Optional[str] = None,
+    skip_ftp: bool = False,
 ) -> Dict[str, Any]:
+    """
+    笔迹素材 upsert 核心。
+    - skip_ftp=True 时跳过 FTP 上传，使用 prepared_ftp_path / prepared_ftp_err；
+      调用方应在进入事务之前完成 FTP 上传（避免 InnoDB 长事务持锁）。
+    - prepared_item_id：piece_mode 与 sig/date 都可指定，覆盖默认 UUID 生成。
+    """
     raw = (kind or "").strip().lower()
     pk = normalize_piece_kind(raw)
     piece_mode = bool(pk)
@@ -1682,7 +1726,7 @@ def _upsert_stroke_item_core(
                 "DELETE FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s",
                 (signer_id, loc, k),
             )
-        item_id = uuid.uuid4().hex
+        item_id = prepared_item_id or uuid.uuid4().hex
     else:
         k = raw
         if k not in ("sig", "date"):
@@ -1691,20 +1735,29 @@ def _upsert_stroke_item_core(
         if loc not in ("zh", "en"):
             loc = "zh"
         sha = hashlib.sha256(png_b).hexdigest()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s AND sha256=%s",
-                (signer_id, loc, k, sha),
-            )
-            ex = cur.fetchone()
-            overwrote = bool(ex)
-            item_id = ex["id"] if ex else uuid.uuid4().hex
+        if prepared_item_id:
+            # 调用方已用「同 sha256」决定了 item_id 是否复用，这里只需判断 UPDATE/INSERT
+            item_id = prepared_item_id
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM sign_stroke_item WHERE id=%s", (item_id,))
+                overwrote = bool(cur.fetchone())
+        else:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s AND sha256=%s",
+                    (signer_id, loc, k, sha),
+                )
+                ex = cur.fetchone()
+                overwrote = bool(ex)
+                item_id = ex["id"] if ex else uuid.uuid4().hex
 
     sha = hashlib.sha256(png_b).hexdigest()
-    ftp_path = None
-    ftp_err_note: Optional[str] = None
-    if prefer_ftp_path:
+    if skip_ftp:
+        ftp_path = prepared_ftp_path
+        ftp_err_note = prepared_ftp_err
+    elif prefer_ftp_path:
         ftp_path = prefer_ftp_path
+        ftp_err_note = None
     else:
         ftp_path, ftp_err_note = _ftp_upload_bytes_or_mysql(
             png_b, f"sign/strokeitem/{item_id}.png"
@@ -1738,17 +1791,155 @@ def _upsert_stroke_item_core(
 
 
 def upsert_signer_stroke_piece(signer_id: str, piece_kind: str, png_b: bytes) -> Dict[str, Any]:
-    """录入英文点分日期笔迹元件（locale 固定为 en，同槽位覆盖）。"""
+    """录入英文点分日期笔迹元件（locale 固定为 en，同槽位覆盖）。
+
+    注意：FTP 上传放在 DB 事务之外执行，避免 InnoDB 行锁在 FTP 慢/抖动期间被长时间持有
+    （否则会拖垮其它客户端的保存/上传/列表等所有走 MySQL 的接口）。
+    """
     ensure_sign_mysql()
-    if not normalize_piece_kind(piece_kind):
+    pk_norm = normalize_piece_kind(piece_kind)
+    if not pk_norm:
         raise ValueError("无效的 piece_kind（pd0..pd9 / pm01..pm12 / pma01..pma12 / pdot）")
+    # 1) 短事务：校验签署人存在（含建表/迁移）
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM sign_signer WHERE id=%s", (signer_id,))
             if not cur.fetchone():
                 raise ValueError("签署人不存在")
-        return _upsert_stroke_item_core(conn, signer_id, "en", piece_kind, png_b)
+    # 2) 事务外：先 FTP 上传（item_id 预生成；同槽位整体覆盖，沿用新 UUID 即可）
+    item_id = uuid.uuid4().hex
+    ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(
+        png_b, f"sign/strokeitem/{item_id}.png"
+    )
+    # 3) 短事务：写入 DB
+    with _conn_commit() as conn:
+        return _upsert_stroke_item_core(
+            conn,
+            signer_id,
+            "en",
+            piece_kind,
+            png_b,
+            prepared_item_id=item_id,
+            prepared_ftp_path=ftp_path,
+            prepared_ftp_err=ftp_err,
+            skip_ftp=True,
+        )
+
+
+def batch_upsert_signer_stroke_pieces(
+    signer_id: str,
+    pieces: List[Tuple[str, bytes]],
+    overwrite: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    批量写入笔迹元件。
+    pieces: [(piece_kind, png_bytes), ...]
+
+    关键稳定性约束：
+      - FTP 上传一律放在 DB 事务之外执行；每一项写库使用独立短事务。
+        避免历史实现「N 个元件 FTP 上传与 DB 写入串在同一个 InnoDB 长事务里」
+        导致 FTP 抖动时整段事务持锁数十秒，进而把 _HEAVY_SEM 槽位、MySQL 连接池
+        与同一签署人的行锁全部占满，最终拖垮整个签名模块所有接口。
+      - 每个元件结果独立返回，与前端原本逐条展示的语义一致。
+    """
+    ensure_sign_mysql()
+    results: List[Dict[str, Any]] = []
+    # 1) 短事务预检：签署人存在 + （overwrite=False 时）批量 exists 探测
+    skip_idx: set = set()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM sign_signer WHERE id=%s", (signer_id,))
+            if not cur.fetchone():
+                raise ValueError("签署人不存在")
+            if not overwrite:
+                for i, (piece_kind, _png) in enumerate(pieces):
+                    pk = normalize_piece_kind((piece_kind or "").strip().lower())
+                    if not pk:
+                        continue
+                    cur.execute(
+                        "SELECT 1 FROM sign_stroke_item WHERE signer_id=%s AND locale='en' AND kind=%s LIMIT 1",
+                        (signer_id, pk),
+                    )
+                    if cur.fetchone():
+                        skip_idx.add(i)
+    # 2) 主循环：逐件先 FTP 后短事务（彻底拆开 FTP 与 DB 事务）
+    for i, (piece_kind, png_b) in enumerate(pieces):
+        pk_raw = (piece_kind or "").strip()
+        pk = normalize_piece_kind(pk_raw.lower())
+        if not pk:
+            results.append(
+                {
+                    "piece_kind": pk_raw,
+                    "ok": False,
+                    "error": "无效的 piece_kind（pd0..pd9 / pm01..pm12 / pma01..pma12 / pdot）",
+                }
+            )
+            continue
+        if (not overwrite) and i in skip_idx:
+            results.append(
+                {
+                    "piece_kind": pk_raw,
+                    "ok": False,
+                    "error_code": "exists",
+                    "overwritten": False,
+                }
+            )
+            continue
+        # 2.1 事务外：先 FTP 上传
+        item_id = uuid.uuid4().hex
+        try:
+            ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(
+                png_b, f"sign/strokeitem/{item_id}.png"
+            )
+        except Exception as e:
+            # SIGN_FTP_REQUIRED=True 时 FTP 强制失败会抛；此时跳过该元件，不阻断后续
+            results.append(
+                {"piece_kind": pk_raw, "ok": False, "error": str(e) or type(e).__name__}
+            )
+            continue
+        # 2.2 短事务：写入 DB
+        try:
+            with _conn_commit() as conn:
+                r = _upsert_stroke_item_core(
+                    conn,
+                    signer_id,
+                    "en",
+                    pk_raw,
+                    png_b,
+                    prepared_item_id=item_id,
+                    prepared_ftp_path=ftp_path,
+                    prepared_ftp_err=ftp_err,
+                    skip_ftp=True,
+                )
+                results.append({"piece_kind": pk_raw, "ok": True, **r})
+        except ValueError as e:
+            results.append({"piece_kind": pk_raw, "ok": False, "error": str(e)})
+        except Exception as e:
+            results.append(
+                {"piece_kind": pk_raw, "ok": False, "error": str(e) or type(e).__name__}
+            )
+    return results
+
+
+def stroke_item_exists(signer_id: str, locale: str, kind: str) -> bool:
+    """仅判断笔迹槽位是否存在，不下载 FTP 内容（批量上传 exists 预检用）。"""
+    ensure_sign_mysql()
+    loc = (locale or "zh").strip().lower()
+    k = (kind or "").strip().lower()
+    pk = normalize_piece_kind(k)
+    if pk:
+        k = pk
+        loc = "en"
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s LIMIT 1",
+                (signer_id, loc, k),
+            )
+            return bool(cur.fetchone())
 
 
 def get_stroke_item_row_by_signer_kind(signer_id: str, locale: str, kind: str) -> Optional[dict]:
@@ -2026,15 +2217,50 @@ def delete_stroke_item(item_id: str) -> int:
 
 
 def upsert_signer_stroke_item(signer_id: str, kind: str, png_b: bytes, locale: str = "zh") -> Dict[str, Any]:
+    """
+    单条 sig/date 笔迹素材入库。
+    FTP 上传放在事务外执行；事务内仅做 SELECT/INSERT/UPDATE，避免长事务持锁。
+    """
     ensure_sign_mysql()
+    k = (kind or "").strip().lower()
+    if k not in ("sig", "date"):
+        # 仅本接口受限于 sig/date；piece 元件请走 upsert_signer_stroke_piece
+        raise ValueError("kind 须为 sig 或 date")
+    loc = (locale or "zh").strip().lower()
+    if loc not in ("zh", "en"):
+        loc = "zh"
+    sha = hashlib.sha256(png_b or b"").hexdigest()
+    # 1) 短事务：校验签署人存在，按 sha256 复用历史 item_id
+    item_id = None
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM sign_signer WHERE id=%s", (signer_id,))
             if not cur.fetchone():
                 raise ValueError("签署人不存在")
-        res = _upsert_stroke_item_core(conn, signer_id, locale, kind, png_b)
-    return res
+            cur.execute(
+                "SELECT id FROM sign_stroke_item WHERE signer_id=%s AND locale=%s AND kind=%s AND sha256=%s",
+                (signer_id, loc, k, sha),
+            )
+            ex = cur.fetchone()
+            item_id = ex["id"] if ex else uuid.uuid4().hex
+    # 2) 事务外：先 FTP 上传
+    ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(
+        png_b, f"sign/strokeitem/{item_id}.png"
+    )
+    # 3) 短事务：写入 DB
+    with _conn_commit() as conn:
+        return _upsert_stroke_item_core(
+            conn,
+            signer_id,
+            loc,
+            k,
+            png_b,
+            prepared_item_id=item_id,
+            prepared_ftp_path=ftp_path,
+            prepared_ftp_err=ftp_err,
+            skip_ftp=True,
+        )
 
 
 def _hydrate_stroke_storage_row(row: Optional[dict]) -> Optional[dict]:
@@ -2219,7 +2445,18 @@ def _resolve_map_val_to_stroke_set_id(conn, val: str) -> Optional[str]:
 
 
 def _upsert_stroke_set_core(
-    conn, signer_id: str, locale: str, sig_b: bytes, date_b: bytes
+    conn,
+    signer_id: str,
+    locale: str,
+    sig_b: bytes,
+    date_b: bytes,
+    *,
+    prepared_set_id: Optional[str] = None,
+    prepared_sig_path: Optional[str] = None,
+    prepared_sig_err: Optional[str] = None,
+    prepared_date_path: Optional[str] = None,
+    prepared_date_err: Optional[str] = None,
+    skip_ftp: bool = False,
 ) -> Dict[str, Any]:
     sig_sha = hashlib.sha256(sig_b).hexdigest()
     date_sha = hashlib.sha256(date_b).hexdigest()
@@ -2232,9 +2469,16 @@ def _upsert_stroke_set_core(
         )
         ex = cur.fetchone()
         overwrote = bool(ex)
-        set_id = ex["id"] if ex else uuid.uuid4().hex
-    sig_path, sig_err = _ftp_upload_bytes_or_mysql(sig_b, f"sign/strokeset/{set_id}/sig.png")
-    date_path, date_err = _ftp_upload_bytes_or_mysql(date_b, f"sign/strokeset/{set_id}/date.png")
+        if prepared_set_id:
+            set_id = prepared_set_id
+        else:
+            set_id = ex["id"] if ex else uuid.uuid4().hex
+    if skip_ftp:
+        sig_path, sig_err = prepared_sig_path, prepared_sig_err
+        date_path, date_err = prepared_date_path, prepared_date_err
+    else:
+        sig_path, sig_err = _ftp_upload_bytes_or_mysql(sig_b, f"sign/strokeset/{set_id}/sig.png")
+        date_path, date_err = _ftp_upload_bytes_or_mysql(date_b, f"sign/strokeset/{set_id}/date.png")
     ftp_row_err_parts: List[str] = []
     if not sig_path and sig_err:
         ftp_row_err_parts.append("签名:" + sig_err)
@@ -2288,14 +2532,27 @@ def _upsert_stroke_set_core(
 
 
 def _sync_legacy_signer_stroke(
-    conn, signer_id: str, sig_b: bytes, date_b: bytes
+    conn,
+    signer_id: str,
+    sig_b: bytes,
+    date_b: bytes,
+    *,
+    prepared_sig_path: Optional[str] = None,
+    prepared_sig_err: Optional[str] = None,
+    prepared_date_path: Optional[str] = None,
+    prepared_date_err: Optional[str] = None,
+    skip_ftp: bool = False,
 ) -> None:
     sig_sha = hashlib.sha256(sig_b).hexdigest()
     date_sha = hashlib.sha256(date_b).hexdigest()
     sig_size = int(len(sig_b))
     date_size = int(len(date_b))
-    sig_path, sig_err = _ftp_upload_bytes_or_mysql(sig_b, f"sign/strokes/{signer_id}/sig.png")
-    date_path, date_err = _ftp_upload_bytes_or_mysql(date_b, f"sign/strokes/{signer_id}/date.png")
+    if skip_ftp:
+        sig_path, sig_err = prepared_sig_path, prepared_sig_err
+        date_path, date_err = prepared_date_path, prepared_date_err
+    else:
+        sig_path, sig_err = _ftp_upload_bytes_or_mysql(sig_b, f"sign/strokes/{signer_id}/sig.png")
+        date_path, date_err = _ftp_upload_bytes_or_mysql(date_b, f"sign/strokes/{signer_id}/date.png")
     leg_parts: List[str] = []
     if not sig_path and sig_err:
         leg_parts.append("签名:" + sig_err)
@@ -2340,8 +2597,8 @@ def list_signers() -> List[dict]:
             cur.execute(
                 """
                 SELECT s.id, s.display_name AS name, s.created_at,
-                    ( (st.sig_png IS NOT NULL AND LENGTH(st.sig_png) > 0) OR (st.sig_ftp_path IS NOT NULL AND st.sig_ftp_path <> '') ) AS leg_sig,
-                    ( (st.date_png IS NOT NULL AND LENGTH(st.date_png) > 0) OR (st.date_ftp_path IS NOT NULL AND st.date_ftp_path <> '') ) AS leg_date
+                    ( (st.sig_png IS NOT NULL) OR (st.sig_ftp_path IS NOT NULL AND st.sig_ftp_path <> '') ) AS leg_sig,
+                    ( (st.date_png IS NOT NULL) OR (st.date_ftp_path IS NOT NULL AND st.date_ftp_path <> '') ) AS leg_date
                 FROM sign_signer s
                 LEFT JOIN sign_signer_stroke st ON s.id = st.signer_id
                 ORDER BY s.created_at DESC
@@ -2351,9 +2608,9 @@ def list_signers() -> List[dict]:
             cur.execute(
                 """
                 SELECT id, signer_id, locale, updated_at, sig_sha256, date_sha256,
-                    ( (sig_png IS NOT NULL AND LENGTH(sig_png) > 0)
+                    ( (sig_png IS NOT NULL)
                       OR (sig_ftp_path IS NOT NULL AND sig_ftp_path <> '') ) AS has_sig_blob,
-                    ( (date_png IS NOT NULL AND LENGTH(date_png) > 0)
+                    ( (date_png IS NOT NULL)
                       OR (date_ftp_path IS NOT NULL AND date_ftp_path <> '') ) AS has_date_blob
                 FROM sign_stroke_set ORDER BY signer_id ASC, locale ASC, updated_at DESC
                 """
@@ -2362,7 +2619,7 @@ def list_signers() -> List[dict]:
             cur.execute(
                 """
                 SELECT id, signer_id, locale, kind, updated_at, sha256
-                , ftp_path, ftp_last_error, (png IS NOT NULL AND LENGTH(png) > 0) AS has_blob
+                , ftp_path, ftp_last_error, (png IS NOT NULL) AS has_blob
                 FROM sign_stroke_item ORDER BY signer_id ASC, locale ASC, kind ASC, updated_at DESC
                 """
             )
@@ -2469,6 +2726,95 @@ def list_signers() -> List[dict]:
     return out
 
 
+def list_signers_brief() -> List[dict]:
+    """素材录入页：聚合 SQL 汇总 has_* / 元件槽位，不加载笔迹明细与 BLOB。"""
+    kinds_all = all_piece_kinds()
+    empty_pie = {x: False for x in kinds_all}
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.id, s.display_name AS name, s.created_at,
+                    COALESCE(leg.leg_sig, 0) AS leg_sig,
+                    COALESCE(leg.leg_date, 0) AS leg_date,
+                    COALESCE(ss.has_set_sig, 0) AS has_set_sig,
+                    COALESCE(ss.has_set_date, 0) AS has_set_date,
+                    COALESCE(si.has_sig_item, 0) AS has_sig_item,
+                    COALESCE(si.has_date_item, 0) AS has_date_item
+                FROM sign_signer s
+                LEFT JOIN (
+                    SELECT signer_id,
+                        MAX( (sig_png IS NOT NULL) OR (sig_ftp_path IS NOT NULL AND sig_ftp_path <> '') ) AS leg_sig,
+                        MAX( (date_png IS NOT NULL) OR (date_ftp_path IS NOT NULL AND date_ftp_path <> '') ) AS leg_date
+                    FROM sign_signer_stroke
+                    GROUP BY signer_id
+                ) leg ON leg.signer_id = s.id
+                LEFT JOIN (
+                    SELECT signer_id,
+                        MAX( (sig_png IS NOT NULL) OR (sig_ftp_path IS NOT NULL AND sig_ftp_path <> '') ) AS has_set_sig,
+                        MAX( (date_png IS NOT NULL) OR (date_ftp_path IS NOT NULL AND date_ftp_path <> '') ) AS has_set_date
+                    FROM sign_stroke_set
+                    GROUP BY signer_id
+                ) ss ON ss.signer_id = s.id
+                LEFT JOIN (
+                    SELECT signer_id,
+                        MAX(CASE WHEN kind='sig' AND ( (png IS NOT NULL)
+                              OR (ftp_path IS NOT NULL AND ftp_path <> '') ) THEN 1 ELSE 0 END) AS has_sig_item,
+                        MAX(CASE WHEN kind='date' AND ( (png IS NOT NULL)
+                              OR (ftp_path IS NOT NULL AND ftp_path <> '') ) THEN 1 ELSE 0 END) AS has_date_item
+                    FROM sign_stroke_item
+                    WHERE kind IN ('sig', 'date')
+                    GROUP BY signer_id
+                ) si ON si.signer_id = s.id
+                ORDER BY s.created_at DESC
+                """
+            )
+            rows = cur.fetchall() or []
+            piece_rows: List[dict] = []
+            if kinds_all:
+                ph = ",".join(["%s"] * len(kinds_all))
+                cur.execute(
+                    "SELECT signer_id, kind FROM sign_stroke_item WHERE locale='en' AND kind IN ("
+                    + ph
+                    + ")",
+                    kinds_all,
+                )
+                piece_rows = list(cur.fetchall() or [])
+    pieces_by_signer: Dict[str, Dict[str, bool]] = {}
+    for ir in piece_rows:
+        sid = ir["signer_id"]
+        pk = normalize_piece_kind((ir.get("kind") or "").strip().lower())
+        if not pk:
+            continue
+        if sid not in pieces_by_signer:
+            pieces_by_signer[sid] = {x: False for x in kinds_all}
+        pieces_by_signer[sid][pk] = True
+    out: List[dict] = []
+    for r in rows:
+        ts = r.get("created_at")
+        signer_id = r["id"]
+        has_sig = bool(r.get("has_sig_item")) or bool(r.get("has_set_sig")) or bool(r.get("leg_sig"))
+        has_date = bool(r.get("has_date_item")) or bool(r.get("has_set_date")) or bool(r.get("leg_date"))
+        pie = pieces_by_signer.get(signer_id) or dict(empty_pie)
+        out.append(
+            {
+                "id": signer_id,
+                "name": r["name"],
+                "has_sig": has_sig,
+                "has_date": has_date,
+                "created_at": ts.isoformat(sep=" ") if ts is not None else None,
+                "stroke_sets": [],
+                "sig_items": [],
+                "date_items": [],
+                "date_piece_en": pie,
+                "brief": True,
+            }
+        )
+    return out
+
+
 def insert_signer(display_name: str) -> str:
     ensure_sign_mysql()
     sid = uuid.uuid4().hex
@@ -2481,6 +2827,21 @@ def insert_signer(display_name: str) -> str:
                 (sid, nm),
             )
     return sid
+
+
+def get_signer_display_name(signer_id: str) -> Optional[str]:
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT display_name FROM sign_signer WHERE id=%s",
+                (signer_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return (row.get("display_name") or "").strip() or None
 
 
 def delete_signer(signer_id: str) -> int:
@@ -2601,11 +2962,20 @@ def get_stroke_set_stroke_png_resolved(
 def upsert_signer_strokes(
     signer_id: str, sig_png: Optional[bytes], date_png: Optional[bytes], locale: str = "zh"
 ) -> Dict[str, Any]:
-    """写入 sign_stroke_set（按内容去重覆盖），并同步 legacy sign_signer_stroke 为当前合并结果。"""
+    """写入 sign_stroke_set（按内容去重覆盖），并同步 legacy sign_signer_stroke 为当前合并结果。
+
+    稳定性：4 次 FTP 上传一律放在 DB 事务之外执行，否则同一签署人
+    sig+date 联合保存时会与 _upsert_stroke_set_core/_sync_legacy_signer_stroke 串成长事务，
+    持有行锁数十秒拖垮其它客户端。
+    """
     ensure_sign_mysql()
     loc = (locale or "zh").strip().lower()
     if loc not in ("zh", "en"):
         loc = "zh"
+    # 1) 短事务A：校验签署人 + 合并 sig/date + 预先决定 set_id（保证 FTP 路径稳定）
+    sig_b: Optional[bytes] = None
+    date_b: Optional[bytes] = None
+    set_id: Optional[str] = None
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
@@ -2615,8 +2985,54 @@ def upsert_signer_strokes(
         sig_b, date_b = _merge_signer_stroke_bytes(conn, signer_id, sig_png, date_png)
         if not sig_b or not date_b:
             raise ValueError("请至少提交签名与日期笔迹（可只传其一，另一项从已有笔迹合并）")
-        res = _upsert_stroke_set_core(conn, signer_id, loc, sig_b, date_b)
-        _sync_legacy_signer_stroke(conn, signer_id, sig_b, date_b)
+        sig_sha = hashlib.sha256(sig_b).hexdigest()
+        date_sha = hashlib.sha256(date_b).hexdigest()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM sign_stroke_set WHERE signer_id=%s AND locale=%s AND sig_sha256=%s AND date_sha256=%s",
+                (signer_id, loc, sig_sha, date_sha),
+            )
+            ex = cur.fetchone()
+            set_id = ex["id"] if ex else uuid.uuid4().hex
+    # 2) 事务外：4 次 FTP 上传
+    set_sig_path, set_sig_err = _ftp_upload_bytes_or_mysql(
+        sig_b, f"sign/strokeset/{set_id}/sig.png"
+    )
+    set_date_path, set_date_err = _ftp_upload_bytes_or_mysql(
+        date_b, f"sign/strokeset/{set_id}/date.png"
+    )
+    leg_sig_path, leg_sig_err = _ftp_upload_bytes_or_mysql(
+        sig_b, f"sign/strokes/{signer_id}/sig.png"
+    )
+    leg_date_path, leg_date_err = _ftp_upload_bytes_or_mysql(
+        date_b, f"sign/strokes/{signer_id}/date.png"
+    )
+    # 3) 短事务B：写入 sign_stroke_set + 同步 legacy sign_signer_stroke
+    with _conn_commit() as conn:
+        res = _upsert_stroke_set_core(
+            conn,
+            signer_id,
+            loc,
+            sig_b,
+            date_b,
+            prepared_set_id=set_id,
+            prepared_sig_path=set_sig_path,
+            prepared_sig_err=set_sig_err,
+            prepared_date_path=set_date_path,
+            prepared_date_err=set_date_err,
+            skip_ftp=True,
+        )
+        _sync_legacy_signer_stroke(
+            conn,
+            signer_id,
+            sig_b,
+            date_b,
+            prepared_sig_path=leg_sig_path,
+            prepared_sig_err=leg_sig_err,
+            prepared_date_path=leg_date_path,
+            prepared_date_err=leg_date_err,
+            skip_ftp=True,
+        )
     return res
 
 
@@ -2715,17 +3131,19 @@ def set_file_role_signer_map(file_id: str, mapping: Dict[str, Any]) -> None:
                         date_item_id = None
                         date_iso_v = (val.get("date_iso") or "").strip() or None
                         date_mode_v = dm_raw
-                        if not sig_item_id or not date_iso_v:
-                            raise ValueError("笔迹拼接日期：请绑定签名素材并选择日历日期（YYYY-MM-DD）")
-                        try:
-                            if dm_raw == "composite_zh_ymd":
-                                kinds_zh_ymd_dot(date_iso_v)
-                            elif dm_raw == "composite_en_space":
-                                kinds_en_dmy_space(date_iso_v)
-                            else:
-                                kinds_for_iso_date(date_iso_v)
-                        except Exception as e:
-                            raise ValueError("日期无效，需为 YYYY-MM-DD") from e
+                        if not sig_item_id and not date_iso_v:
+                            raise ValueError("笔迹拼接日期：请至少绑定签名素材或选择日历日期")
+                        # 允许仅签名、仅 date_iso、或二者都有；生成签名时再校验是否可拼接（见 app.py）。
+                        if date_iso_v:
+                            try:
+                                if dm_raw == "composite_zh_ymd":
+                                    kinds_zh_ymd_dot(date_iso_v)
+                                elif dm_raw == "composite_en_space":
+                                    kinds_en_dmy_space(date_iso_v)
+                                else:
+                                    kinds_for_iso_date(date_iso_v)
+                            except Exception as e:
+                                raise ValueError("日期无效，需为 YYYY-MM-DD") from e
                     else:
                         sig_item_id = str(val.get("sig") or "").strip() or None
                         date_item_id = str(val.get("date") or "").strip() or None
