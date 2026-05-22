@@ -98,7 +98,7 @@ def match_document_role_rule(source_name: str) -> Optional[Dict[str, Any]]:
 
 
 def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[str, Any]:
-    """把文件名规则识别到的角色并入 detect 结果，正文识别不够时兜底补全。"""
+    """按文件名规则修正文档角色；人工维护规则命中后以规则为准。"""
     if not isinstance(result, dict):
         return result
     rule = match_document_role_rule(source_name)
@@ -115,16 +115,9 @@ def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[
         result["roles"] = []
         result["blocks"] = []
         return result
-    existing = []
-    for r in result.get("roles") or []:
-        rid = str((r or {}).get("id") or "")
-        if rid:
-            existing.append(rid)
-    roles = list(result.get("roles") or [])
-    for rid in roles_from_rule:
-        if rid not in existing:
-            roles.append({"id": rid, "confidence": 0.99, "source": "document_role_rule"})
-            existing.append(rid)
-    result["roles"] = roles
+    result["roles"] = [
+        {"id": rid, "confidence": 0.99, "source": "document_role_rule"}
+        for rid in roles_from_rule
+    ]
     return result
 
