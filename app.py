@@ -3945,6 +3945,12 @@ def api_sign_detect():
             else:
                 src_name = (rec.get("name") or "").strip() if rec else ""
             result["source_name"] = src_name
+            try:
+                from sign_handlers.sign_document_role_rules import apply_document_role_rules
+
+                result = apply_document_role_rules(result, src_name)
+            except Exception:
+                pass
             blob_for_hash = mysql_blob
             if blob_for_hash is None and source_path and os.path.isfile(source_path):
                 try:
