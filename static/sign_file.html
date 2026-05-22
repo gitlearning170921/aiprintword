@@ -179,6 +179,7 @@
     body.from-aiword a[href="/sign/materials"] { display: none !important; }
     body.batch-workbench-mode .legacy-sign-flow { display: none !important; }
     body.batch-workbench-mode #uploadSaveCard { display: block !important; }
+    body.batch-workbench-mode #legacyFileListCard { display: block !important; }
     body.batch-workbench-mode #needSignCard {
       display: none !important;
     }
@@ -284,6 +285,34 @@
       width: 100%;
       height: 14px;
       accent-color: var(--accent);
+    }
+    #saveUploadProgressWrap {
+      display: none;
+      margin: 10px 0 0;
+      padding: 8px 10px;
+      background: #f7f9fc;
+      border: 1px solid #dce6f6;
+      border-radius: 6px;
+    }
+    #saveUploadProgressBar {
+      width: 100%;
+      height: 14px;
+      accent-color: var(--accent);
+    }
+    #saveUploadProgressText {
+      margin-top: 6px;
+      font-size: 0.88rem;
+      color: var(--text-muted);
+    }
+    #saveUploadFeedback.btn-inline-feedback.is-ok {
+      background: #e8f5e9;
+      color: #1b5e20;
+      border: 1px solid #a5d6a7;
+    }
+    #saveUploadFeedback.btn-inline-feedback.is-warn {
+      background: #fff3e0;
+      color: #bf360c;
+      border: 1px solid #ffcc80;
     }
     #batchWorkbenchProgressText {
       margin-top: 6px;
@@ -395,7 +424,11 @@
           <p class="hint" id="fileHint">可多选 .doc/.docx/.docm/.xls/.xlsx/.xlsm/.zip/.7z/.rar，或使用「选择文件夹」上传整目录；上传后自动进入批量签字工作台</p>
           <div class="btn-row" style="margin-top:12px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
             <button type="button" class="btn btn-secondary" id="saveBtn" disabled>保存到列表</button>
-            <p id="saveUploadFeedback" class="btn-inline-feedback is-error" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
+            <p id="saveUploadFeedback" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
+          </div>
+          <div id="saveUploadProgressWrap" role="status" aria-live="polite">
+            <progress id="saveUploadProgressBar" value="0" max="100"></progress>
+            <div id="saveUploadProgressText">准备上传…</div>
           </div>
         </div>
 
@@ -602,7 +635,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js?v=47';
+      s.src = (p || '') + '/js/sign-page.js?v=48';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +

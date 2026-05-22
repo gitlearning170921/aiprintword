@@ -3935,15 +3935,43 @@ def api_sign_detect():
 
         from sign_handlers.detect_fields import detect_file
 
-        result = detect_file(in_path)
+        src_name = ""
+        if _sign_using_mysql():
+            src_name = (row.get("name") or "").strip() if row else ""
+        else:
+            src_name = (rec.get("name") or "").strip() if rec else ""
+
+        try:
+            op_timeout = int((os.environ.get("SIGN_DETECT_OP_TIMEOUT_SEC") or "300").strip() or "300")
+        except ValueError:
+            op_timeout = 300
+        op_timeout = max(60, min(op_timeout, 1800))
+
+        def _run_detect():
+            return detect_file(in_path, source_name=src_name)
+
+        result = None
+        try:
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(_run_detect)
+                result = fut.result(timeout=op_timeout)
+        except _FutTimeout:
+            result = {
+                "ok": False,
+                "error": (
+                    f"识别超时（>{op_timeout} 秒）。该文档可能页数很多（如软件需求规范），"
+                    "已中止本次解析；请稍后单独重试或联系管理员调整 SIGN_DETECT_OP_TIMEOUT_SEC。"
+                ),
+                "error_code": "detect_timeout",
+            }
+        except Exception as e:
+            result = {"ok": False, "error": str(e)}
+
         if isinstance(result, dict):
             result = dict(result)
             result["file_id"] = file_id
-            src_name = ""
-            if _sign_using_mysql():
-                src_name = (row.get("name") or "").strip() if row else ""
-            else:
-                src_name = (rec.get("name") or "").strip() if rec else ""
             result["source_name"] = src_name
             try:
                 from sign_handlers.sign_document_role_rules import apply_document_role_rules

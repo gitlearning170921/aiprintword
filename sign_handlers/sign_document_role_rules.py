@@ -97,6 +97,39 @@ def match_document_role_rule(source_name: str) -> Optional[Dict[str, Any]]:
     return best
 
 
+def _filter_blocks_by_roles(blocks: Any, allowed_roles: List[str]) -> List[Dict[str, Any]]:
+    if not isinstance(blocks, list):
+        return []
+    allow = set(allowed_roles or [])
+    if not allow:
+        return []
+    out: List[Dict[str, Any]] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        fields = b.get("fields")
+        if not isinstance(fields, list):
+            continue
+        kept_fields = []
+        has_role = False
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            ftype = str(f.get("type") or "").strip()
+            if ftype == "role_id":
+                rid = str(f.get("name") or "").strip()
+                if rid not in allow:
+                    continue
+                has_role = True
+            kept_fields.append(f)
+        if not has_role:
+            continue
+        b2 = dict(b)
+        b2["fields"] = kept_fields
+        out.append(b2)
+    return out
+
+
 def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[str, Any]:
     """按文件名规则修正文档角色；人工维护规则命中后以规则为准。"""
     if not isinstance(result, dict):
@@ -109,15 +142,50 @@ def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[
         "matched": True,
         "pattern": rule.get("pattern"),
         "roles": roles_from_rule,
+        "override": True,
     }
     if not roles_from_rule:
         # 空角色也是明确识别结果：用于规范评审报告、调查问卷等不应进入签字流程的文档。
         result["roles"] = []
         result["blocks"] = []
+        result["role_evidence"] = {}
+        result["debug_summary"] = {
+            "rule_override": True,
+            "override_pattern": rule.get("pattern"),
+            "override_roles": [],
+        }
         return result
+    original_roles = [str((x or {}).get("id") or "") for x in (result.get("roles") or []) if isinstance(x, dict)]
     result["roles"] = [
         {"id": rid, "confidence": 0.99, "source": "document_role_rule"}
         for rid in roles_from_rule
     ]
+    result["blocks"] = _filter_blocks_by_roles(result.get("blocks"), roles_from_rule)
+    role_evidence = result.get("role_evidence")
+    if isinstance(role_evidence, dict):
+        result["role_evidence"] = {
+            rid: role_evidence.get(rid, [])
+            for rid in roles_from_rule
+            if isinstance(role_evidence.get(rid), list)
+        }
+    else:
+        result["role_evidence"] = {}
+    for rid in roles_from_rule:
+        ev = result["role_evidence"].setdefault(rid, [])
+        if not ev:
+            ev.append(
+                {
+                    "confidence": 0.99,
+                    "source_hint": "document_name_rule",
+                    "matched_rules": ["document_role_rule_override"],
+                    "label_preview": str(rule.get("pattern") or ""),
+                }
+            )
+    result["debug_summary"] = {
+        "rule_override": True,
+        "override_pattern": rule.get("pattern"),
+        "override_roles": roles_from_rule,
+        "dropped_roles": [rid for rid in original_roles if rid and rid not in set(roles_from_rule)],
+    }
     return result
 

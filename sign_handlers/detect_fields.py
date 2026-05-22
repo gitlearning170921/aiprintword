@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sign_handlers.config import ROLE_ID_TO_KEYWORD, canonical_sign_role_id, role_keywords
 from sign_handlers.label_match import cell_text_matches_keyword, xlsx_cell_has_leading_role_keyword
@@ -135,6 +135,55 @@ class DetectedBlock:
         return d
 
 
+def _append_role_evidence(
+    role_evidence: Dict[str, List[Dict[str, Any]]],
+    role_ids: Sequence[str],
+    confidence: float,
+    source_hint: str,
+    matched_rules: Sequence[str],
+    label_preview: str = "",
+) -> None:
+    for rid in sorted(set(role_ids or [])):
+        if rid not in ROLE_ID_TO_KEYWORD:
+            continue
+        arr = role_evidence.setdefault(rid, [])
+        arr.append(
+            {
+                "confidence": float(confidence),
+                "source_hint": str(source_hint or ""),
+                "matched_rules": list(matched_rules or []),
+                "label_preview": str(label_preview or "")[:120],
+            }
+        )
+
+
+def _compact_role_evidence(role_evidence: Dict[str, List[Dict[str, Any]]], top_n: int = 3) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for rid, arr in (role_evidence or {}).items():
+        if rid not in ROLE_ID_TO_KEYWORD or not isinstance(arr, list):
+            continue
+        seen = set()
+        clean = []
+        arr_sorted = sorted(arr, key=lambda x: float(x.get("confidence") or 0.0), reverse=True)
+        for e in arr_sorted:
+            if not isinstance(e, dict):
+                continue
+            key = (
+                str(e.get("source_hint") or ""),
+                tuple(str(x) for x in (e.get("matched_rules") or [])),
+                str(e.get("label_preview") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(e)
+            if len(clean) >= max(1, int(top_n)):
+                break
+        if clean:
+            out[rid] = clean
+    return out
+
+
 def _score_block(
     role_ids: List[str], joined_text: str, has_date: bool, has_action: bool
 ) -> Tuple[float, List[str]]:
@@ -142,6 +191,9 @@ def _score_block(
     matched: List[str] = []
     rset = set(role_ids)
     jt = joined_text or ""
+    # 仅「执行+审核」且无日期/动作，通常是用例表列头，不应作为签字角色命中。
+    if rset and rset.issubset({"executor", "reviewer"}) and not has_date and not has_action:
+        return 0.0, ["weak_executor_reviewer_only"]
     if rset and has_date:
         matched.append("strong_block_rule")
     if {"author", "reviewer", "approver"}.issubset(rset):
@@ -150,8 +202,12 @@ def _score_block(
         matched.append("triad_text_hint")
     elif _contains_any(jt.lower(), _EN_TRIAD_TOKENS) and len(rset) >= 2:
         matched.append("triad_text_hint_en")
-    elif len(rset) >= 2 and rset.intersection({"author", "reviewer", "approver"}):
+    elif len(rset) >= 2 and rset.intersection({"author", "reviewer", "approver"}) and (
+        has_date or has_action or "author" in rset or "approver" in rset
+    ):
         matched.append("multi_role_rule")
+    elif len(rset) >= 2 and rset.intersection({"author", "reviewer", "approver"}):
+        matched.append("multi_role_weak_context")
     if _contains_any(jt, ("企业负责人", "法定代表人", "法人代表")) and (has_date or has_action):
         matched.append("org_seal_rule")
     if has_action and has_date and rset:
@@ -168,6 +224,8 @@ def _score_block(
         return 0.88, matched
     if "multi_role_rule" in matched:
         return 0.8, matched
+    if "multi_role_weak_context" in matched:
+        return 0.62, matched
     if "org_seal_rule" in matched:
         return 0.86, matched
     if "table_header_rule" in matched:
@@ -266,27 +324,89 @@ def _harvest_roles_xlsx_cell(ws, max_scan_rows: int, max_scan_cols: int) -> Dict
 
 
 def _iter_docx_tables(doc) -> List:
-    tables: List = list(getattr(doc, "tables", None) or [])
+    """全量表（签字落位等场景）；识别角色请用 _iter_docx_tables_for_detect。"""
+    return _iter_docx_tables_for_detect(doc, max_total=10000)
+
+
+def _iter_docx_tables_for_detect(doc, max_body_tables: int = 32, max_total: int = 96) -> List:
+    """
+    识别专用：SRS 等长文档会在每节页眉/页脚重复签批表，全量遍历会极慢甚至像卡死。
+    仅取正文前/后若干表 + 首尾节的页眉页脚表。
+    """
+    tables: List = []
+    body = list(getattr(doc, "tables", None) or [])
+    if len(body) > max_body_tables:
+        head_n = min(8, max_body_tables // 2)
+        tail_n = max_body_tables - head_n
+        body = body[:head_n] + body[-tail_n:]
+    tables.extend(body)
     try:
-        for section in doc.sections:
+        sections = list(doc.sections)
+        pick = []
+        if sections:
+            pick.append(sections[0])
+            if len(sections) > 1:
+                pick.append(sections[-1])
+        for section in pick:
             for hf in (
-                section.header,
                 section.footer,
-                section.first_page_header,
+                section.header,
                 section.first_page_footer,
+                section.first_page_header,
             ):
                 if hf is None:
                     continue
                 tables.extend(list(getattr(hf, "tables", None) or []))
     except Exception:
         pass
+    if len(tables) > max_total:
+        return tables[:max_total]
     return tables
+
+
+def _docx_has_core_triad(role_ids_found: Dict[str, float]) -> bool:
+    return {"author", "reviewer", "approver"}.issubset(set(role_ids_found.keys()))
+
+
+_ROLE_KW_FLAT_CACHE: Optional[Tuple[str, ...]] = None
+
+
+def _all_role_keywords_flat() -> Tuple[str, ...]:
+    global _ROLE_KW_FLAT_CACHE
+    if _ROLE_KW_FLAT_CACHE is None:
+        seen: set = set()
+        flat: List[str] = []
+        for rid in ROLE_ID_TO_KEYWORD:
+            for kw in role_keywords(rid):
+                k = str(kw or "").strip()
+                if not k or k in seen:
+                    continue
+                seen.add(k)
+                flat.append(k)
+        flat.sort(key=len, reverse=True)
+        _ROLE_KW_FLAT_CACHE = tuple(flat)
+    return _ROLE_KW_FLAT_CACHE
+
+
+def _paragraph_might_have_role(text: str) -> bool:
+    t = text or ""
+    if not t:
+        return False
+    if _contains_any(t, _DATE_TOKENS) or _contains_any(t, _ACTION_TOKENS):
+        return True
+    for kw in _all_role_keywords_flat():
+        if all(ord(c) < 128 for c in kw):
+            if kw.lower() in t.lower():
+                return True
+        elif kw in t:
+            return True
+    return False
 
 
 def _apply_docx_table_triad_boost(doc, role_ids_found: Dict[str, float]) -> None:
     """同一表内凑齐 author+reviewer+approver（或其中两个）时抬高置信度。"""
     core = {"author", "reviewer", "approver"}
-    for table in _iter_docx_tables(doc):
+    for table in _iter_docx_tables_for_detect(doc):
         ids: set = set()
         for row in table.rows:
             for cell in row.cells:
@@ -364,6 +484,7 @@ def _append_xlsx_block(
     sheet_title: str,
     row_index: int,
     role_ids_found: Dict[str, float],
+    role_evidence: Dict[str, List[Dict[str, Any]]],
 ) -> None:
     fields: List[Dict[str, str]] = []
     for rid in sorted(set(role_ids)):
@@ -385,6 +506,14 @@ def _append_xlsx_block(
     blocks.append(b)
     for rid in set(role_ids):
         role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+    _append_role_evidence(
+        role_evidence,
+        role_ids,
+        conf,
+        f"{sheet_title}!row{row_index}",
+        matched,
+        joined,
+    )
 
 
 def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) -> dict:
@@ -394,6 +523,7 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
     wb = load_workbook(path, data_only=True)
     blocks: List[DetectedBlock] = []
     role_ids_found: Dict[str, float] = {}
+    role_evidence: Dict[str, List[Dict[str, Any]]] = {}
     bi_holder = [1]
 
     for ws in wb.worksheets:
@@ -402,6 +532,14 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
         # 逐格补漏（与有效扫描范围一致，避免只扫到「第一页」）
         for rid, conf in _harvest_roles_xlsx_cell(ws, eff_rows, eff_cols).items():
             role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+            _append_role_evidence(
+                role_evidence,
+                [rid],
+                conf,
+                f"{ws.title or '?'}!cell_scan",
+                ["xlsx_cell_scan_role_hint"],
+                "",
+            )
 
         _dtoks = sorted(_DATE_TOKENS, key=len, reverse=True)
         _atoks = sorted(_ACTION_TOKENS, key=len, reverse=True)
@@ -433,6 +571,7 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
                 ws.title or "?",
                 r,
                 role_ids_found,
+                role_evidence,
             )
             rows_with_block.add(r)
 
@@ -448,7 +587,8 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
             joined = " | ".join(cell_texts)
             conf, matched = _score_block(role_ids, joined, has_date, has_action)
             if conf < 0.5:
-                if len(set(role_ids)) >= 2 or has_date or has_action:
+                rset = set(role_ids)
+                if (len(rset) >= 2 and not rset.issubset({"executor", "reviewer"})) or has_date or has_action:
                     conf = 0.56
                     matched = list(matched or []) + ["xlsx_multi_page_supplement"]
                 elif len(set(role_ids)) == 1 and has_date:
@@ -471,6 +611,7 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
                 ws.title or "?",
                 r,
                 role_ids_found,
+                role_evidence,
             )
 
     for b in blocks:
@@ -479,17 +620,33 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
                 rid = f["name"]
                 role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), float(b.confidence) * 0.95)
 
+    role_ev = _compact_role_evidence(role_evidence)
+    debug_summary = {
+        "kind": "xlsx",
+        "total_blocks": len(blocks),
+        "role_count": len(role_ids_found),
+        "rules_matched": sorted(
+            {
+                str(m)
+                for b in blocks
+                for m in (b.matched_rules or [])
+                if str(m).strip()
+            }
+        ),
+    }
     return {
         "ok": True,
         "kind": "xlsx",
         "roles": [{"id": rid, "confidence": role_ids_found[rid]} for rid in sorted(role_ids_found)],
         "blocks": [b.to_dict() for b in blocks],
+        "role_evidence": role_ev,
+        "debug_summary": debug_summary,
     }
 
 
 def _harvest_roles_docx_tables(doc) -> Dict[str, float]:
     found: Dict[str, float] = {}
-    for table in _iter_docx_tables(doc):
+    for table in _iter_docx_tables_for_detect(doc):
         for row in table.rows:
             for cell in row.cells:
                 s = _norm(cell.text or "")
@@ -527,22 +684,45 @@ def _harvest_roles_docx_headers_footers(doc) -> Dict[str, float]:
     return found
 
 
-def detect_docx(path: str, max_paragraphs: int = 1200) -> dict:
+def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -> dict:
     from docx import Document
 
     doc = Document(path)
+    if light:
+        max_paragraphs = min(max_paragraphs, 300)
     blocks: List[DetectedBlock] = []
     role_ids_found: Dict[str, float] = {}
+    role_evidence: Dict[str, List[Dict[str, Any]]] = {}
     bi = 1
 
     for rid, conf in _harvest_roles_docx_tables(doc).items():
         role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+        _append_role_evidence(
+            role_evidence,
+            [rid],
+            conf,
+            "docx_table_scan",
+            ["docx_table_scan_role_hint"],
+            "",
+        )
     for rid, conf in _harvest_roles_docx_headers_footers(doc).items():
         role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+        _append_role_evidence(
+            role_evidence,
+            [rid],
+            conf,
+            "docx_header_footer_scan",
+            ["docx_header_footer_scan_role_hint"],
+            "",
+        )
     _apply_docx_table_triad_boost(doc, role_ids_found)
 
+    tables_for_detect = _iter_docx_tables_for_detect(
+        doc, max_body_tables=16 if light else 32, max_total=48 if light else 96
+    )
+
     # 1) 表格行：强场景（含页眉页脚表；签批栏常「角色行 + 下一行 Date」）
-    for ti, table in enumerate(_iter_docx_tables(doc)):
+    for ti, table in enumerate(tables_for_detect):
         rows_list = list(table.rows)
         for ri, row in enumerate(rows_list):
             texts = [_norm(c.text or "") for c in row.cells]
@@ -564,10 +744,11 @@ def detect_docx(path: str, max_paragraphs: int = 1200) -> dict:
 
             conf, matched = _score_block(role_ids, joined, has_date, has_action)
             if conf < 0.5:
-                if len(set(role_ids)) >= 1 and has_date:
+                rset = set(role_ids)
+                if len(rset) >= 1 and has_date:
                     conf = 0.72
                     matched = list(matched or []) + ["docx_role_with_date_row"]
-                elif len(set(role_ids)) >= 2:
+                elif len(rset) >= 2 and not rset.issubset({"executor", "reviewer"}):
                     conf = 0.76
                     matched = list(matched or []) + ["docx_multi_role_row"]
                 else:
@@ -591,18 +772,33 @@ def detect_docx(path: str, max_paragraphs: int = 1200) -> dict:
             bi += 1
             for rid in set(role_ids):
                 role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+            _append_role_evidence(
+                role_evidence,
+                role_ids,
+                conf,
+                f"table{ti+1}.row{ri+1}",
+                matched,
+                joined,
+            )
+        if light and _docx_has_core_triad(role_ids_found) and ti >= 4:
+            break
+        if not light and _docx_has_core_triad(role_ids_found) and ti >= 12:
+            break
 
-    # 2) 段落：角色+日期同段
-    for pi, p in enumerate(doc.paragraphs[:max_paragraphs]):
+    # 2) 段落：角色+日期同段（长文档减少扫描上限）
+    para_cap = max_paragraphs
+    try:
+        if len(doc.paragraphs) > 2500:
+            para_cap = min(para_cap, 400 if light else 800)
+    except Exception:
+        pass
+    if light and _docx_has_core_triad(role_ids_found):
+        para_cap = 0
+    for pi, p in enumerate(doc.paragraphs[:para_cap]):
         t = _norm(p.text or "")
         if not t:
             continue
-        # 先粗过滤：含任一角色/日期/动作
-        if not (
-            _contains_any(t, _DATE_TOKENS)
-            or _contains_any(t, _ACTION_TOKENS)
-            or any(_contains_any(t, role_keywords(rid)) for rid in ROLE_ID_TO_KEYWORD)
-        ):
+        if not _paragraph_might_have_role(t):
             continue
         role_ids = _paragraph_role_ids(t)
         has_date = _contains_any(t, _DATE_TOKENS)
@@ -626,6 +822,14 @@ def detect_docx(path: str, max_paragraphs: int = 1200) -> dict:
         bi += 1
         for rid in set(role_ids):
             role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), conf)
+        _append_role_evidence(
+            role_evidence,
+            role_ids,
+            conf,
+            f"paragraph{pi+1}",
+            matched,
+            t,
+        )
 
     for b in blocks:
         for f in b.fields:
@@ -633,19 +837,49 @@ def detect_docx(path: str, max_paragraphs: int = 1200) -> dict:
                 rid = f["name"]
                 role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), float(b.confidence) * 0.95)
 
+    role_ev = _compact_role_evidence(role_evidence)
+    debug_summary = {
+        "kind": "docx",
+        "light_scan": bool(light),
+        "tables_scanned": len(tables_for_detect),
+        "total_blocks": len(blocks),
+        "role_count": len(role_ids_found),
+        "rules_matched": sorted(
+            {
+                str(m)
+                for b in blocks
+                for m in (b.matched_rules or [])
+                if str(m).strip()
+            }
+        ),
+    }
     return {
         "ok": True,
         "kind": "docx",
         "roles": [{"id": rid, "confidence": role_ids_found[rid]} for rid in sorted(role_ids_found)],
         "blocks": [b.to_dict() for b in blocks],
+        "role_evidence": role_ev,
+        "debug_summary": debug_summary,
     }
 
 
-def detect_file(path: str) -> dict:
+def detect_file(path: str, source_name: str = "", mode: str = "auto") -> dict:
     ext = os.path.splitext(path)[1].lower()
+    light = mode == "light"
+    if mode == "auto" and source_name:
+        try:
+            from sign_handlers.sign_document_role_rules import match_document_role_rule
+
+            rule = match_document_role_rule(source_name)
+            if rule and (rule.get("roles") or []) == []:
+                light = True
+            elif rule and rule.get("roles"):
+                light = True
+        except Exception:
+            pass
     if ext == ".xlsx":
         return detect_xlsx(path)
     if ext == ".docx":
-        return detect_docx(path)
+        return detect_docx(path, light=light)
     return {"ok": False, "error": f"不支持的格式: {ext}"}
 
