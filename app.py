@@ -3823,11 +3823,18 @@ def api_sign_files_batch_delete():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
+            delete_errors = []
             for fid in dedup:
-                n = mysql_store.delete_file(fid)
-                if n:
-                    deleted_ids.append(fid)
-                else:
+                try:
+                    # 批量删除优先保证接口稳定返回：跳过 FTP 清理，避免远程连接抖动导致整批超时。
+                    # 清理失败不影响「待签列表」删除结果。
+                    n = mysql_store.delete_file(fid, skip_ftp_cleanup=True)
+                    if n:
+                        deleted_ids.append(fid)
+                    else:
+                        missing_ids.append(fid)
+                except Exception as de:
+                    delete_errors.append({"id": fid, "error": str(de)})
                     missing_ids.append(fid)
             return jsonify(
                 {
@@ -3835,6 +3842,7 @@ def api_sign_files_batch_delete():
                     "deleted_ids": deleted_ids,
                     "missing_ids": missing_ids,
                     "invalid_ids": invalid_ids,
+                    "delete_errors": delete_errors,
                     "files": mysql_store.list_files(),
                 }
             )

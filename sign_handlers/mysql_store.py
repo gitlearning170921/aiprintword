@@ -545,31 +545,32 @@ def insert_file_from_external_ftp(file_id: str, original_name: str, ext: str, ex
             )
 
 
-def delete_file(file_id: str) -> int:
+def delete_file(file_id: str, skip_ftp_cleanup: bool = False) -> int:
     ensure_sign_mysql()
     with _conn_commit() as conn:
         _ensure_sign_file_columns(conn)
         # best-effort delete FTP
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT ftp_path, ftp_owned_by_sign FROM sign_uploaded_file WHERE id=%s",
-                    (file_id,),
-                )
-                row = cur.fetchone()
-            p = (row or {}).get("ftp_path")
-            owned = (row or {}).get("ftp_owned_by_sign")
-            if owned is None:
-                owned = 1
-            if p and int(owned) != 0:
-                try:
-                    from ftp_store import delete_path
+        if not skip_ftp_cleanup:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT ftp_path, ftp_owned_by_sign FROM sign_uploaded_file WHERE id=%s",
+                        (file_id,),
+                    )
+                    row = cur.fetchone()
+                p = (row or {}).get("ftp_path")
+                owned = (row or {}).get("ftp_owned_by_sign")
+                if owned is None:
+                    owned = 1
+                if p and int(owned) != 0:
+                    try:
+                        from ftp_store import delete_path
 
-                    delete_path(p)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                        delete_path(p)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sign_uploaded_file WHERE id=%s", (file_id,))
             return cur.rowcount

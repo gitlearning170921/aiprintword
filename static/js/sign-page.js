@@ -1442,18 +1442,46 @@
       ids.length +
       ' 个文件？\n删除后会同时清除这些文件的角色映射缓存。';
     if (!window.confirm(tip)) return Promise.resolve();
+    var delSetReq = {};
+    ids.forEach(function (x) {
+      delSetReq[String(x)] = true;
+    });
+    // 先本地移除，减少大批量删除时的“等待无反馈”感；失败后会自动从服务端刷新纠偏。
+    savedFiles = savedFiles.filter(function (rec) {
+      return !(rec && rec.id && delSetReq[String(rec.id)]);
+    });
+    if (selectedFileId && delSetReq[String(selectedFileId)]) {
+      selectedFileId = savedFiles.length ? String(savedFiles[0].id || '') : null;
+    }
+    Object.keys(delSetReq).forEach(function (x) {
+      try {
+        delete fileUiCache[String(x)];
+        delete __batchWorkbenchRows[String(x)];
+        delete __aiwordHandoffCtxByFileId[String(x)];
+        delete _lastPersistedRoleMapStable[String(x)];
+      } catch (_) {}
+    });
+    renderFileList();
+    syncHiddenBatchPicks();
+    renderBatchWorkbenchTable();
+    if (feedbackTarget === 'workbench') {
+      setBatchWorkbenchMsg('正在删除 ' + ids.length + ' 个文件…', false);
+    } else {
+      setFileListActionFeedback('正在删除 ' + ids.length + ' 个文件…', false);
+    }
     var post = function () {
       return fetchJson(apiUrl('/api/sign/files/batch-delete'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ file_ids: ids }),
+        timeoutMs: 300000,
       }).then(function (r) {
         var j = (r && r.data) || {};
         if (!j.ok) {
           var em = j.error || '批量删除失败';
           if (feedbackTarget === 'workbench') setBatchWorkbenchMsg(em, true);
           else setFileListActionFeedback(em, true);
-          return;
+          throw new Error(em);
         }
         var deleted = Array.isArray(j.deleted_ids) ? j.deleted_ids.map(String) : [];
         var delSet = {};
@@ -1484,8 +1512,13 @@
     };
     return post().catch(function (e) {
       var em = (e && e.message) || String(e || '');
-      if (feedbackTarget === 'workbench') setBatchWorkbenchMsg(em, true);
-      else setFileListActionFeedback(em, true);
+      return refreshFileList({ softFail: false, showLoading: false })
+        .catch(function () {})
+        .then(function () {
+          var msg = '批量删除请求失败：' + em + '。已自动刷新列表。';
+          if (feedbackTarget === 'workbench') setBatchWorkbenchMsg(msg, true);
+          else setFileListActionFeedback(msg, true);
+        });
     });
   }
 
@@ -5471,7 +5504,11 @@
     var expectName = rec && rec.name ? _fileBaseNameOnly(rec.name) : '';
     var gotName = j.source_name ? _fileBaseNameOnly(j.source_name) : '';
     if (expectName && gotName && expectName !== gotName) {
-      return '识别结果文件名不一致（返回：' + gotName + '）';
+      // 实际环境中同一源文件可能经过 .doc/.xls 转换、重命名或数据库展示名修正，
+      // 文件名不一致不应直接判定 detect 失败，否则批量会出现“全部识别失败”假象。
+      if (!isBatchWorkbenchMode()) {
+        return '';
+      }
     }
     return '';
   }
@@ -7303,10 +7340,26 @@
           (fileUiCache[fileId] || {}).currentRoleMap || {}
         );
         if (skipDetect) return true;
-        return detectAndAutoSelectRoles(fileId, __aiwordHandoffDetectRetries, {
-          returnPromise: true,
-          batchSilent: true,
-        });
+        function _detectOnceOrRetryLeft(retryLeft) {
+          return detectAndAutoSelectRoles(fileId, __aiwordHandoffDetectRetries, {
+            returnPromise: true,
+            batchSilent: true,
+          }).then(function (ok) {
+            if (ok || retryLeft <= 0) return !!ok;
+            var waitMs = 800 + (2 - retryLeft) * 700;
+            row.status = '识别重试中…';
+            row.rolesLabel = '识别失败，自动重试…';
+            renderBatchWorkbenchTable();
+            return new Promise(function (resolve) {
+              setTimeout(resolve, waitMs);
+            }).then(function () {
+              if (!fileUiCache[fileId]) fileUiCache[fileId] = {};
+              fileUiCache[fileId].detectedOnce = false;
+              return _detectOnceOrRetryLeft(retryLeft - 1);
+            });
+          });
+        }
+        return _detectOnceOrRetryLeft(2);
       })
       .then(function (detectOk) {
         syncWorkbenchRowFromDetect(fileId);
