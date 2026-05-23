@@ -57,14 +57,25 @@ def load_sign_document_role_rules(force: bool = False) -> Dict[str, Any]:
             rid_s = str(rid or "").strip()
             if rid_s in ROLE_ID_TO_KEYWORD and rid_s not in roles:
                 roles.append(rid_s)
-        clean.append(
-            {
-                "pattern": pattern.replace("\\", "/"),
-                "match": match,
-                "roles": roles,
-                "note": str(item.get("note") or ""),
-            }
-        )
+        entry: Dict[str, Any] = {
+            "pattern": pattern.replace("\\", "/"),
+            "match": match,
+            "roles": roles,
+            "note": str(item.get("note") or ""),
+        }
+        sp = str(item.get("sign_policy") or "").strip()
+        if sp in {"no_sign", "detect_roles"}:
+            entry["sign_policy"] = sp
+        if not roles:
+            entry["no_sign_required"] = True
+            entry.setdefault("sign_policy", "no_sign")
+        cat = str(item.get("category") or "").strip()
+        if cat:
+            entry["category"] = cat
+        lbl = str(item.get("label") or "").strip()
+        if lbl:
+            entry["label"] = lbl
+        clean.append(entry)
     _RULES_CACHE = {
         "schema_version": int(raw.get("schema_version", 1) or 1),
         "source": raw.get("source") or "",
@@ -143,9 +154,17 @@ def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[
         "pattern": rule.get("pattern"),
         "roles": roles_from_rule,
         "override": True,
+        "no_sign_required": not bool(roles_from_rule),
+        "sign_policy": rule.get("sign_policy")
+        or ("no_sign" if not roles_from_rule else "detect_roles"),
+        "category": rule.get("category") or "",
+        "label": rule.get("label") or "",
     }
     if not roles_from_rule:
-        # 空角色也是明确识别结果：用于规范评审报告、调查问卷等不应进入签字流程的文档。
+        # 空角色也是明确识别结果：用例表、规范评审报告等不应进入签字流程的文档。
+        result["ok"] = True
+        result.pop("error", None)
+        result.pop("error_code", None)
         result["roles"] = []
         result["blocks"] = []
         result["role_evidence"] = {}

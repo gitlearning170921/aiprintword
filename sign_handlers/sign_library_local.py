@@ -41,6 +41,10 @@ def _role_map_json_path(inbox_root: str, sid: str) -> str:
     return os.path.join(_session_dir(inbox_root, sid), "file_role_signer.json")
 
 
+def _file_session_cache_path(inbox_root: str, sid: str) -> str:
+    return os.path.join(_session_dir(inbox_root, sid), "file_session_cache.json")
+
+
 def _load_json(path: str, default):
     if not os.path.isfile(path):
         return default
@@ -662,3 +666,73 @@ def set_file_role_map(inbox_root: str, sid: str, file_id: str, mapping: Dict[str
             clean[str(k)[:64]] = rid
     rmap[file_id] = clean
     _save_json(path, rmap)
+
+
+def _load_file_session_cache(inbox_root: str, sid: str) -> Dict[str, dict]:
+    data = _load_json(_file_session_cache_path(inbox_root, sid), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_file_session_cache(inbox_root: str, sid: str, data: Dict[str, dict]) -> None:
+    _save_json(_file_session_cache_path(inbox_root, sid), data)
+
+
+def set_file_detect_snapshot(inbox_root: str, sid: str, file_id: str, snapshot: dict) -> None:
+    from sign_handlers.file_session_cache import trim_detect_snapshot
+
+    cache = _load_file_session_cache(inbox_root, sid)
+    ent = cache.get(file_id) if isinstance(cache.get(file_id), dict) else {}
+    ent["detect"] = trim_detect_snapshot(snapshot)
+    cache[file_id] = ent
+    _save_file_session_cache(inbox_root, sid, cache)
+
+
+def get_file_detect_snapshot(inbox_root: str, sid: str, file_id: str) -> Optional[dict]:
+    from sign_handlers.file_session_cache import trim_detect_snapshot
+
+    ent = _load_file_session_cache(inbox_root, sid).get(file_id)
+    if not isinstance(ent, dict):
+        return None
+    det = trim_detect_snapshot(ent.get("detect"))
+    return det if det else None
+
+
+def set_file_workbench_state(inbox_root: str, sid: str, file_id: str, state: dict) -> None:
+    from sign_handlers.file_session_cache import trim_workbench_state
+
+    cache = _load_file_session_cache(inbox_root, sid)
+    ent = cache.get(file_id) if isinstance(cache.get(file_id), dict) else {}
+    ent["workbench"] = trim_workbench_state(state)
+    cache[file_id] = ent
+    _save_file_session_cache(inbox_root, sid, cache)
+
+
+def get_file_workbench_state(inbox_root: str, sid: str, file_id: str) -> Optional[dict]:
+    from sign_handlers.file_session_cache import trim_workbench_state
+
+    ent = _load_file_session_cache(inbox_root, sid).get(file_id)
+    if not isinstance(ent, dict):
+        return None
+    wb = trim_workbench_state(ent.get("workbench"))
+    return wb if wb else None
+
+
+def list_file_session_caches(inbox_root: str, sid: str) -> Dict[str, dict]:
+    cache = _load_file_session_cache(inbox_root, sid)
+    out: Dict[str, dict] = {}
+    for fid, ent in cache.items():
+        if not fid or not isinstance(ent, dict):
+            continue
+        entry: Dict[str, Any] = {}
+        det = ent.get("detect")
+        if isinstance(det, dict) and det:
+            entry["detect"] = det
+        wb = ent.get("workbench")
+        if isinstance(wb, dict) and wb:
+            entry["workbench"] = wb
+        m = get_file_role_map(inbox_root, sid, str(fid))
+        if m:
+            entry["map"] = m
+        if entry:
+            out[str(fid)] = entry
+    return out

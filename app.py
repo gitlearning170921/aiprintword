@@ -3624,6 +3624,58 @@ def sign_materials_page():
     return send_from_directory(os.path.join(ROOT, "static"), "sign_materials.html")
 
 
+@app.route("/api/sign/files/file-caches", methods=["GET"])
+def api_sign_file_caches_list():
+    """各文件已保存的识别结果、工作台行状态、角色映射（页面打开时恢复）。"""
+    try:
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            caches = mysql_store.list_file_session_caches()
+            return jsonify({"ok": True, "caches": caches})
+        _sign_ensure_session_inbox()
+        sid = session["sign_inbox_sid"]
+        from sign_handlers.sign_library_local import list_file_session_caches as local_list
+
+        return jsonify({"ok": True, "caches": local_list(SIGN_INBOX_ROOT, sid)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/files/<file_id>/file-cache", methods=["PUT"])
+def api_sign_file_cache_put(file_id):
+    if not _SIGN_FILE_ID_RE.match(file_id or ""):
+        return jsonify({"ok": False, "error": "无效的文件 id"}), 400
+    data = request.get_json(silent=True) or {}
+    detect = data.get("detect")
+    workbench = data.get("workbench")
+    try:
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            if isinstance(detect, dict):
+                mysql_store.set_file_detect_snapshot(file_id, detect)
+            if isinstance(workbench, dict):
+                mysql_store.set_file_workbench_state(file_id, workbench)
+        else:
+            _sign_ensure_session_inbox()
+            sid = session["sign_inbox_sid"]
+            from sign_handlers.sign_library_local import (
+                set_file_detect_snapshot as local_set_detect,
+                set_file_workbench_state as local_set_wb,
+            )
+
+            if isinstance(detect, dict):
+                local_set_detect(SIGN_INBOX_ROOT, sid, file_id, detect)
+            if isinstance(workbench, dict):
+                local_set_wb(SIGN_INBOX_ROOT, sid, file_id, workbench)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/sign/files", methods=["GET"])
 def api_sign_files_list():
     """List pending files for signature."""
@@ -3990,6 +4042,22 @@ def api_sign_detect():
                 import hashlib
 
                 result["content_sha256"] = hashlib.sha256(blob_for_hash).hexdigest()
+            if result.get("ok"):
+                try:
+                    if _sign_using_mysql():
+                        from sign_handlers import mysql_store
+
+                        mysql_store.set_file_detect_snapshot(file_id, result)
+                    else:
+                        _sign_ensure_session_inbox()
+                        sid = session["sign_inbox_sid"]
+                        from sign_handlers.sign_library_local import (
+                            set_file_detect_snapshot as local_set_detect,
+                        )
+
+                        local_set_detect(SIGN_INBOX_ROOT, sid, file_id, result)
+                except Exception:
+                    pass
         return jsonify(result)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500

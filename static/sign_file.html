@@ -179,7 +179,9 @@
     body.from-aiword a[href="/sign/materials"] { display: none !important; }
     body.batch-workbench-mode .legacy-sign-flow { display: none !important; }
     body.batch-workbench-mode #uploadSaveCard { display: block !important; }
-    body.batch-workbench-mode #legacyFileListCard { display: block !important; }
+    #legacyFileListCard { display: none !important; }
+    #saveUploadProgressWrap,
+    #batchWorkbenchProgressWrap { display: none !important; }
     body.batch-workbench-mode #needSignCard {
       display: none !important;
     }
@@ -426,10 +428,6 @@
             <button type="button" class="btn btn-secondary" id="saveBtn" disabled>保存到列表</button>
             <p id="saveUploadFeedback" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
           </div>
-          <div id="saveUploadProgressWrap" role="status" aria-live="polite">
-            <progress id="saveUploadProgressBar" value="0" max="100"></progress>
-            <div id="saveUploadProgressText">准备上传…</div>
-          </div>
         </div>
 
         <div id="batchWorkbenchCard" class="card" style="display:none;">
@@ -453,13 +451,25 @@
             </select>
             <button type="button" class="btn btn-secondary" id="batchWorkbenchLocaleApplyBtn">应用到已选</button>
             <button type="button" class="btn btn-secondary" id="batchWorkbenchExportIssuesBtn">导出问题清单</button>
+            <button type="button" class="btn btn-secondary" id="batchWorkbenchRefreshBtn">刷新列表</button>
             <button type="button" class="btn btn-primary" id="batchWorkbenchSignBtn">一键批量签字</button>
           </div>
-          <p id="batchWorkbenchMsg" class="btn-inline-feedback" style="display:none;margin:0 0 8px;" role="status"></p>
-          <div id="batchWorkbenchProgressWrap" role="status" aria-live="polite">
-            <progress id="batchWorkbenchProgressBar" value="0" max="100"></progress>
-            <div id="batchWorkbenchProgressText">准备就绪</div>
+          <div class="btn-row" style="margin:0 0 10px;align-items:center;flex-wrap:wrap;gap:8px;">
+            <label style="margin:0;font-size:0.88rem;">筛选</label>
+            <input type="search" id="batchWorkbenchFilterName" placeholder="按文件名筛选…" style="flex:1;min-width:160px;max-width:320px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
+            <select id="batchWorkbenchFilterStatus" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;min-width:120px;">
+              <option value="">全部状态</option>
+              <option value="就绪">就绪</option>
+              <option value="部分就绪">部分就绪</option>
+              <option value="待匹配">待匹配</option>
+              <option value="无需签字">无需签字</option>
+              <option value="待处理">待处理</option>
+              <option value="识别中">识别中…</option>
+              <option value="__fail__">失败/超时</option>
+            </select>
+            <span id="batchWorkbenchFilterHint" class="hint" style="margin:0;"></span>
           </div>
+          <p id="batchWorkbenchMsg" class="btn-inline-feedback" style="display:none;margin:0 0 8px;" role="status"></p>
           <div class="batch-workbench-wrap">
             <table class="batch-workbench-table" id="batchWorkbenchTable">
               <thead>
@@ -492,20 +502,9 @@
           <p class="hint" id="batchAdvancedHint">高级模式：在页面下方画布区为未匹配到库的角色手写补签。</p>
         </div>
 
-        <div class="card legacy-sign-flow" id="legacyFileListCard">
-          <h2>2. 选择要签名的文件</h2>
-          <p class="hint" id="listHint">正在加载文件列表…</p>
-          <div class="btn-row" style="margin:6px 0 10px;align-items:flex-start;gap:8px;flex-wrap:wrap;">
-            <button type="button" class="btn btn-secondary" id="btnRefreshFiles" style="padding:6px 12px;">刷新列表</button>
-            <button type="button" class="btn btn-secondary" id="batchDeleteFilesBtn" style="padding:6px 12px;">批量删除已勾选</button>
-            <p id="fileListActionMsg" class="btn-inline-feedback" style="display:none;margin:0;flex:1;min-width:200px;max-width:100%;" role="alert" aria-live="assertive"></p>
-          </div>
-          <div class="btn-row" style="margin-bottom:10px;">
-            <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;margin:0;font-size:0.9rem;">
-              <input type="checkbox" id="batchSelectAll"> 全选（用于下方「一键批量签」）
-            </label>
-          </div>
+        <div id="batchWorkbenchHiddenPicksHost" style="display:none;" aria-hidden="true">
           <ul class="file-list" id="fileList"></ul>
+          <p class="hint" id="listHint" style="display:none;">正在加载文件列表…</p>
         </div>
 
         <div class="card legacy-sign-flow" id="aiwordBatchStrategyCard" style="display:none;">
@@ -635,7 +634,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js?v=48';
+      s.src = (p || '') + '/js/sign-page.js?v=52';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +

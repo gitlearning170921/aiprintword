@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import threading
@@ -385,6 +386,14 @@ def _ensure_sign_file_columns(conn) -> None:
                 )
             except Exception:
                 pass
+            for sql in (
+                "ALTER TABLE sign_uploaded_file ADD COLUMN detect_snapshot_json MEDIUMTEXT NULL",
+                "ALTER TABLE sign_uploaded_file ADD COLUMN workbench_state_json TEXT NULL",
+            ):
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -3181,3 +3190,90 @@ def set_file_role_signer_map(file_id: str, mapping: Dict[str, Any]) -> None:
                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                     (file_id, rid, signer_id, sig_item_id, date_item_id, date_mode_v, date_iso_v),
                 )
+
+
+def set_file_detect_snapshot(file_id: str, snapshot: dict) -> None:
+    from sign_handlers.file_session_cache import trim_detect_snapshot
+
+    ensure_sign_mysql()
+    blob = json.dumps(trim_detect_snapshot(snapshot), ensure_ascii=False)
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sign_uploaded_file SET detect_snapshot_json=%s WHERE id=%s",
+                (blob, file_id),
+            )
+
+
+def get_file_detect_snapshot(file_id: str) -> Optional[dict]:
+    from sign_handlers.file_session_cache import trim_detect_snapshot, _json_load
+
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT detect_snapshot_json FROM sign_uploaded_file WHERE id=%s",
+                (file_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    data = trim_detect_snapshot(_json_load(row.get("detect_snapshot_json")))
+    return data if data else None
+
+
+def set_file_workbench_state(file_id: str, state: dict) -> None:
+    from sign_handlers.file_session_cache import trim_workbench_state
+
+    ensure_sign_mysql()
+    blob = json.dumps(trim_workbench_state(state), ensure_ascii=False)
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sign_uploaded_file SET workbench_state_json=%s WHERE id=%s",
+                (blob, file_id),
+            )
+
+
+def get_file_workbench_state(file_id: str) -> Optional[dict]:
+    from sign_handlers.file_session_cache import trim_workbench_state, _json_load
+
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT workbench_state_json FROM sign_uploaded_file WHERE id=%s",
+                (file_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    data = trim_workbench_state(_json_load(row.get("workbench_state_json")))
+    return data if data else None
+
+
+def list_file_session_caches() -> Dict[str, dict]:
+    """返回各文件的 detect / workbench / role-map 缓存（用于页面恢复）。"""
+    ensure_sign_mysql()
+    files = list_files()
+    out: Dict[str, dict] = {}
+    for rec in files:
+        fid = str(rec.get("id") or "")
+        if not fid:
+            continue
+        entry: dict = {}
+        det = get_file_detect_snapshot(fid)
+        if det:
+            entry["detect"] = det
+        wb = get_file_workbench_state(fid)
+        if wb:
+            entry["workbench"] = wb
+        try:
+            m = get_file_role_signer_map(fid)
+            if m:
+                entry["map"] = m
+        except Exception:
+            pass
+        if entry:
+            out[fid] = entry
+    return out
