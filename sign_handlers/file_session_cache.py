@@ -18,6 +18,7 @@ _DETECT_KEYS = (
     "error_code",
     "content_sha256",
     "debug_summary",
+    "document_role_rule",
 )
 
 
@@ -38,6 +39,8 @@ def trim_workbench_state(data: Any) -> Dict[str, Any]:
         "status",
         "rolesLabel",
         "detectExplain",
+        "detectWrongNote",
+        "manualDetectWrong",
         "editor",
         "reviewer",
         "approver",

@@ -10,7 +10,7 @@
 
 - **match**: 文件名 contains 主题片段（pattern），不含项目编号/版本号/扩展名
 - **detect_roles**: sign_policy=detect_roles：正常识别签字角色并进入匹配/签字流程
-- **no_sign**: sign_policy=no_sign：工作台「无需签字」，roles 强制为空
+- **no_sign**: sign_policy=no_sign：附件类规则；仅 category=use_case_spec_table 在工作台显示「无需签字」
 - **use_case_spec_table**: category=use_case_spec_table：用例表；批量可跳过签字位识别
 - **use_case_execution**: 含「用例执行表/用例执行记录」：识别 executor+reviewer
 - **other_files**: 未命中规则：按正文签批栏自动识别

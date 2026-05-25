@@ -161,10 +161,6 @@ def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[
         "label": rule.get("label") or "",
     }
     if not roles_from_rule:
-        # 空角色也是明确识别结果：用例表、规范评审报告等不应进入签字流程的文档。
-        result["ok"] = True
-        result.pop("error", None)
-        result.pop("error_code", None)
         result["roles"] = []
         result["blocks"] = []
         result["role_evidence"] = {}
@@ -173,6 +169,11 @@ def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[
             "override_pattern": rule.get("pattern"),
             "override_roles": [],
         }
+        # 仅约定「用例表」在未识别成功时也视为完成；其它 no_sign 规则仍保留真实识别结果供排查
+        if (rule.get("category") or "") == "use_case_spec_table":
+            result["ok"] = True
+            result.pop("error", None)
+            result.pop("error_code", None)
         return result
     original_roles = [str((x or {}).get("id") or "") for x in (result.get("roles") or []) if isinstance(x, dict)]
     result["roles"] = [

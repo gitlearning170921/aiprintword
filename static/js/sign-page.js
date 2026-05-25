@@ -656,8 +656,12 @@
   var batchWorkbenchExportIssuesBtn = document.getElementById('batchWorkbenchExportIssuesBtn');
   var batchWorkbenchSignBtn = document.getElementById('batchWorkbenchSignBtn');
   var batchWorkbenchRefreshBtn = document.getElementById('batchWorkbenchRefreshBtn');
+  var batchWorkbenchSelectFilteredBtn = document.getElementById('batchWorkbenchSelectFilteredBtn');
   var batchWorkbenchFilterName = document.getElementById('batchWorkbenchFilterName');
-  var batchWorkbenchFilterStatus = document.getElementById('batchWorkbenchFilterStatus');
+  var batchWorkbenchFilterClearBtn = document.getElementById('batchWorkbenchFilterClearBtn');
+  var batchWorkbenchSelectByStatusBtn = document.getElementById('batchWorkbenchSelectByStatusBtn');
+  var batchWorkbenchFilterNameTags = document.getElementById('batchWorkbenchFilterNameTags');
+  var batchWorkbenchFilterStatusBox = document.getElementById('batchWorkbenchFilterStatusBox');
   var batchWorkbenchFilterHint = document.getElementById('batchWorkbenchFilterHint');
   var batchWorkbenchAdvancedCb = document.getElementById('batchWorkbenchAdvancedCb');
   var needSignActionMsg = document.getElementById('needSignActionMsg');
@@ -997,8 +1001,9 @@
   var __aiwordBatchGroups = [];
   /** 批量工作台：每文件一行配置（编审批/日期/版本/状态） */
   var __batchWorkbenchRows = {};
-  var __wbFilterName = '';
-  var __wbFilterStatus = '';
+  var __wbFilterNameTerms = [];
+  var __wbFilterNameDraft = '';
+  var __wbFilterStatuses = [];
   var __signUploadInFlight = false;
   var __fileCacheHydratePromise = null;
   /** aiword 批量载入后由工作台统一识别，renderFileList 勿再单文件自动识别 */
@@ -1166,7 +1171,11 @@
     if (detectJson && detectJson.ok) {
       var bad = validateDetectResponseForFile(fileId, detectJson);
       if (bad) {
-        fileUiCache[fileId].lastDetectData = null;
+        fileUiCache[fileId].lastDetectData = {
+          ok: false,
+          error: bad,
+          file_id: fileId,
+        };
         fileUiCache[fileId].lastDetectError = bad;
       } else {
         fileUiCache[fileId].lastDetectData = detectJson;
@@ -1175,6 +1184,14 @@
       }
     } else if (errMsg) {
       fileUiCache[fileId].lastDetectError = String(errMsg);
+      fileUiCache[fileId].lastDetectData = {
+        ok: false,
+        error: String(errMsg),
+        file_id: fileId,
+      };
+    } else if (detectJson && !detectJson.ok) {
+      fileUiCache[fileId].lastDetectData = detectJson;
+      fileUiCache[fileId].lastDetectError = String(detectJson.error || '识别失败');
     }
     if (String(selectedFileId) === String(fileId)) {
       fileUiCache[fileId].checkedRoleIds = selectedRoleIds();
@@ -3851,11 +3868,7 @@
   if (batchWorkbenchHeadCheck) {
     batchWorkbenchHeadCheck.addEventListener('change', function () {
       var on = !!batchWorkbenchHeadCheck.checked;
-      savedFiles.forEach(function (r) {
-        if (!r || !r.id) return;
-        var row = __batchWorkbenchRows[String(r.id)];
-        if (row) row.selected = on;
-      });
+      _setWorkbenchRowsSelected(on, _workbenchHasActiveFilter());
       if (batchWorkbenchSelectAll) batchWorkbenchSelectAll.checked = on;
       syncHiddenBatchPicks();
       renderBatchWorkbenchTable();
@@ -3863,28 +3876,48 @@
   }
   if (batchWorkbenchSelectAll) {
     batchWorkbenchSelectAll.addEventListener('change', function () {
-      if (batchWorkbenchHeadCheck) batchWorkbenchHeadCheck.checked = !!batchWorkbenchSelectAll.checked;
-      savedFiles.forEach(function (r) {
-        if (!r || !r.id) return;
-        var row = __batchWorkbenchRows[String(r.id)];
-        if (row) row.selected = !!batchWorkbenchSelectAll.checked;
-      });
+      var on = !!batchWorkbenchSelectAll.checked;
+      if (batchWorkbenchHeadCheck) batchWorkbenchHeadCheck.checked = on;
+      _setWorkbenchRowsSelected(on, _workbenchHasActiveFilter());
       syncHiddenBatchPicks();
       renderBatchWorkbenchTable();
+    });
+  }
+  if (batchWorkbenchSelectFilteredBtn) {
+    batchWorkbenchSelectFilteredBtn.addEventListener('click', function () {
+      var n = selectWorkbenchFilteredRows(true, { merge: true });
+      var totalSel = _countWorkbenchSelectedRows();
+      setBatchWorkbenchMsg(
+        n
+          ? '本次累加勾选 ' + n + ' 个（合计已选 ' + totalSel + ' 个，含筛选外仍保留）'
+          : '当前筛选下没有可见文件',
+        !n
+      );
     });
   }
   if (batchWorkbenchDetectBtn) {
     batchWorkbenchDetectBtn.addEventListener('click', function () {
       withButtonBusy(batchWorkbenchDetectBtn, '识别中…', function () {
-        return processBatchWorkbenchAllFiles(true);
+        return processBatchWorkbenchSelected(true, { forceReprocess: true });
       }, { skipPageProgress: true });
     });
   }
   if (batchWorkbenchApplyBtn) {
     batchWorkbenchApplyBtn.addEventListener('click', function () {
       withButtonBusy(batchWorkbenchApplyBtn, '匹配中…', function () {
-        return processBatchWorkbenchSelected(false, { skipDetectIfCached: true });
+        return processBatchWorkbenchSelected(false, {
+          skipDetectIfCached: true,
+          forceReprocess: true,
+        });
       }, { skipPageProgress: true });
+    });
+  }
+  var batchWorkbenchMarkDetectWrongBtn = document.getElementById(
+    'batchWorkbenchMarkDetectWrongBtn'
+  );
+  if (batchWorkbenchMarkDetectWrongBtn) {
+    batchWorkbenchMarkDetectWrongBtn.addEventListener('click', function () {
+      markWorkbenchSelectedAsDetectWrong();
     });
   }
   if (batchWorkbenchDeleteBtn) {
@@ -4086,14 +4119,51 @@
   }
   if (batchWorkbenchFilterName) {
     batchWorkbenchFilterName.addEventListener('input', function () {
-      __wbFilterName = String(batchWorkbenchFilterName.value || '');
-      renderBatchWorkbenchTable();
+      __wbFilterNameDraft = String(batchWorkbenchFilterName.value || '');
+    });
+    batchWorkbenchFilterName.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        if (_pinWorkbenchFilterNameTerm()) {
+          setBatchWorkbenchMsg(
+            '已筛选文件名：' + __wbFilterNameTerms.join('、') + '（回车可继续追加，OR 合并）',
+            false
+          );
+        } else {
+          setBatchWorkbenchMsg('请输入文件名关键词后回车', true);
+        }
+      }
     });
   }
-  if (batchWorkbenchFilterStatus) {
-    batchWorkbenchFilterStatus.addEventListener('change', function () {
-      __wbFilterStatus = String(batchWorkbenchFilterStatus.value || '');
-      renderBatchWorkbenchTable();
+  if (batchWorkbenchSelectByStatusBtn) {
+    batchWorkbenchSelectByStatusBtn.addEventListener('click', function () {
+      var n = selectWorkbenchRowsByStatus(true, { merge: true });
+      var totalSel = _countWorkbenchSelectedRows();
+      setBatchWorkbenchMsg(
+        n
+          ? '已按状态累加勾选 ' + n + ' 个（合计已选 ' + totalSel + ' 个）'
+          : '请先勾选状态，再点「按状态全选」',
+        !n
+      );
+    });
+  }
+  if (batchWorkbenchFilterClearBtn) {
+    batchWorkbenchFilterClearBtn.addEventListener('click', function () {
+      _clearWorkbenchFilters();
+      setBatchWorkbenchMsg('已清除筛选条件', false);
+    });
+  }
+  var batchWorkbenchFilterDetectIssuesBtn = document.getElementById(
+    'batchWorkbenchFilterDetectIssuesBtn'
+  );
+  _bindWorkbenchStatusFilterCheckboxes();
+  if (batchWorkbenchFilterDetectIssuesBtn) {
+    batchWorkbenchFilterDetectIssuesBtn.addEventListener('click', function () {
+      _setWorkbenchFilterDetectIssuesOnly();
+      setBatchWorkbenchMsg(
+        '已筛选：识别有误(人工) / 失败 / 超时 / 未识别。可「累加勾选当前筛选」后改规则并批量重新识别。',
+        false
+      );
     });
   }
   if (btnRefreshSigned) {
@@ -4422,7 +4492,7 @@
         // 把被剔除的文件状态标到 row 上
         Object.keys(blockedSet).forEach(function (fid) {
           var row = __batchWorkbenchRows[fid];
-          if (row && (!row.status || row.status === '待匹配' || row.status === '—')) {
+          if (row && (!row.status || row.status === '识别有误' || row.status === '待匹配' || row.status === '—')) {
             row.status = '无可用素材';
             row.rolesLabel = blockedSet[fid];
           }
@@ -5668,19 +5738,16 @@
     return /用例表/.test(nm);
   }
 
-  /** 工作台状态：规则 no_sign 或约定用例表 → 无需签字 */
+  /** 仅「用例表」类（非用例执行表）为约定无需签字；其它文件须走识别流程 */
   function isNoSignRequiredForFile(fileId, dataOpt) {
+    if (_isUseCaseSpecTableNoSignByFileName(fileId)) return true;
     var data = dataOpt;
     if (data === undefined) {
       data = (fileUiCache[String(fileId)] || {}).lastDetectData;
     }
-    if (data && data.document_role_rule && data.document_role_rule.matched) {
-      if (data.document_role_rule.no_sign_required) return true;
-      if (data.document_role_rule.sign_policy === 'no_sign') return true;
-      var rr = data.document_role_rule.roles;
-      if (Array.isArray(rr) && !rr.length) return true;
-    }
-    return _isUseCaseSpecTableNoSignByFileName(fileId);
+    var rr = data && data.document_role_rule;
+    if (rr && rr.matched && rr.category === 'use_case_spec_table') return true;
+    return false;
   }
 
   /** 仅约定用例表可跳过签字位识别；其余文档（含其他 no_sign 规则）仍走识别接口 */
@@ -6846,9 +6913,9 @@
   }
 
   function fileHasValidDetectCache(fileId) {
+    if (shouldSkipDetectPipelineForFile(fileId)) return true;
     var st = fileUiCache[String(fileId)] || {};
     var data = st.lastDetectData;
-    if (isNoSignRequiredForFile(fileId, data)) return true;
     return !!(data && data.ok && mergeDetectedRolesForFile(fileId).length);
   }
 
@@ -6877,10 +6944,15 @@
   function finalizeWorkbenchRowStatus(fileId) {
     var row = __batchWorkbenchRows[String(fileId)];
     if (!row) return;
+    if (row.manualDetectWrong) {
+      row.status = '识别有误';
+      schedulePersistFileSessionCache(fileId);
+      return;
+    }
     syncWorkbenchRowFromDetect(fileId);
     if (isNoSignRequiredForFile(fileId)) {
       row.status = '无需签字';
-      row.rolesLabel = '无需签字';
+      row.rolesLabel = '无需签字（用例表）';
       row._wbPipelineDone = true;
       row._wbMatchAttempted = true;
       schedulePersistFileSessionCache(fileId);
@@ -6901,6 +6973,218 @@
       row.status = '待匹配';
     }
     schedulePersistFileSessionCache(fileId);
+  }
+
+  function markWorkbenchRowDetectWrong(fileId, noteOpt) {
+    var row = __batchWorkbenchRows[String(fileId)];
+    if (!row) return;
+    row.status = '识别有误';
+    row.manualDetectWrong = true;
+    if (noteOpt) row.detectWrongNote = String(noteOpt);
+    row._wbPipelineDone = true;
+    schedulePersistFileSessionCache(fileId);
+    renderBatchWorkbenchTable();
+  }
+
+  function markWorkbenchSelectedAsDetectWrong() {
+    var n = 0;
+    savedFiles.forEach(function (rec) {
+      if (!rec || !rec.id) return;
+      var row = __batchWorkbenchRows[String(rec.id)];
+      if (!row || !row.selected) return;
+      markWorkbenchRowDetectWrong(rec.id, '人工标记：识别角色与规则不符，待修正后重新识别');
+      n++;
+    });
+    setBatchWorkbenchMsg(
+      n ? '已将 ' + n + ' 个已勾选文件标为「识别有误」' : '请先勾选要标记的文件',
+      !n
+    );
+  }
+
+  function _workbenchStatusBucket(shown) {
+    var t = String(shown || '').trim();
+    if (t === '识别有误') return '识别有误';
+    if (t === '待匹配') return '待匹配';
+    if (/识别失败/.test(t)) return '识别失败';
+    if (/识别超时/.test(t)) return '识别超时';
+    if (/未识别/.test(t)) return '未识别';
+    if (t === '就绪') return '就绪';
+    if (t === '部分就绪') return '部分就绪';
+    if (t === '无需签字') return '无需签字';
+    if (/识别|匹配|分析/.test(t)) return '识别中';
+    if (t === '—' || !t) return '待处理';
+    return t;
+  }
+
+  function _isWorkbenchDetectIssueStatus(shown) {
+    var b = _workbenchStatusBucket(shown);
+    return (
+      b === '识别有误' ||
+      b === '识别失败' ||
+      b === '识别超时' ||
+      b === '未识别'
+    );
+  }
+
+  function _readWorkbenchFilterStatusesFromUi() {
+    if (!batchWorkbenchFilterStatusBox) return [];
+    var out = [];
+    var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
+    for (var i = 0; i < cbs.length; i++) {
+      var cb = cbs[i];
+      if (cb.checked) {
+        var v = String(cb.getAttribute('data-wb-status') || '').trim();
+        if (v) out.push(v);
+      }
+    }
+    return out;
+  }
+
+  function _bindWorkbenchStatusFilterCheckboxes() {
+    if (!batchWorkbenchFilterStatusBox) return;
+    var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
+    for (var i = 0; i < cbs.length; i++) {
+      cbs[i].addEventListener('change', function () {
+        __wbFilterStatuses = _readWorkbenchFilterStatusesFromUi();
+        renderBatchWorkbenchTable();
+      });
+    }
+  }
+
+  function _setWorkbenchFilterStatusChecks(statusKeys) {
+    if (!batchWorkbenchFilterStatusBox) return;
+    var keys = statusKeys || {};
+    var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
+    for (var i = 0; i < cbs.length; i++) {
+      var v = String(cbs[i].getAttribute('data-wb-status') || '');
+      cbs[i].checked = !!keys[v];
+    }
+    __wbFilterStatuses = _readWorkbenchFilterStatusesFromUi();
+  }
+
+  function _setWorkbenchFilterDetectIssuesOnly() {
+    _setWorkbenchFilterStatusChecks({
+      识别有误: true,
+      识别失败: true,
+      识别超时: true,
+      未识别: true,
+    });
+    renderBatchWorkbenchTable();
+  }
+
+  function _workbenchRowMatchesStatusFilter(row) {
+    if (!__wbFilterStatuses.length) return false;
+    var shown = row ? String(row.status || '') : '';
+    var bucket = _workbenchStatusBucket(shown);
+    for (var i = 0; i < __wbFilterStatuses.length; i++) {
+      var f = __wbFilterStatuses[i];
+      if (f === '__detect_issues__') {
+        if (_isWorkbenchDetectIssueStatus(shown)) return true;
+      } else if (f === bucket) return true;
+    }
+    return false;
+  }
+
+  function selectWorkbenchRowsByStatus(selected, opt) {
+    opt = opt && typeof opt === 'object' ? opt : {};
+    if (!__wbFilterStatuses.length) return 0;
+    var on = !!selected;
+    var merge = opt.merge !== false;
+    var n = 0;
+    savedFiles.forEach(function (rec) {
+      if (!rec || !rec.id) return;
+      var row = __batchWorkbenchRows[String(rec.id)];
+      if (!row || !_workbenchRowMatchesStatusFilter(row)) return;
+      if (on && merge && row.selected) return;
+      row.selected = on;
+      n++;
+    });
+    syncHiddenBatchPicks();
+    renderBatchWorkbenchTable();
+    return n;
+  }
+
+  function _pinWorkbenchFilterNameTerm() {
+    var t = String(__wbFilterNameDraft || '').trim();
+    if (!t) return false;
+    if (__wbFilterNameTerms.indexOf(t) < 0) __wbFilterNameTerms.push(t);
+    __wbFilterNameDraft = '';
+    if (batchWorkbenchFilterName) batchWorkbenchFilterName.value = '';
+    _renderWorkbenchFilterNameTags();
+    renderBatchWorkbenchTable();
+    return true;
+  }
+
+  function _renderWorkbenchFilterNameTags() {
+    if (!batchWorkbenchFilterNameTags) return;
+    if (!__wbFilterNameTerms.length) {
+      batchWorkbenchFilterNameTags.style.display = 'none';
+      batchWorkbenchFilterNameTags.innerHTML = '';
+      return;
+    }
+    batchWorkbenchFilterNameTags.style.display = 'flex';
+    batchWorkbenchFilterNameTags.innerHTML = '';
+    var label = document.createElement('span');
+    label.style.color = 'var(--text-muted)';
+    label.textContent = '已筛选文件名：';
+    batchWorkbenchFilterNameTags.appendChild(label);
+    __wbFilterNameTerms.forEach(function (term) {
+      var tag = document.createElement('span');
+      tag.className = 'wb-filter-tag';
+      var txt = document.createElement('span');
+      txt.textContent = term;
+      tag.appendChild(txt);
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.setAttribute('aria-label', '移除');
+      rm.textContent = '×';
+      rm.addEventListener('click', function () {
+        var ix = __wbFilterNameTerms.indexOf(term);
+        if (ix >= 0) __wbFilterNameTerms.splice(ix, 1);
+        _renderWorkbenchFilterNameTags();
+        renderBatchWorkbenchTable();
+      });
+      tag.appendChild(rm);
+      batchWorkbenchFilterNameTags.appendChild(tag);
+    });
+  }
+
+  function _clearWorkbenchFilters() {
+    __wbFilterNameTerms = [];
+    __wbFilterNameDraft = '';
+    __wbFilterStatuses = [];
+    if (batchWorkbenchFilterName) batchWorkbenchFilterName.value = '';
+    _setWorkbenchFilterStatusChecks({});
+    _renderWorkbenchFilterNameTags();
+    renderBatchWorkbenchTable();
+  }
+
+  function _workbenchHasActiveFilter() {
+    return __wbFilterNameTerms.length > 0 || __wbFilterStatuses.length > 0;
+  }
+
+  function _workbenchNameFilterTerms() {
+    return __wbFilterNameTerms.slice();
+  }
+
+  function _countWorkbenchSelectedRows() {
+    var n = 0;
+    savedFiles.forEach(function (rec) {
+      if (!rec || !rec.id) return;
+      var row = __batchWorkbenchRows[String(rec.id)];
+      if (row && row.selected) n++;
+    });
+    return n;
+  }
+
+  function _setWorkbenchRowsSelected(on, onlyFilteredVisible) {
+    savedFiles.forEach(function (r) {
+      if (!r || !r.id) return;
+      var row = __batchWorkbenchRows[String(r.id)];
+      if (!row) return;
+      if (onlyFilteredVisible && !_workbenchRowPassesFilter(r, row)) return;
+      row.selected = !!on;
+    });
   }
 
   function _canvasOverrideForRole(fileId, rid) {
@@ -7266,6 +7550,8 @@
       status: row.status || '',
       rolesLabel: row.rolesLabel || '',
       detectExplain: row.detectExplain || '',
+      detectWrongNote: row.detectWrongNote || '',
+      manualDetectWrong: !!row.manualDetectWrong,
       editor: row.editor || '',
       reviewer: row.reviewer || '',
       approver: row.approver || '',
@@ -7281,6 +7567,10 @@
     var row = __batchWorkbenchRows[String(fileId)];
     if (!row) return;
     if (wb.status != null) row.status = String(wb.status);
+    if (typeof wb.manualDetectWrong === 'boolean') {
+      row.manualDetectWrong = wb.manualDetectWrong;
+    }
+    if (wb.detectWrongNote != null) row.detectWrongNote = String(wb.detectWrongNote);
     if (wb.rolesLabel != null) row.rolesLabel = String(wb.rolesLabel);
     if (wb.detectExplain != null) row.detectExplain = String(wb.detectExplain);
     if (wb.editor != null) row.editor = String(wb.editor);
@@ -7293,34 +7583,62 @@
     syncRowToHandoffCtx(fileId);
   }
 
-  var __persistFileCacheTimer = null;
+  var __persistFileCacheTimers = {};
+  function persistFileSessionCacheNow(fileId) {
+    if (!fileId) return Promise.resolve();
+    var payload = {};
+    var st = fileUiCache[String(fileId)] || {};
+    if (st.lastDetectData) payload.detect = st.lastDetectData;
+    var wb = workbenchStateFromRow(fileId);
+    if (wb) payload.workbench = wb;
+    if (!Object.keys(payload).length) return Promise.resolve();
+    return fetchJson(apiUrl('/api/sign/files/' + encodeURIComponent(fileId) + '/file-cache'), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      timeoutMs: 60000,
+    }).catch(function () {});
+  }
+
   function schedulePersistFileSessionCache(fileId) {
     if (!fileId) return;
-    if (__persistFileCacheTimer) clearTimeout(__persistFileCacheTimer);
-    __persistFileCacheTimer = setTimeout(function () {
-      __persistFileCacheTimer = null;
-      var payload = {};
-      var st = fileUiCache[String(fileId)] || {};
-      if (st.lastDetectData) payload.detect = st.lastDetectData;
-      var wb = workbenchStateFromRow(fileId);
-      if (wb) payload.workbench = wb;
-      if (!Object.keys(payload).length) return;
-      fetchJson(apiUrl('/api/sign/files/' + encodeURIComponent(fileId) + '/file-cache'), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        timeoutMs: 60000,
-      }).catch(function () {});
+    var fid = String(fileId);
+    if (__persistFileCacheTimers[fid]) clearTimeout(__persistFileCacheTimers[fid]);
+    __persistFileCacheTimers[fid] = setTimeout(function () {
+      delete __persistFileCacheTimers[fid];
+      persistFileSessionCacheNow(fid);
     }, 400);
+  }
+
+  function flushPendingFileSessionCaches(fileIdsOpt) {
+    var ids = fileIdsOpt && fileIdsOpt.length
+      ? fileIdsOpt.map(String)
+      : Object.keys(__persistFileCacheTimers);
+    ids.forEach(function (fid) {
+      if (__persistFileCacheTimers[fid]) {
+        clearTimeout(__persistFileCacheTimers[fid]);
+        delete __persistFileCacheTimers[fid];
+      }
+    });
+    var uniq = {};
+    ids.forEach(function (fid) {
+      if (fid) uniq[fid] = true;
+    });
+    return Promise.all(
+      Object.keys(uniq).map(function (fid) {
+        return persistFileSessionCacheNow(fid);
+      })
+    );
   }
 
   function hydrateFileCachesFromServer() {
     if (!IS_FILE_SIGN_PAGE) return Promise.resolve();
     if (__fileCacheHydratePromise) return __fileCacheHydratePromise;
-    __fileCacheHydratePromise = fetchJson(apiUrl('/api/sign/files/file-caches'), {
-      timeoutMs: 120000,
-      cache: 'no-store',
-    })
+    __fileCacheHydratePromise = fetchJsonWithRetry(
+      apiUrl('/api/sign/files/file-caches') + '?_=' + Date.now(),
+      { timeoutMs: 90000, cache: 'no-store' },
+      { maxTry: 2, delayMs: 1500 }
+    )
       .then(function (r) {
         var j = (r && r.data) || {};
         if (!j.ok || !j.caches || typeof j.caches !== 'object') return;
@@ -7335,14 +7653,26 @@
           }
           if (ent.workbench) {
             applyWorkbenchStateFromCache(fid, ent.workbench);
-          } else if (ent.detect && ent.detect.ok) {
+          } else if (ent.detect) {
             syncWorkbenchRowFromDetect(fid, ent.detect);
           }
           var row = __batchWorkbenchRows[String(fid)];
-          if (row && ent.map) {
+          if (row) {
             finalizeWorkbenchRowStatus(fid);
           }
         });
+        try {
+          renderBatchWorkbenchTable();
+        } catch (_) {}
+      })
+      .catch(function (e) {
+        var msg = (e && e.message) || String(e);
+        try {
+          setBatchWorkbenchMsg(
+            '识别/匹配缓存恢复失败（页面仍可使用）：' + msg + '。可点「刷新列表」重试。',
+            true
+          );
+        } catch (_) {}
       })
       .finally(function () {
         __fileCacheHydratePromise = null;
@@ -7350,31 +7680,73 @@
     return __fileCacheHydratePromise;
   }
 
+  function _workbenchFilteredFileIds() {
+    var ids = [];
+    savedFiles.forEach(function (rec) {
+      if (!rec || !rec.id) return;
+      var row = __batchWorkbenchRows[String(rec.id)];
+      if (!_workbenchRowPassesFilter(rec, row)) return;
+      ids.push(String(rec.id));
+    });
+    return ids;
+  }
+
+  function selectWorkbenchFilteredRows(selected, opt) {
+    opt = opt && typeof opt === 'object' ? opt : {};
+    var on = !!selected;
+    var merge = opt.merge !== false;
+    var n = 0;
+    savedFiles.forEach(function (rec) {
+      if (!rec || !rec.id) return;
+      var row = __batchWorkbenchRows[String(rec.id)];
+      if (!_workbenchRowPassesFilter(rec, row)) return;
+      if (!row) return;
+      if (on && merge && row.selected) return;
+      row.selected = on;
+      n++;
+    });
+    syncHiddenBatchPicks();
+    renderBatchWorkbenchTable();
+    return n;
+  }
+
   function _workbenchRowPassesFilter(rec, row) {
     if (!rec || !rec.id) return false;
     var nm = String(rec.name || rec.id || '').toLowerCase();
-    var q = String(__wbFilterName || '').trim().toLowerCase();
-    if (q && nm.indexOf(q) < 0) return false;
-    var st = String(__wbFilterStatus || '').trim();
-    if (!st) return true;
-    var shown = row ? String(row.status || '') : '';
-    if (st === '__fail__') {
-      return /失败|超时|未识别/.test(shown);
+    var nameTerms = _workbenchNameFilterTerms();
+    if (nameTerms.length) {
+      var nameHit = false;
+      for (var ni = 0; ni < nameTerms.length; ni++) {
+        var term = String(nameTerms[ni] || '').trim().toLowerCase();
+        if (term && nm.indexOf(term) >= 0) {
+          nameHit = true;
+          break;
+        }
+      }
+      if (!nameHit) return false;
     }
-    if (st === '识别中') {
-      return /识别|匹配|分析/.test(shown);
-    }
-    return shown === st || shown.indexOf(st) === 0;
+    if (!__wbFilterStatuses.length) return true;
+    return _workbenchRowMatchesStatusFilter(row);
   }
 
   function _updateWorkbenchFilterHint(shown, total) {
     if (!batchWorkbenchFilterHint) return;
-    if (!__wbFilterName && !__wbFilterStatus) {
-      batchWorkbenchFilterHint.textContent = total ? '共 ' + total + ' 个文件' : '';
+    var sel = _countWorkbenchSelectedRows();
+    if (!_workbenchHasActiveFilter()) {
+      batchWorkbenchFilterHint.textContent = total
+        ? '共 ' + total + ' 个文件' + (sel ? ' · 已勾选 ' + sel + ' 个' : '')
+        : '';
       return;
     }
-    batchWorkbenchFilterHint.textContent =
-      '显示 ' + shown + ' / ' + total + ' 个文件';
+    var parts = ['显示 ' + shown + ' / ' + total];
+    if (__wbFilterNameTerms.length) {
+      parts.push('文件名[' + __wbFilterNameTerms.join('|') + ']');
+    }
+    if (__wbFilterStatuses.length) {
+      parts.push('状态[' + __wbFilterStatuses.join('|') + ']');
+    }
+    if (sel) parts.push('已勾选 ' + sel + ' 个');
+    batchWorkbenchFilterHint.textContent = parts.join(' · ');
   }
 
   function _summarizeBatchWorkbenchProgress(scopeFileIds) {
@@ -7382,7 +7754,7 @@
       ? scopeFileIds
       : Object.keys(__batchWorkbenchRows || {})
     ).map(String);
-    var s = { total: ids.length, done: 0, ready: 0, partial: 0, waitMatch: 0,
+    var s = { total: ids.length, done: 0, ready: 0, partial: 0, waitMatch: 0, detectWrong: 0,
       noSign: 0, detectTimeout: 0, detectFail: 0, noField: 0, busy: 0, pending: 0,
       failItems: [] };
     ids.forEach(function (fid) {
@@ -7393,6 +7765,8 @@
       else if (t === '就绪') { s.ready++; s.done++; }
       else if (t === '部分就绪') { s.partial++; s.done++; }
       else if (t === '待匹配') { s.waitMatch++; s.done++; }
+      else if (t === '识别有误') { s.detectWrong++; s.done++;
+        s.failItems.push({ fid: fid, name: r.name || fid, status: t, detail: r.detectWrongNote || r.rolesLabel || '' }); }
       else if (/识别超时/.test(t)) { s.detectTimeout++; s.done++;
         s.failItems.push({ fid: fid, name: r.name || fid, status: t, detail: r.rolesLabel || '' }); }
       else if (/识别失败/.test(t)) { s.detectFail++; s.done++;
@@ -7425,7 +7799,13 @@
       return '本类文档按规则无需签字，可取消勾选后批量处理其余文件';
     }
     if (/未识别/.test(s)) {
-      return '检查模板签批栏标签（编写/审核/批准）是否规范';
+      return '检查模板签批栏标签（编写/审核/批准）是否规范，或修正 JSON 规则后批量重新识别';
+    }
+    if (/识别有误/.test(s)) {
+      return '人工标记识别有误：修正规则 JSON 后勾选并点「批量识别签字位」重新识别';
+    }
+    if (/待匹配/.test(s)) {
+      return '识别结果可用，点「批量匹配素材」或补全库素材';
     }
     if (mat && mat.missingRoleIds && mat.missingRoleIds.length) {
       return '为缺素材角色补签名/日期素材，或开启高级模式画布补签';
@@ -7460,7 +7840,7 @@
       if (dateOnlyLabels.length) detailParts.push('仅日期：' + dateOnlyLabels.join('、'));
       var details = detailParts.join('；');
       var hasIssue =
-        /识别超时|识别失败|未识别|待匹配|部分就绪/.test(status) ||
+        /识别超时|识别失败|未识别|识别有误|部分就绪/.test(status) ||
         !!missingLabels.length ||
         !!sigOnlyLabels.length ||
         !!dateOnlyLabels.length;
@@ -7726,7 +8106,7 @@
       var _stTxt = String(row.status || '');
       if (_stTxt === '就绪') tr.classList.add('row-ready');
       if (/识别中|匹配素材|识别…|分析中/.test(_stTxt)) tr.classList.add('row-busy');
-      if (/失败|超时|未识别/.test(_stTxt)) tr.classList.add('row-error');
+      if (/失败|超时|未识别|识别有误/.test(_stTxt)) tr.classList.add('row-error');
 
       var td0 = document.createElement('td');
       td0.className = 'col-check';
@@ -7801,7 +8181,7 @@
       tdSt.title = (_rolesTxt && _rolesTxt !== '—')
         ? (_stShown + '\n' + _rolesTxt + (_detExplain ? ('\n' + _detExplain) : ''))
         : (_detExplain ? (_stShown + '\n' + _detExplain) : _stShown);
-      if (/失败|超时|未识别/.test(_stShown)) {
+      if (/失败|超时|未识别|识别有误/.test(_stShown)) {
         tdSt.style.color = '#c62828';
         tdSt.style.fontWeight = '600';
       } else if (/识别中|匹配素材|识别…|分析中/.test(_stShown)) {
@@ -7809,6 +8189,8 @@
       } else if (_stShown === '就绪') {
         tdSt.style.color = '#1b5e20';
         tdSt.style.fontWeight = '600';
+      } else if (_stShown === '待匹配') {
+        tdSt.style.color = '#e65100';
       }
 
       var tdOp = document.createElement('td');
@@ -7831,6 +8213,8 @@
         if (rrow) {
           rrow._wbPipelineDone = false;
           rrow._wbMatchAttempted = false;
+          rrow.manualDetectWrong = false;
+          rrow.detectWrongNote = '';
           rrow.status = '识别中…';
           rrow.rolesLabel = '识别中…';
         }
@@ -7853,6 +8237,21 @@
       btnCanvas.addEventListener('click', function () {
         selectWorkbenchFileForAdvanced(fid);
       });
+      if (!row.manualDetectWrong && _stShown !== '识别有误') {
+        var btnWrong = document.createElement('button');
+        btnWrong.type = 'button';
+        btnWrong.className = 'btn btn-secondary';
+        btnWrong.style.padding = '4px 8px';
+        btnWrong.style.fontSize = '0.82rem';
+        btnWrong.style.marginLeft = '4px';
+        btnWrong.textContent = '标误';
+        btnWrong.title = '人工标记：识别角色与规则不符';
+        btnWrong.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          markWorkbenchRowDetectWrong(fid, '人工标记：识别角色与规则不符');
+        });
+        tdOp.appendChild(btnWrong);
+      }
       tdOp.appendChild(btnDet);
       tdOp.appendChild(btnCanvas);
 
@@ -7878,12 +8277,26 @@
       tr.appendChild(tdOp);
       batchWorkbenchBody.appendChild(tr);
     });
-    var allOn = savedFiles.length > 0 && savedFiles.every(function (r) {
+    var visRows = [];
+    savedFiles.forEach(function (r) {
+      if (!r || !r.id) return;
       var rw = __batchWorkbenchRows[String(r.id)];
+      if (!rw || !_workbenchRowPassesFilter(r, rw)) return;
+      visRows.push(rw);
+    });
+    var allOn = visRows.length > 0 && visRows.every(function (rw) {
       return rw && rw.selected;
     });
     if (batchWorkbenchHeadCheck) batchWorkbenchHeadCheck.checked = allOn;
-    if (batchWorkbenchSelectAll) batchWorkbenchSelectAll.checked = allOn;
+    if (batchWorkbenchSelectAll) {
+      batchWorkbenchSelectAll.checked = _workbenchHasActiveFilter()
+        ? allOn
+        : savedFiles.length > 0 &&
+          savedFiles.every(function (r) {
+            var rw = __batchWorkbenchRows[String(r.id)];
+            return rw && rw.selected;
+          });
+    }
     _updateWorkbenchFilterHint(shown, total);
   }
 
@@ -7968,14 +8381,6 @@
         var stDet = (fileUiCache[fileId] || {}).lastDetectData;
         var roleList = mergeDetectedRolesForFile(fileId);
         if (detectOk === false || !stDet || !stDet.ok) {
-          if (isNoSignRequiredForFile(fileId, stDet)) {
-            row.status = '无需签字';
-            row.rolesLabel = '无需签字';
-            row._wbPipelineDone = true;
-            row._wbMatchAttempted = true;
-            finalizeWorkbenchRowStatus(fileId);
-            return null;
-          }
           row.status = '识别失败';
           if (row.rolesLabel === '—' || row.rolesLabel === '识别中…') {
             row.rolesLabel = (fileUiCache[fileId] || {}).lastDetectError || '识别失败';
@@ -7983,17 +8388,6 @@
           return Promise.reject(new Error('识别失败'));
         }
         if (!roleList.length) {
-          if (isNoSignRequiredForFile(fileId, stDet)) {
-            row.status = '无需签字';
-            row.rolesLabel = '无需签字';
-            row._wbPipelineDone = true;
-            row._wbMatchAttempted = true;
-            if (opts.detectOnly) {
-              finalizeWorkbenchRowStatus(fileId);
-              return null;
-            }
-            return null;
-          }
           row.status = '未识别到签字位';
           row.rolesLabel =
             (fileUiCache[fileId] || {}).lastDetectError ||
@@ -8020,7 +8414,7 @@
         finalizeWorkbenchRowStatus(fileId);
       })
       .catch(function (e) {
-        if (isNoSignRequiredForFile(fileId) || fileHasValidDetectCache(fileId)) {
+        if (shouldSkipDetectPipelineForFile(fileId) || fileHasValidDetectCache(fileId)) {
           finalizeWorkbenchRowStatus(fileId);
         } else {
           var msg = (e && e.message) || '识别失败';
@@ -8108,7 +8502,11 @@
         });
       });
     });
-    return chain.then(function () {
+    return chain
+      .then(function () {
+        return flushPendingFileSessionCaches(ids);
+      })
+      .then(function () {
       var totalSec = Math.max(0, Math.round((Date.now() - startTs) / 1000));
       var sum = _summarizeBatchWorkbenchProgress(ids);
       var failN = sum.detectTimeout + sum.detectFail + sum.noField;
@@ -8116,6 +8514,7 @@
         '（耗时 ' + totalSec + 's）。';
       var detail = '就绪 ' + sum.ready + ' / 部分就绪 ' + sum.partial +
         ' / 待匹配 ' + sum.waitMatch +
+        (sum.detectWrong ? ' / 识别有误 ' + sum.detectWrong : '') +
         (sum.noSign ? ' / 无需签字 ' + sum.noSign : '') +
         ' / 识别超时 ' + sum.detectTimeout +
         ' / 识别失败 ' + sum.detectFail +
@@ -8178,9 +8577,18 @@
         return row && row.selected;
       });
     if (!ids.length) {
-      setBatchWorkbenchMsg('请先勾选要处理的文件', true);
+      setBatchWorkbenchMsg('请先勾选要处理的文件（可先「全选当前筛选」）', true);
       return Promise.resolve();
     }
+    ids.forEach(function (fid) {
+      var row = __batchWorkbenchRows[String(fid)];
+      if (row && runOpt.forceReprocess) {
+        row._wbPipelineDone = false;
+        row._wbMatchAttempted = false;
+        row.manualDetectWrong = false;
+        row.detectWrongNote = '';
+      }
+    });
     return processBatchWorkbenchFileIds(ids, detectOnly, runOpt);
   }
 
@@ -8245,6 +8653,7 @@
             '后台识别匹配已结束。就绪 ' + sum.ready +
               ' / 部分就绪 ' + sum.partial +
               ' / 待匹配 ' + sum.waitMatch +
+        (sum.detectWrong ? ' / 识别有误 ' + sum.detectWrong : '') +
               (sum.noSign ? ' / 无需签字 ' + sum.noSign : '') +
               ' / 识别超时 ' + sum.detectTimeout +
               ' / 识别失败 ' + sum.detectFail +
@@ -10818,23 +11227,23 @@
       bootChain = (IS_FILE_SIGN_PAGE || IS_MATERIALS_PAGE ? refreshSigners() : Promise.resolve())
         .then(function () {
           if (IS_FILE_SIGN_PAGE) {
-            return refreshFileList().then(function () {
-              if (savedFiles.length) {
-                enableBatchWorkbenchMode();
-                return hydrateFileCachesFromServer();
-              }
-            }).then(function () {
-              syncHiddenBatchPicks();
-              renderBatchWorkbenchTable();
-              refreshSignedList({ skipPageProgress: true });
-              syncLibraryRolesModeRow();
-              updateSubmitState();
-              return maybeApplyAiwordHandoffFromQuery();
-            });
+            return refreshFileList({ softFail: true, skipPageProgress: true })
+              .then(function () {
+                if (savedFiles.length) {
+                  enableBatchWorkbenchMode();
+                  mergeBatchWorkbenchRowsFromSavedFiles();
+                  return hydrateFileCachesFromServer();
+                }
+              })
+              .then(function () {
+                syncHiddenBatchPicks();
+                renderBatchWorkbenchTable();
+                refreshSignedList({ skipPageProgress: true });
+                syncLibraryRolesModeRow();
+                updateSubmitState();
+              });
           }
-          return _bootAfterSigners().then(function () {
-            return maybeApplyAiwordHandoffFromQuery();
-          });
+          return _bootAfterSigners();
         });
     }
 
@@ -10852,19 +11261,27 @@
         },
         function (e) {
           if (IS_FILE_SIGN_PAGE && deferRefreshForHandoff) {
-            refreshFileList();
+            refreshFileList({ softFail: true });
             refreshSignedList();
             syncLibraryRolesModeRow();
             updateSubmitState();
+          } else if (IS_FILE_SIGN_PAGE) {
+            refreshFileList({ softFail: true, skipPageProgress: true }).catch(function () {});
           }
           try {
             var msg = e && e.message ? e.message : String(e);
             var b = document.getElementById('signBootstrapBanner');
             if (b) {
               b.style.display = 'block';
-              b.textContent = 'aiword 交接失败：' + msg;
+              b.textContent = deferRefreshForHandoff
+                ? 'aiword 交接失败：' + msg
+                : '签字页加载异常：' + msg + '（非 aiword 入口可忽略交接提示，请确认服务已启动后点「刷新列表」）';
             }
-            if (typeof setSaveUploadFeedback === 'function') setSaveUploadFeedback(msg || '交接失败');
+            if (typeof setSaveUploadFeedback === 'function') {
+              setSaveUploadFeedback(
+                deferRefreshForHandoff ? msg || '交接失败' : '加载异常：' + msg
+              );
+            }
           } catch (_) {}
           try {
             window.__SIGN_PAGE_BOOT_OK = true;

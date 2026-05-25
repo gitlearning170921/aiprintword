@@ -3252,28 +3252,87 @@ def get_file_workbench_state(file_id: str) -> Optional[dict]:
     return data if data else None
 
 
+def _role_map_light_from_rows(rows: List[dict]) -> Dict[str, Any]:
+    """批量恢复用：仅读 sign_file_role_signer 已存字段，不做旧 stroke_set 迁移。"""
+    out: Dict[str, Any] = {}
+    for r in rows or []:
+        rid = str(r.get("role_id") or "").strip()
+        if not rid:
+            continue
+        sig_id = (r.get("sig_item_id") or "").strip()
+        date_id = (r.get("date_item_id") or "").strip()
+        dm = (r.get("date_mode") or "").strip() or None
+        diso = (r.get("date_iso") or "").strip() or None
+        if sig_id or date_id or is_composite_date_mode(dm):
+            out[rid] = {
+                "sig": sig_id or None,
+                "date": date_id or None,
+                "date_mode": dm,
+                "date_iso": diso or None,
+            }
+    return out
+
+
 def list_file_session_caches() -> Dict[str, dict]:
-    """返回各文件的 detect / workbench / role-map 缓存（用于页面恢复）。"""
+    """返回各文件的 detect / workbench / role-map 缓存（用于页面恢复，批量 SQL）。"""
+    from sign_handlers.file_session_cache import trim_detect_snapshot, trim_workbench_state, _json_load
+
     ensure_sign_mysql()
-    files = list_files()
+    try:
+        limit = int((os.environ.get("SIGN_MYSQL_MAX_FILES") or "500").strip() or "500")
+    except ValueError:
+        limit = 500
+    limit = max(1, min(limit, 2000))
     out: Dict[str, dict] = {}
-    for rec in files:
-        fid = str(rec.get("id") or "")
+    maps_by_file: Dict[str, Dict[str, Any]] = {}
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, detect_snapshot_json, workbench_state_json "
+                "FROM sign_uploaded_file "
+                "WHERE detect_snapshot_json IS NOT NULL OR workbench_state_json IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            file_rows = cur.fetchall() or []
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT file_id, role_id, sig_item_id, date_item_id, date_mode, date_iso "
+                "FROM sign_file_role_signer "
+                "WHERE sig_item_id IS NOT NULL OR date_item_id IS NOT NULL "
+                "OR (date_mode IS NOT NULL AND date_mode != '') "
+                "OR (date_iso IS NOT NULL AND date_iso != '')"
+            )
+            role_rows = cur.fetchall() or []
+    for r in role_rows:
+        fid = str(r.get("file_id") or "")
+        if not fid:
+            continue
+        maps_by_file.setdefault(fid, []).append(r)
+    for fid, rs in maps_by_file.items():
+        m = _role_map_light_from_rows(rs)
+        if m:
+            maps_by_file[fid] = m
+        else:
+            del maps_by_file[fid]
+    for row in file_rows:
+        fid = str(row.get("id") or "")
         if not fid:
             continue
         entry: dict = {}
-        det = get_file_detect_snapshot(fid)
+        det = trim_detect_snapshot(_json_load(row.get("detect_snapshot_json")))
         if det:
             entry["detect"] = det
-        wb = get_file_workbench_state(fid)
+        wb = trim_workbench_state(_json_load(row.get("workbench_state_json")))
         if wb:
             entry["workbench"] = wb
-        try:
-            m = get_file_role_signer_map(fid)
-            if m:
-                entry["map"] = m
-        except Exception:
-            pass
+        m = maps_by_file.get(fid)
+        if m:
+            entry["map"] = m
         if entry:
             out[fid] = entry
+    for fid, m in maps_by_file.items():
+        if fid not in out:
+            out[fid] = {"map": m}
     return out

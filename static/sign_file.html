@@ -271,6 +271,54 @@
     .batch-workbench-table tr.row-busy .col-status { color: #1a73e8; }
     .batch-workbench-table tr.row-busy { background: rgba(26,115,232,0.03); }
     .batch-workbench-table .col-status { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: help; }
+    .wb-filter-status-box {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      align-items: center;
+      max-width: 520px;
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface2);
+      font-size: 0.82rem;
+    }
+    .wb-filter-status-box label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin: 0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .wb-filter-status-box input { accent-color: var(--accent); }
+    .wb-filter-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      min-height: 0;
+      font-size: 0.82rem;
+    }
+    .wb-filter-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      background: #e8f0fe;
+      border: 1px solid #c6dafc;
+      border-radius: 999px;
+      color: #174ea6;
+    }
+    .wb-filter-tag button {
+      border: none;
+      background: transparent;
+      color: #174ea6;
+      cursor: pointer;
+      padding: 0 2px;
+      font-size: 0.9rem;
+      line-height: 1;
+    }
     /* 工作台顶部反馈消息条：四态颜色（普通/成功/警告/错误）；JS 也兜底了内联样式 */
     #batchWorkbenchMsg.btn-inline-feedback.is-ok { background:#e8f5e9; color:#1b5e20; border:1px solid #a5d6a7; padding:8px 12px; border-radius:6px; white-space:pre-wrap; }
     #batchWorkbenchMsg.btn-inline-feedback.is-warn { background:#fff3e0; color:#bf360c; border:1px solid #ffcc80; padding:8px 12px; border-radius:6px; white-space:pre-wrap; }
@@ -442,6 +490,7 @@
             </label>
             <button type="button" class="btn btn-secondary" id="batchWorkbenchDetectBtn">批量识别签字位</button>
             <button type="button" class="btn btn-secondary" id="batchWorkbenchApplyBtn">批量匹配素材</button>
+            <button type="button" class="btn btn-secondary" id="batchWorkbenchMarkDetectWrongBtn" title="人工标记：识别角色与规则不符">标为识别有误（已选）</button>
             <button type="button" class="btn btn-secondary" id="batchWorkbenchDeleteBtn">批量删除已勾选</button>
             <label style="margin:0;font-size:0.9rem;">批量版本</label>
             <select id="batchWorkbenchLocaleBulk" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
@@ -454,21 +503,30 @@
             <button type="button" class="btn btn-secondary" id="batchWorkbenchRefreshBtn">刷新列表</button>
             <button type="button" class="btn btn-primary" id="batchWorkbenchSignBtn">一键批量签字</button>
           </div>
-          <div class="btn-row" style="margin:0 0 10px;align-items:center;flex-wrap:wrap;gap:8px;">
+          <div class="btn-row" style="margin:0 0 6px;align-items:center;flex-wrap:wrap;gap:8px;">
             <label style="margin:0;font-size:0.88rem;">筛选</label>
-            <input type="search" id="batchWorkbenchFilterName" placeholder="按文件名筛选…" style="flex:1;min-width:160px;max-width:320px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
-            <select id="batchWorkbenchFilterStatus" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;min-width:120px;">
-              <option value="">全部状态</option>
-              <option value="就绪">就绪</option>
-              <option value="部分就绪">部分就绪</option>
-              <option value="待匹配">待匹配</option>
-              <option value="无需签字">无需签字</option>
-              <option value="待处理">待处理</option>
-              <option value="识别中">识别中…</option>
-              <option value="__fail__">失败/超时</option>
-            </select>
+            <input type="search" id="batchWorkbenchFilterName" placeholder="文件名关键词，回车筛选" style="flex:1;min-width:140px;max-width:280px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
+            <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterClearBtn" style="font-size:0.88rem;">清除筛选</button>
+            <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterDetectIssuesBtn" style="font-size:0.88rem;">仅筛识别问题</button>
+            <button type="button" class="btn btn-secondary" id="batchWorkbenchSelectFilteredBtn" style="font-size:0.88rem;">累加勾选当前筛选</button>
             <span id="batchWorkbenchFilterHint" class="hint" style="margin:0;"></span>
           </div>
+          <div id="batchWorkbenchFilterNameTags" class="wb-filter-tags" style="margin:0 0 8px;display:none;"></div>
+          <div id="batchWorkbenchFilterStatusBox" class="wb-filter-status-box" style="margin:0 0 8px;">
+            <span style="color:var(--text-muted);margin-right:4px;">状态</span>
+            <label><input type="checkbox" data-wb-status="识别有误">识别有误</label>
+            <label><input type="checkbox" data-wb-status="识别失败">识别失败</label>
+            <label><input type="checkbox" data-wb-status="识别超时">识别超时</label>
+            <label><input type="checkbox" data-wb-status="未识别">未识别</label>
+            <label><input type="checkbox" data-wb-status="待匹配">待匹配</label>
+            <label><input type="checkbox" data-wb-status="就绪">就绪</label>
+            <label><input type="checkbox" data-wb-status="部分就绪">部分就绪</label>
+            <label><input type="checkbox" data-wb-status="无需签字">无需签字</label>
+            <label><input type="checkbox" data-wb-status="待处理">待处理</label>
+            <label><input type="checkbox" data-wb-status="识别中">识别中</label>
+            <button type="button" class="btn btn-secondary" id="batchWorkbenchSelectByStatusBtn" style="font-size:0.82rem;margin-left:6px;">按状态全选</button>
+          </div>
+          <p class="hint" style="margin:0 0 8px;font-size:0.85rem;">文件名回车可多次筛选合并（OR）；状态勾选后点「按状态全选」或「累加勾选当前筛选」。已勾选跨筛选保留。</p>
           <p id="batchWorkbenchMsg" class="btn-inline-feedback" style="display:none;margin:0 0 8px;" role="status"></p>
           <div class="batch-workbench-wrap">
             <table class="batch-workbench-table" id="batchWorkbenchTable">
@@ -634,7 +692,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js?v=52';
+      s.src = (p || '') + '/js/sign-page.js?v=58';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +
