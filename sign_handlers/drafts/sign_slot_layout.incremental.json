@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "source": "signature_slot_layout_full_rescan_T2.md",
+  "generated_by": "scripts/generate_sign_rule_drafts_from_md.py",
+  "layout_forms_ranked": [
+    {
+      "name": "日期在右相邻单元格",
+      "count": 129
+    },
+    {
+      "name": "日期在下方相邻/偏右单元格",
+      "count": 98
+    },
+    {
+      "name": "右侧空白单元格",
+      "count": 48
+    },
+    {
+      "name": "与角色同一单元格/字段标记",
+      "count": 43
+    },
+    {
+      "name": "日期在右侧隔列单元格",
+      "count": 32
+    },
+    {
+      "name": "右侧已有姓名/日期值（需先删除电脑输入后重签）",
+      "count": 28
+    },
+    {
+      "name": "与角色同字段标记，后接长空格",
+      "count": 14
+    },
+    {
+      "name": "同字段长空格占位",
+      "count": 14
+    },
+    {
+      "name": "与角色同字段标记，后接下划线/点线",
+      "count": 2
+    },
+    {
+      "name": "两行签批表：角色行右侧空白签名格，日期行右侧空白日期格",
+      "count": 2
+    },
+    {
+      "name": "同字段下划线/点线占位",
+      "count": 2
+    },
+    {
+      "name": "日期在下一行对应签名格右侧/同列空白格（两行签批表）",
+      "count": 2
+    }
+  ],
+  "layout_priority_rules": [
+    {
+      "layout_type": "two_row_signoff_table",
+      "description": "两行签批表：优先角色行右侧签名格 + 日期行右侧日期格",
+      "priority": 100,
+      "match_contains": [
+        "两行签批表"
+      ]
+    },
+    {
+      "layout_type": "same_cell_inline",
+      "description": "同字段长空格/下划线占位，优先同格内联插入",
+      "priority": 80,
+      "match_contains": [
+        "同字段长空格占位",
+        "同字段下划线/点线占位"
+      ]
+    },
+    {
+      "layout_type": "adjacent_right_cell",
+      "description": "右侧相邻/隔列空白格落位",
+      "priority": 60,
+      "match_contains": [
+        "右侧空白单元格",
+        "日期在右相邻单元格",
+        "日期在右侧隔列单元格"
+      ]
+    }
+  ]
+}

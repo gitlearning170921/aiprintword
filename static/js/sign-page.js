@@ -188,8 +188,8 @@
         var elapsed = Date.now() - started;
         if (!row) return;
         if (elapsed > 45000 && (row.status === '识别中…' || row.status === '识别重试中…')) {
-          row.status = '识别较慢…';
-          row.rolesLabel = '大文档解析中（' + Math.round(elapsed / 1000) + 's）';
+          row.status = '识别较慢…（' + Math.round(elapsed / 1000) + 's）';
+          row.slotTags = ['识别中'];
           try {
             renderBatchWorkbenchTable();
           } catch (_) {}
@@ -659,9 +659,23 @@
   var batchWorkbenchSelectFilteredBtn = document.getElementById('batchWorkbenchSelectFilteredBtn');
   var batchWorkbenchFilterName = document.getElementById('batchWorkbenchFilterName');
   var batchWorkbenchFilterClearBtn = document.getElementById('batchWorkbenchFilterClearBtn');
+  var batchWorkbenchFilterNotSignableBtn = document.getElementById('batchWorkbenchFilterNotSignableBtn');
   var batchWorkbenchSelectByStatusBtn = document.getElementById('batchWorkbenchSelectByStatusBtn');
   var batchWorkbenchFilterNameTags = document.getElementById('batchWorkbenchFilterNameTags');
+  var batchWorkbenchFilterStatusWrap = document.getElementById('batchWorkbenchFilterStatusWrap');
+  var batchWorkbenchFilterStatusToggle = document.getElementById(
+    'batchWorkbenchFilterStatusToggle'
+  );
   var batchWorkbenchFilterStatusBox = document.getElementById('batchWorkbenchFilterStatusBox');
+  var batchWorkbenchFilterSlotWrap = document.getElementById('batchWorkbenchFilterSlotWrap');
+  var batchWorkbenchFilterSlotToggle = document.getElementById('batchWorkbenchFilterSlotToggle');
+  var batchWorkbenchFilterSlotBox = document.getElementById('batchWorkbenchFilterSlotBox');
+  var batchWorkbenchStatusSelectAllBtn = document.getElementById(
+    'batchWorkbenchStatusSelectAllBtn'
+  );
+  var batchWorkbenchStatusClearBtn = document.getElementById('batchWorkbenchStatusClearBtn');
+  var batchWorkbenchSlotSelectAllBtn = document.getElementById('batchWorkbenchSlotSelectAllBtn');
+  var batchWorkbenchSlotClearBtn = document.getElementById('batchWorkbenchSlotClearBtn');
   var batchWorkbenchFilterHint = document.getElementById('batchWorkbenchFilterHint');
   var batchWorkbenchAdvancedCb = document.getElementById('batchWorkbenchAdvancedCb');
   var needSignActionMsg = document.getElementById('needSignActionMsg');
@@ -1004,6 +1018,113 @@
   var __wbFilterNameTerms = [];
   var __wbFilterNameDraft = '';
   var __wbFilterStatuses = [];
+  var __wbFilterSlotTags = [];
+  var __wbAvailableSlotTags = [];
+  /** 处理状态筛选项（与 _workbenchStatusBucket 返回值一致），固定全集 */
+  var WORKBENCH_STATUS_FILTER_GROUPS = [
+    {
+      title: '识别异常',
+      items: [
+        { value: '识别有误', label: '识别有误（人工登记）' },
+        { value: '识别失败', label: '识别失败' },
+        { value: '识别超时', label: '识别超时' },
+        { value: '未识别', label: '未识别（含未识别到签字位）' },
+        { value: '签字位不完整', label: '签字位不完整（含缺姓名/日期位）' },
+      ],
+    },
+    {
+      title: '素材与就绪',
+      items: [
+        { value: '待匹配', label: '待匹配' },
+        { value: '就绪', label: '就绪' },
+        { value: '部分就绪', label: '部分就绪' },
+        { value: '无可用素材', label: '无可用素材' },
+      ],
+    },
+    {
+      title: '流水线进行中',
+      items: [
+        { value: '识别中', label: '识别中/匹配素材/识别较慢/重试中' },
+        { value: '签字中', label: '签字中…' },
+      ],
+    },
+    {
+      title: '签字结果',
+      items: [
+        { value: '已签字', label: '已签字' },
+        { value: '签字失败', label: '签字失败' },
+        { value: '保存映射失败', label: '保存映射失败' },
+      ],
+    },
+    {
+      title: '其它',
+      items: [
+        { value: '无需签字', label: '无需签字' },
+        { value: '待处理', label: '待处理（— / 未跑流水线）' },
+      ],
+    },
+  ];
+  /** 签字位筛选：固定全集（不依赖当前列表是否出现过） */
+  var WORKBENCH_SLOT_FILTER_GROUPS = [
+    {
+      title: '结论',
+      items: [
+        { value: '可签', label: '可签' },
+        { value: '不可签', label: '不可签' },
+        { value: '位齐全', label: '位齐全' },
+        { value: '待确认', label: '待确认' },
+        { value: '无需签字', label: '无需签字' },
+        { value: '缺姓名位', label: '缺姓名位' },
+        { value: '缺日期位', label: '缺日期位' },
+        { value: '缺姓名+日期位', label: '缺姓名+日期位' },
+      ],
+    },
+    {
+      title: '缺位标签',
+      items: [
+        { value: '姓名位缺失', label: '姓名位缺失' },
+        { value: '日期位缺失', label: '日期位缺失' },
+      ],
+    },
+    {
+      title: '识别过程',
+      items: [
+        { value: '识别中', label: '识别中' },
+        { value: '识别失败', label: '识别失败' },
+        { value: '识别超时', label: '识别超时' },
+        { value: '未识别到签字位', label: '未识别到签字位' },
+      ],
+    },
+    {
+      title: '版式',
+      items: [
+        { value: '版式-左右', label: '版式-左右' },
+        { value: '版式-上下', label: '版式-上下' },
+        { value: '版式-混合', label: '版式-混合' },
+        { value: '版式-同格', label: '版式-同格' },
+        { value: '版式-分格', label: '版式-分格' },
+        { value: '版式-正文', label: '版式-正文' },
+      ],
+    },
+    {
+      title: '分隔方式',
+      items: [
+        { value: '分隔-/', label: '分隔-/' },
+        { value: '分隔-空格', label: '分隔-空格' },
+        { value: '分隔-空格子', label: '分隔-空格子' },
+        { value: '分隔-单元格', label: '分隔-单元格' },
+        { value: '分隔-换行', label: '分隔-换行' },
+      ],
+    },
+  ];
+  /** 筛选项与行上 tag/结论 的等价匹配（避免「缺姓名位」与「姓名位缺失」对不上） */
+  var WORKBENCH_SLOT_FILTER_MATCH_KEYS = {
+    缺姓名位: ['缺姓名位', '姓名位缺失'],
+    缺日期位: ['缺日期位', '日期位缺失'],
+    '缺姓名+日期位': ['缺姓名+日期位', '姓名位缺失', '日期位缺失'],
+    姓名位缺失: ['姓名位缺失', '缺姓名位', '缺姓名+日期位'],
+    日期位缺失: ['日期位缺失', '缺日期位', '缺姓名+日期位'],
+  };
   var __signUploadInFlight = false;
   var __fileCacheHydratePromise = null;
   /** aiword 批量载入后由工作台统一识别，renderFileList 勿再单文件自动识别 */
@@ -1486,7 +1607,23 @@
     if (!it) return '';
     var nm = it.name || it.file_id || '';
     if (!it.ok) {
-      return '❌ ' + nm + '：' + (it.error || '失败');
+      var failParts = ['❌ ' + nm + '：' + (it.error || '失败')];
+      if (Array.isArray(it.missing_roles) && it.missing_roles.length) {
+        failParts.push('  未落位角色：' + it.missing_roles.join('、'));
+      }
+      if (it.per_role_results && typeof it.per_role_results === 'object') {
+        var missLines = [];
+        Object.keys(it.per_role_results).forEach(function (rid) {
+          var one = it.per_role_results[rid] || {};
+          if (one && one.placed) return;
+          var why = one && one.placed_by ? String(one.placed_by) : 'not_found';
+          missLines.push(rid + '（' + why + '）');
+        });
+        if (missLines.length) {
+          failParts.push('  角色明细：' + missLines.join('；'));
+        }
+      }
+      return failParts.join('\n');
     }
     var chunks = [];
     if (it.applied_n > 0) {
@@ -1506,6 +1643,9 @@
           ' 项' +
           (it.skipped ? '：' + _humanizeRoleResultField(it.skipped) : '')
       );
+    }
+    if (Array.isArray(it.fallback_roles) && it.fallback_roles.length) {
+      chunks.push('规则建议：以下角色本次依赖兜底关键词落位，建议补充版式规则：' + it.fallback_roles.join('、'));
     }
     return '✅ ' + nm + '\n  ' + chunks.join('\n  ');
   }
@@ -2849,6 +2989,24 @@
     });
   }
 
+  function _applySignersListToUi() {
+    renderSignerLib();
+    try {
+      if (typeof window.__tryRestorePieceDraft === 'function') {
+        window.__tryRestorePieceDraft();
+      }
+    } catch (_) {}
+    if (IS_FILE_SIGN_PAGE) {
+      renderNeedSignTable();
+      refreshRoleSaveSignerControls();
+      updateBatchUi();
+      updateSubmitState();
+    }
+    if (IS_MATERIALS_PAGE) {
+      refreshStrokeItemList();
+    }
+  }
+
   function refreshSigners(opt) {
     opt = opt || {};
     if (__refreshSignersPromise && !opt.force) {
@@ -2858,11 +3016,13 @@
       beginPageProgress(opt.progressLabel || '正在加载签署人列表…');
     }
     showSignerListLoading();
-    var signersUrl =
-      apiUrl('/api/sign/signers') +
-      '?_=' +
-      Date.now() +
-      (IS_MATERIALS_PAGE ? '&brief=1' : '');
+    var signersQs = '_=' + Date.now();
+    if (IS_MATERIALS_PAGE) {
+      signersQs += '&brief=1';
+    } else if (IS_FILE_SIGN_PAGE && opt.compact !== false) {
+      signersQs += '&compact=1';
+    }
+    var signersUrl = apiUrl('/api/sign/signers') + '?' + signersQs;
     __refreshSignersPromise = fetchJson(signersUrl, {
       cache: 'no-store',
       timeoutMs: SIGNERS_LIST_FETCH_TIMEOUT_MS,
@@ -2893,20 +3053,10 @@
           ? '已启用 MySQL：签署人笔迹可在多台电脑复用。'
           : '当前为会话目录存储：笔迹仅保存在本浏览器对应会话目录，换浏览器需重新添加。';
         if (pieceDateCard) pieceDateCard.style.display = signersDbShare ? 'block' : 'none';
-        renderSignerLib();
-        try {
-          if (typeof window.__tryRestorePieceDraft === 'function') {
-            window.__tryRestorePieceDraft();
-          }
-        } catch (_) {}
-        if (IS_FILE_SIGN_PAGE) {
-          renderNeedSignTable();
-          refreshRoleSaveSignerControls();
-          updateBatchUi();
-          updateSubmitState();
-        }
-        if (IS_MATERIALS_PAGE) {
-          refreshStrokeItemList();
+        if (opt.deferRender) {
+          setTimeout(_applySignersListToUi, 0);
+        } else {
+          _applySignersListToUi();
         }
       })
       .catch(function (e) {
@@ -3920,6 +4070,7 @@
       markWorkbenchSelectedAsDetectWrong();
     });
   }
+  initDetectCorrectionModal();
   if (batchWorkbenchDeleteBtn) {
     batchWorkbenchDeleteBtn.addEventListener('click', function () {
       withButtonBusy(batchWorkbenchDeleteBtn, '删除中…', function () {
@@ -4157,6 +4308,59 @@
     'batchWorkbenchFilterDetectIssuesBtn'
   );
   _bindWorkbenchStatusFilterCheckboxes();
+  _refreshWorkbenchSlotFilterOptions();
+  if (batchWorkbenchFilterStatusToggle) {
+    batchWorkbenchFilterStatusToggle.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var open = batchWorkbenchFilterStatusWrap &&
+        batchWorkbenchFilterStatusWrap.classList.contains('open');
+      _toggleWorkbenchSlotFilterPanel(false);
+      _toggleWorkbenchStatusFilterPanel(!open);
+    });
+  }
+  if (batchWorkbenchFilterSlotToggle) {
+    batchWorkbenchFilterSlotToggle.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var open = batchWorkbenchFilterSlotWrap &&
+        batchWorkbenchFilterSlotWrap.classList.contains('open');
+      _toggleWorkbenchStatusFilterPanel(false);
+      _toggleWorkbenchSlotFilterPanel(!open);
+    });
+  }
+  document.addEventListener('click', function (ev) {
+    if (
+      (batchWorkbenchFilterStatusWrap && batchWorkbenchFilterStatusWrap.contains(ev.target)) ||
+      (batchWorkbenchFilterSlotWrap && batchWorkbenchFilterSlotWrap.contains(ev.target))
+    ) {
+      return;
+    }
+    _toggleWorkbenchStatusFilterPanel(false);
+    _toggleWorkbenchSlotFilterPanel(false);
+  });
+  if (batchWorkbenchStatusSelectAllBtn) {
+    batchWorkbenchStatusSelectAllBtn.addEventListener('click', function () {
+      _selectAllWorkbenchStatusFilters();
+      setBatchWorkbenchMsg('已全选状态（显示全部文件）', false);
+    });
+  }
+  if (batchWorkbenchStatusClearBtn) {
+    batchWorkbenchStatusClearBtn.addEventListener('click', function () {
+      _clearWorkbenchStatusFilters();
+      setBatchWorkbenchMsg('已清空状态筛选', false);
+    });
+  }
+  if (batchWorkbenchSlotSelectAllBtn) {
+    batchWorkbenchSlotSelectAllBtn.addEventListener('click', function () {
+      _selectAllWorkbenchSlotFilters();
+      setBatchWorkbenchMsg('已全选签字位标签', false);
+    });
+  }
+  if (batchWorkbenchSlotClearBtn) {
+    batchWorkbenchSlotClearBtn.addEventListener('click', function () {
+      _clearWorkbenchSlotFilters();
+      setBatchWorkbenchMsg('已清空签字位标签筛选', false);
+    });
+  }
   if (batchWorkbenchFilterDetectIssuesBtn) {
     batchWorkbenchFilterDetectIssuesBtn.addEventListener('click', function () {
       _setWorkbenchFilterDetectIssuesOnly();
@@ -4164,6 +4368,12 @@
         '已筛选：识别有误(人工) / 失败 / 超时 / 未识别。可「累加勾选当前筛选」后改规则并批量重新识别。',
         false
       );
+    });
+  }
+  if (batchWorkbenchFilterNotSignableBtn) {
+    batchWorkbenchFilterNotSignableBtn.addEventListener('click', function () {
+      _setWorkbenchFilterNotSignableOnly();
+      setBatchWorkbenchMsg('已筛选：仅显示不可签文件（签字位可落位校验未通过）。', false);
     });
   }
   if (btnRefreshSigned) {
@@ -4553,7 +4763,7 @@
       });
     }
     showErr('');
-    if (!opts.skipPageProgress) {
+    if (!opts.skipPageProgress && !isBatchWorkbenchMode()) {
       beginPageProgress('批量生成签字文档…', { done: 0, total: ids.length });
     }
     if (submitBtn) {
@@ -5738,21 +5948,34 @@
     return /用例表/.test(nm);
   }
 
-  /** 仅「用例表」类（非用例执行表）为约定无需签字；其它文件须走识别流程 */
+  /** 测试任务表 / 测试任务执行表：约定无需签字（与用例执行表不同） */
+  function _isTestTaskTableNoSignByFileName(fileId) {
+    var nm = _fileDisplayNameById(fileId);
+    return /测试任务执行表/.test(nm) || /测试任务表/.test(nm);
+  }
+
+  /** 约定无需签字的附件表（用例表、测试任务表等） */
   function isNoSignRequiredForFile(fileId, dataOpt) {
     if (_isUseCaseSpecTableNoSignByFileName(fileId)) return true;
+    if (_isTestTaskTableNoSignByFileName(fileId)) return true;
     var data = dataOpt;
     if (data === undefined) {
       data = (fileUiCache[String(fileId)] || {}).lastDetectData;
     }
     var rr = data && data.document_role_rule;
-    if (rr && rr.matched && rr.category === 'use_case_spec_table') return true;
+    if (
+      rr &&
+      rr.matched &&
+      (rr.category === 'use_case_spec_table' || rr.category === 'test_task_no_sign')
+    ) {
+      return true;
+    }
     return false;
   }
 
-  /** 仅约定用例表可跳过签字位识别；其余文档（含其他 no_sign 规则）仍走识别接口 */
+  /** 约定无需签字的表可跳过签字位识别（轻量规则路径） */
   function shouldSkipDetectPipelineForFile(fileId) {
-    return _isUseCaseSpecTableNoSignByFileName(fileId);
+    return _isUseCaseSpecTableNoSignByFileName(fileId) || _isTestTaskTableNoSignByFileName(fileId);
   }
 
   function _isUseCaseTableFileName(fileId) {
@@ -5910,6 +6133,21 @@
         : '无需签字';
       lines.push('规则命中：' + pat + ' -> ' + rtxt);
     }
+    var dc = data.detect_correction;
+    if (dc && typeof dc === 'object' && (dc.wrong_description || (dc.expected_roles && dc.expected_roles.length))) {
+      var expTxt = Array.isArray(dc.expected_roles) && dc.expected_roles.length
+        ? dc.expected_roles.map(function (x) { return roleLabel(x); }).join('、')
+        : '';
+      lines.push(
+        '人工纠正：' +
+          String(dc.wrong_description || '').slice(0, 80) +
+          (expTxt ? (' → 应为 ' + expTxt) : '')
+      );
+    }
+    var ds0 = data.debug_summary || null;
+    if (ds0 && ds0.correction_override) {
+      lines.push('重新识别已应用人工纠正登记');
+    }
     var evid = (data.role_evidence && typeof data.role_evidence === 'object') ? data.role_evidence : {};
     (roleIds || []).forEach(function (rid) {
       var arr = Array.isArray(evid[rid]) ? evid[rid] : [];
@@ -5930,6 +6168,659 @@
       if (isFinite(bcnt) && bcnt >= 0) lines.push('检测块: ' + bcnt + ' (' + ds.kind + ')');
     }
     return lines.join('\n');
+  }
+
+  function _detectRoleIdsFromBlock(block) {
+    var out = [];
+    if (!block || !Array.isArray(block.fields)) return out;
+    block.fields.forEach(function (f) {
+      if (!f || String(f.type || '') !== 'role_id') return;
+      var rid = _canonicalSignRoleId(f.name);
+      if (!rid) return;
+      if (out.indexOf(rid) < 0) out.push(rid);
+    });
+    return out;
+  }
+
+  function _axisToChineseLabel(axis) {
+    switch (axis) {
+      case 'horizontal':
+        return '从左到右';
+      case 'vertical':
+        return '从上到下';
+      case 'mixed':
+        return '混合排列';
+      case 'single':
+        return '仅 1 个角色';
+      case 'inline':
+        return '段落内联';
+      default:
+        return '';
+    }
+  }
+
+  function _relationToChineseLabel(rel) {
+    switch (rel) {
+      case 'same_cell':
+        return '同一单元格';
+      case 'different_cell':
+        return '不同单元格';
+      case 'paragraph_inline':
+        return '正文段落';
+      case 'none':
+        return '';
+      default:
+        return '';
+    }
+  }
+
+  function _positionToChineseLabel(pos) {
+    switch (pos) {
+      case 'right':
+        return '日期在角色右方';
+      case 'below':
+        return '日期在角色下方';
+      case 'inline':
+        return '与角色同行';
+      case 'none':
+        return '';
+      default:
+        return '';
+    }
+  }
+
+  function _separatorToChineseLabel(sep) {
+    if (!sep) return '';
+    if (sep === 'slash') return '/';
+    if (sep === 'backslash') return '\\';
+    if (sep === 'space') return '空格';
+    if (sep === 'newline') return '换行';
+    if (sep === 'empty_cell') return '空单元格';
+    if (sep === 'cell') return '单元格';
+    if (sep === 'adjacent') return '紧邻无分隔';
+    if (sep === 'none') return '';
+    if (sep === 'unknown') return '';
+    if (sep.indexOf && sep.indexOf('punct:') === 0) return sep.slice(6);
+    if (sep.indexOf && sep.indexOf('other:') === 0) return sep.slice(6);
+    return sep;
+  }
+
+  function _pickBestBlockForRole(blocks, rid) {
+    var best = null;
+    var bestKey = null;
+    (blocks || []).forEach(function (b) {
+      if (!b || typeof b !== 'object') return;
+      var bRoles = _detectRoleIdsFromBlock(b).filter(function (r) {
+        return r === rid;
+      });
+      if (!bRoles.length) return;
+      var preview = String(b.label_preview || '');
+      var key = (preview ? preview.length : 9999) + (1 - Number(b.confidence || 0));
+      if (best === null || key < bestKey) {
+        best = b;
+        bestKey = key;
+      }
+    });
+    return best;
+  }
+
+  function _layoutFromDetectBlock(block) {
+    if (!block) {
+      return {
+        name_slot: false,
+        date_slot: false,
+        date_relation: 'none',
+        date_position: 'none',
+        separator: 'none',
+      };
+    }
+    var preview = String(block.label_preview || '');
+    var matched = Array.isArray(block.matched_rules)
+      ? block.matched_rules.map(function (x) {
+          return String(x || '');
+        })
+      : [];
+    var fields = Array.isArray(block.fields) ? block.fields : [];
+    var hasDate = fields.some(function (f) {
+      return f && String(f.type || '') === 'date';
+    });
+    if (/\/|／/.test(preview)) {
+      return {
+        name_slot: true,
+        date_slot: true,
+        date_relation: 'same_cell',
+        date_position: 'right',
+        separator: 'slash',
+      };
+    }
+    if (/\r|\n/.test(preview)) {
+      return {
+        name_slot: true,
+        date_slot: hasDate,
+        date_relation: 'same_cell',
+        date_position: 'below',
+        separator: 'newline',
+      };
+    }
+    if (matched.indexOf('docx_role_with_date_row') >= 0) {
+      return {
+        name_slot: true,
+        date_slot: hasDate,
+        date_relation: 'different_cell',
+        date_position: 'below',
+        separator: 'cell',
+      };
+    }
+    if (preview.indexOf('|') >= 0 && hasDate) {
+      return {
+        name_slot: true,
+        date_slot: true,
+        date_relation: 'different_cell',
+        date_position: 'right',
+        separator: 'cell',
+      };
+    }
+    if (hasDate && /\s+\d{4}/.test(preview)) {
+      return {
+        name_slot: true,
+        date_slot: true,
+        date_relation: 'same_cell',
+        date_position: 'right',
+        separator: 'space',
+      };
+    }
+    if (hasDate) {
+      return {
+        name_slot: true,
+        date_slot: true,
+        date_relation: 'different_cell',
+        date_position: 'right',
+        separator: 'cell',
+      };
+    }
+    return {
+      name_slot: true,
+      date_slot: false,
+      date_relation: 'none',
+      date_position: 'none',
+      separator: 'none',
+    };
+  }
+
+  function _inferArrangementFromBlocks(blocks, ids) {
+    var rowByRole = {};
+    var multiRoleBlock = null;
+    (blocks || []).forEach(function (b) {
+      if (!b) return;
+      var bRoles = _detectRoleIdsFromBlock(b).filter(function (rid) {
+        return ids.indexOf(rid) >= 0;
+      });
+      if (bRoles.length >= 2) multiRoleBlock = b;
+      bRoles.forEach(function (rid) {
+        var m = /table\d+\.row(\d+)/i.exec(String(b.source_hint || ''));
+        if (m) rowByRole[rid] = parseInt(m[1], 10);
+      });
+    });
+    var rows = ids
+      .map(function (rid) {
+        return rowByRole[rid];
+      })
+      .filter(function (x) {
+        return x != null;
+      });
+    if (rows.length >= 2) {
+      var uniq = {};
+      rows.forEach(function (r) {
+        uniq[r] = true;
+      });
+      if (Object.keys(uniq).length === 1) return 'horizontal';
+      return 'vertical';
+    }
+    if (multiRoleBlock) {
+      var prev = String(multiRoleBlock.label_preview || '');
+      if (prev.indexOf('|') >= 0) return 'horizontal';
+      if (/\r|\n/.test(prev)) return 'vertical';
+    }
+    return '';
+  }
+
+  function _inferSlotLayoutFromBlocks(data, ids) {
+    var blocks = Array.isArray(data && data.blocks) ? data.blocks : [];
+    var role_layouts = {};
+    ids.forEach(function (rid) {
+      var b = _pickBestBlockForRole(blocks, rid);
+      if (b) role_layouts[rid] = _layoutFromDetectBlock(b);
+    });
+    var arrangement = _inferArrangementFromBlocks(blocks, ids) || 'unknown';
+    return { arrangement: arrangement, role_layouts: role_layouts };
+  }
+
+  function _metricsFromExpectedSlotLayout(esl, ids) {
+    if (!esl || typeof esl !== 'object') return null;
+    var rel = String(esl.date_relation || '').trim();
+    var pos = String(esl.date_position || '').trim();
+    var sep = String(esl.separator || '').trim();
+    var axis = String(esl.arrangement || '').trim() || 'unknown';
+    var sameCell = esl.same_cell;
+    if (sameCell === true || rel === 'same_cell') sameCell = true;
+    else if (sameCell === false || rel === 'different_cell') sameCell = false;
+    else sameCell = null;
+    var role_layouts = {};
+    ids.forEach(function (rid) {
+      role_layouts[rid] = {
+        name_slot: true,
+        date_slot: rel && rel !== 'none',
+        date_relation: rel || 'none',
+        date_position: pos || 'none',
+        separator: sep || 'none',
+      };
+    });
+    return {
+      arrangement: axis,
+      arrangementLabel: _axisToChineseLabel(axis) || '未判定',
+      dateRelationLabel: _relationToChineseLabel(rel) || '未判定',
+      datePositionLabel: _positionToChineseLabel(pos) || '未判定',
+      separatorLabel: _separatorToChineseLabel(sep) || '未判定',
+      sameCellLabel:
+        sameCell === true ? '是' : sameCell === false ? '否' : '未判定',
+      role_layouts: role_layouts,
+      source: 'correction',
+    };
+  }
+
+  /** 汇总签字位版式：优先 signature_layout → 识别块推断 → 人工登记 */
+  function _computeSlotLayoutMetrics(data, ids) {
+    var layout =
+      data && data.signature_layout && typeof data.signature_layout === 'object'
+        ? data.signature_layout
+        : null;
+    var role_layouts = {};
+    if (layout && layout.role_layouts && typeof layout.role_layouts === 'object') {
+      role_layouts = layout.role_layouts;
+    }
+    var axis = layout && layout.arrangement ? String(layout.arrangement) : '';
+    ids.forEach(function (rid) {
+      if (!role_layouts[rid]) {
+        var fb = _inferSlotLayoutFromBlocks(data, [rid]);
+        if (fb.role_layouts[rid]) role_layouts[rid] = fb.role_layouts[rid];
+      }
+    });
+    if (!axis || axis === 'unknown') {
+      var fbAll = _inferSlotLayoutFromBlocks(data, ids);
+      axis = fbAll.arrangement || axis;
+      ids.forEach(function (rid) {
+        if (!role_layouts[rid] && fbAll.role_layouts[rid]) {
+          role_layouts[rid] = fbAll.role_layouts[rid];
+        }
+      });
+    }
+    var corrEsl =
+      data &&
+      data.detect_correction &&
+      data.detect_correction.expected_slot_layout;
+    var corrMetrics = _metricsFromExpectedSlotLayout(corrEsl, ids);
+    if (corrMetrics) {
+      role_layouts = corrMetrics.role_layouts;
+      axis = corrMetrics.arrangement;
+    }
+    var rels = {};
+    var posSet = {};
+    var seps = {};
+    ids.forEach(function (rid) {
+      var info = role_layouts[rid] || {};
+      if (info.date_relation && info.date_relation !== 'none') {
+        rels[info.date_relation] = true;
+      }
+      if (info.date_position && info.date_position !== 'none') {
+        posSet[info.date_position] = true;
+      }
+      if (info.separator && info.separator !== 'none') {
+        seps[info.separator] = true;
+      }
+    });
+    var relKeys = Object.keys(rels);
+    var posKeys = Object.keys(posSet);
+    var sepKeys = Object.keys(seps);
+    var sameCellLabel = '未判定';
+    if (relKeys.length === 1 && relKeys[0] === 'same_cell') sameCellLabel = '是';
+    else if (relKeys.length && relKeys.indexOf('same_cell') < 0) sameCellLabel = '否';
+    else if (relKeys.length > 1) sameCellLabel = '混合';
+    if (corrMetrics && corrMetrics.sameCellLabel !== '未判定') {
+      sameCellLabel = corrMetrics.sameCellLabel;
+    }
+    return {
+      arrangement: axis || 'unknown',
+      arrangementLabel: _axisToChineseLabel(axis) || '未判定',
+      dateRelationLabel:
+        relKeys.length === 1
+          ? _relationToChineseLabel(relKeys[0])
+          : relKeys.length > 1
+            ? '混合'
+            : '未判定',
+      datePositionLabel:
+        posKeys.length === 1
+          ? _positionToChineseLabel(posKeys[0])
+          : posKeys.length > 1
+            ? '混合'
+            : '未判定',
+      separatorLabel:
+        sepKeys.length === 1
+          ? _separatorToChineseLabel(sepKeys[0])
+          : sepKeys.length > 1
+            ? '混合'
+            : '未判定',
+      sameCellLabel: sameCellLabel,
+      role_layouts: role_layouts,
+      source: corrMetrics ? 'correction' : layout && layout.ok ? 'signature_layout' : 'blocks',
+    };
+  }
+
+  function _buildLayoutSentence(ids, axis, role_layouts) {
+    if (!role_layouts || !Object.keys(role_layouts).length) return '';
+    var roleNames = ids
+      .map(function (rid) { return roleLabel(rid); })
+      .filter(Boolean);
+    var axisLabel = _axisToChineseLabel(axis);
+    var relSet = {};
+    var posSet = {};
+    var sepSet = {};
+    ids.forEach(function (rid) {
+      var info = role_layouts[rid];
+      if (!info) return;
+      if (info.date_relation && info.date_relation !== 'none') relSet[info.date_relation] = true;
+      if (info.date_position && info.date_position !== 'none') posSet[info.date_position] = true;
+      if (info.separator && info.separator !== 'none') sepSet[info.separator] = true;
+    });
+    var relKeys = Object.keys(relSet);
+    var posKeys = Object.keys(posSet);
+    var sepKeys = Object.keys(sepSet);
+    var rel = relKeys.length === 1 ? _relationToChineseLabel(relKeys[0]) : (relKeys.length > 1 ? '存在多种排布' : '');
+    var pos = posKeys.length === 1 ? _positionToChineseLabel(posKeys[0]) : (posKeys.length > 1 ? '位置不统一' : '');
+    var sep = sepKeys.length === 1 ? _separatorToChineseLabel(sepKeys[0]) : (sepKeys.length > 1 ? '混合' : '');
+    var parts = [];
+    if (roleNames.length) parts.push('需签角色为' + roleNames.join('、'));
+    if (axisLabel) parts.push(axisLabel + '排列');
+    if (rel) parts.push('角色与日期' + rel);
+    if (pos) parts.push(pos);
+    if (sep) parts.push('分隔方式为' + sep);
+    return parts.join('，');
+  }
+
+  function _buildSignSlotSummary(data, roleIds) {
+    if (!data || !data.ok) {
+      return { label: '—', detail: '', tags: [] };
+    }
+    var ids = [];
+    (roleIds || []).forEach(function (rid) {
+      var id = _canonicalSignRoleId(rid);
+      if (!id || ids.indexOf(id) >= 0) return;
+      ids.push(id);
+    });
+    if (!ids.length) {
+      return { label: '—', detail: '', tags: [] };
+    }
+
+    var layoutMetrics = _computeSlotLayoutMetrics(data, ids);
+    var role_layouts = layoutMetrics.role_layouts || {};
+    var axis = layoutMetrics.arrangement || 'unknown';
+
+    var blockHasDateByRole = {};
+    var sourceHints = {};
+    var previews = [];
+    var blocks = Array.isArray(data.blocks) ? data.blocks : [];
+    blocks.forEach(function (b) {
+      if (!b || typeof b !== 'object') return;
+      var bRoles = _detectRoleIdsFromBlock(b).filter(function (rid) {
+        return ids.indexOf(rid) >= 0;
+      });
+      if (!bRoles.length) return;
+      var fields = Array.isArray(b.fields) ? b.fields : [];
+      var hasDate = fields.some(function (f) {
+        return f && String(f.type || '') === 'date';
+      });
+      var hint = String(b.source_hint || '').trim();
+      var preview = String(b.label_preview || '').trim();
+      if (preview && previews.indexOf(preview) < 0) previews.push(preview);
+      bRoles.forEach(function (rid) {
+        if (hasDate) blockHasDateByRole[rid] = true;
+        if (hint) {
+          if (!sourceHints[rid]) sourceHints[rid] = [];
+          if (sourceHints[rid].indexOf(hint) < 0) sourceHints[rid].push(hint);
+        }
+      });
+    });
+
+    var probe = data.slot_probe && typeof data.slot_probe === 'object' ? data.slot_probe : null;
+    var probeMissingSet = {};
+    if (probe && Array.isArray(probe.missing_roles)) {
+      probe.missing_roles.forEach(function (rid) {
+        probeMissingSet[String(rid)] = true;
+      });
+    }
+    var perRoleProbe = probe && probe.per_role_results && typeof probe.per_role_results === 'object'
+      ? probe.per_role_results
+      : {};
+
+    var stat = {};
+    var nameOk = 0;
+    var dateOk = 0;
+    var missingNameRoles = [];
+    var missingDateRoles = [];
+    ids.forEach(function (rid) {
+      var info = role_layouts[rid] || {};
+      var hasName = !!info.name_slot;
+      var hasDate = !!info.date_slot;
+      if (!hasName && blockHasDateByRole[rid]) {
+        // 角色在 block 中出现但 layout 没解析出 cell，仍记为「有姓名位但版式未知」
+        hasName = true;
+      }
+      if (!hasDate && blockHasDateByRole[rid]) {
+        // layout 未解析出日期位时，回退到 detect blocks 的 date 证据，避免“全部日期位丢失”
+        hasDate = true;
+      }
+      var probeOne = perRoleProbe[rid] && typeof perRoleProbe[rid] === 'object'
+        ? perRoleProbe[rid]
+        : null;
+      var probePlaced = !!(probeOne && probeOne.placed && !probeMissingSet[rid]);
+      if (!hasName && probePlaced) {
+        // 真实落位探测已成功，姓名位至少可落，避免仅因版式解析缺字段而误报「缺姓名位」。
+        hasName = true;
+        if (!info.name_loc) {
+          info = Object.assign({}, info, { name_loc: 'slot_probe' });
+        }
+      }
+      if (!hasDate && probePlaced) {
+        // 日期位仅在已有“日期关系证据”或 block 日期证据时回填，避免过度乐观。
+        var rel = String(info.date_relation || '').trim();
+        if (blockHasDateByRole[rid] || rel === 'same_cell' || rel === 'different_cell') {
+          hasDate = true;
+          if (!info.date_loc) {
+            info = Object.assign({}, info, { date_loc: 'slot_probe' });
+          }
+        }
+      }
+      stat[rid] = {
+        hasNameSlot: hasName,
+        hasDateSlot: hasDate,
+        info: info,
+      };
+      if (hasName) nameOk++;
+      else missingNameRoles.push(roleLabel(rid));
+      if (hasDate) dateOk++;
+      else missingDateRoles.push(roleLabel(rid));
+    });
+
+    var probeOk = probe ? !!probe.ok : null;
+
+    var tags = [];
+    var statusText = '待确认';
+    var badgeClass = 'warn';
+    if (missingNameRoles.length || missingDateRoles.length) {
+      // 真实结构分析显示有缺位 → 一定不能标记可签
+      if (missingNameRoles.length && missingDateRoles.length) {
+        statusText = '缺姓名+日期位';
+        badgeClass = 'fail';
+      } else if (missingNameRoles.length) {
+        statusText = '缺姓名位';
+        badgeClass = 'fail';
+      } else {
+        statusText = '缺日期位';
+        badgeClass = 'warn';
+      }
+    } else if (probeOk === false) {
+      statusText = '不可签';
+      badgeClass = 'fail';
+    } else if (probeOk === true) {
+      statusText = '可签';
+      badgeClass = 'ok';
+    } else {
+      statusText = '位齐全';
+      badgeClass = 'ok';
+    }
+
+    if (missingNameRoles.length) tags.push('姓名位缺失');
+    if (missingDateRoles.length) tags.push('日期位缺失');
+    if (statusText && statusText !== '—') tags.push(statusText);
+    if (statusText === '可签') tags.push('可签');
+    if (probeOk === false) tags.push('不可签');
+    if (axis === 'horizontal') tags.push('版式-左右');
+    else if (axis === 'vertical') tags.push('版式-上下');
+    else if (axis === 'mixed') tags.push('版式-混合');
+    ids.forEach(function (rid) {
+      var info = role_layouts[rid] || {};
+      if (info.date_relation === 'same_cell') tags.push('版式-同格');
+      if (info.date_relation === 'different_cell') tags.push('版式-分格');
+      if (info.date_relation === 'paragraph_inline') tags.push('版式-正文');
+      if (info.separator === 'slash') tags.push('分隔-/');
+      if (info.separator === 'space') tags.push('分隔-空格');
+      if (info.separator === 'empty_cell') tags.push('分隔-空格子');
+      if (info.separator === 'cell') tags.push('分隔-单元格');
+      if (info.separator === 'newline') tags.push('分隔-换行');
+    });
+
+    // 自然语句版式描述（按用户口径）
+    var sentence = _buildLayoutSentence(ids, axis, role_layouts);
+    var layoutLine = sentence;
+
+    // 列表中只显示精简标签 chip：每角色「名✓/日✓」
+    var roleMarks = ids
+      .map(function (rid) {
+        var one = stat[rid] || {};
+        var nm = roleLabel(rid).replace(/人员/g, '');
+        if (nm.length > 3) nm = nm.slice(0, 3);
+        var mark = one.hasNameSlot && one.hasDateSlot
+          ? '名✓ 日✓'
+          : one.hasNameSlot
+            ? '名✓ 日×'
+            : one.hasDateSlot
+              ? '名× 日✓'
+              : '名× 日×';
+        return nm + '(' + mark + ')';
+      })
+      .join('  ');
+
+    // 详细 tooltip（按“结论/版式/角色明细/校验/样例”分组）
+    var detail = [];
+    detail.push('【结论】' + statusText + '（姓名位 ' + nameOk + '/' + ids.length + '，日期位 ' + dateOk + '/' + ids.length + '）');
+    if (sentence) detail.push('【版式】' + sentence);
+    detail.push(
+      '【排列方式】' +
+        (layoutMetrics.arrangementLabel || '未判定') +
+        '（编制/审核/批准/执行/审核人员相对位置）'
+    );
+    detail.push(
+      '【角色与日期】' + (layoutMetrics.dateRelationLabel || '未判定')
+    );
+    detail.push('【日期位置】' + (layoutMetrics.datePositionLabel || '未判定'));
+    detail.push('【分隔方式】' + (layoutMetrics.separatorLabel || '未判定'));
+    detail.push('【同一单元格】' + (layoutMetrics.sameCellLabel || '未判定'));
+    if (layoutMetrics.source === 'blocks') {
+      detail.push('【版式来源】识别块推断（未拿到表格结构分析时）');
+    } else if (layoutMetrics.source === 'correction') {
+      detail.push('【版式来源】人工登记纠正');
+    }
+    ids.forEach(function (rid) {
+      var one = stat[rid] || {};
+      var info = one.info || {};
+      var l = roleLabel(rid) + '：姓名位' + (one.hasNameSlot ? '✓' : '×')
+        + '，日期位' + (one.hasDateSlot ? '✓' : '×');
+      if (info.name_loc) l += '；姓名@' + info.name_loc;
+      if (info.date_loc) l += '；日期@' + info.date_loc;
+      var sepLabelOne = _separatorToChineseLabel(info.separator);
+      if (sepLabelOne) l += '；分隔=' + sepLabelOne;
+      if (!info.date_slot && one.hasDateSlot) l += '；日期位来源=识别块证据';
+      if (sourceHints[rid] && sourceHints[rid].length) {
+        l += '；来源=' + sourceHints[rid].slice(0, 2).join(' / ');
+      }
+      detail.push(l);
+    });
+    if (probe && probe.ok === false) {
+      var miss = Array.isArray(probe.missing_roles) ? probe.missing_roles : [];
+      detail.push(
+        '【落位校验】未通过' +
+          (miss.length ? '：' + miss.map(function (x) { return roleLabel(x); }).join('、') : '') +
+          (probe.error ? '\n' + String(probe.error) : '')
+      );
+    } else if (probe && probe.ok) {
+      detail.push('【落位校验】通过');
+    }
+    var layoutRaw =
+      data.signature_layout && typeof data.signature_layout === 'object'
+        ? data.signature_layout
+        : null;
+    if (layoutRaw && layoutRaw.ok === false && layoutRaw.error) {
+      detail.push('【结构分析】失败：' + layoutRaw.error);
+    }
+    if (previews.length) {
+      detail.push('【样例】' + previews.slice(0, 2).join(' ｜ '));
+    }
+
+    return {
+      label: statusText,
+      rolesLine: roleMarks,
+      layoutLine: layoutLine,
+      badgeClass: badgeClass,
+      detail: detail.join('\n'),
+      tags: tags,
+    };
+  }
+
+  /** 仅「流水线进行中」才在签字位列显示处理中（勿用宽泛的 /识别/，否则会误伤「未识别到签字位」「识别失败」等终态） */
+  function _isWorkbenchRowPipelineBusy(st) {
+    var t = String(st || '').trim();
+    if (!t) return false;
+    if (t === '识别中…' || t === '识别重试中…' || t === '匹配素材…') return true;
+    if (/^识别较慢/.test(t)) return true;
+    if (/^匹配素材/.test(t)) return true;
+    if (/^分析中/.test(t)) return true;
+    return false;
+  }
+
+  function _renderWorkbenchSlotCell(td, row) {
+    if (!td || !row) return;
+    td.className = 'col-slot';
+    var st = String(row.status || '');
+    if (row._wbProcessing || _isWorkbenchRowPipelineBusy(st)) {
+      td.innerHTML = '<span class="wb-slot-badge muted">处理中</span>';
+      td.title = '请查看「状态」列';
+      return;
+    }
+    if (row.slotLabel === '无需签字' || (row.slotTags && row.slotTags.indexOf('无需签字') >= 0)) {
+      td.innerHTML = '<span class="wb-slot-badge muted">无需签字</span>';
+      td.title = row.slotExplain || '规则判定本文件无需签字';
+      return;
+    }
+    var badge = row.slotBadgeClass || 'muted';
+    var txt = row.slotLabel || '—';
+    var html = '<span class="wb-slot-badge ' + badge + '">' + txt + '</span>';
+    if (row.slotRolesLine) {
+      html += '<div class="wb-slot-roles">' + row.slotRolesLine + '</div>';
+    }
+    if (row.slotLayoutLine) {
+      html += '<div class="wb-slot-layout">' + row.slotLayoutLine + '</div>';
+    }
+    td.innerHTML = html;
+    td.title = row.slotExplain || txt;
   }
 
   function validateDetectResponseForFile(fileId, j) {
@@ -5977,13 +6868,79 @@
       data,
       roles.map(function (x) { return x && x.id; }).filter(Boolean)
     );
+    var slotData = data;
+    if (slotData) {
+      var corrCached = __fileDetectCorrectionCache[String(fileId)];
+      if (corrCached && !slotData.detect_correction) {
+        slotData = Object.assign({}, slotData, { detect_correction: corrCached });
+      }
+    }
+    var slotSummary = _buildSignSlotSummary(
+      slotData,
+      roles.map(function (x) { return x && x.id; }).filter(Boolean)
+    );
+    row.slotLabel = slotSummary.label || '—';
+    row.slotRolesLine = slotSummary.rolesLine || '';
+    row.slotLayoutLine = slotSummary.layoutLine || '';
+    row.slotBadgeClass = slotSummary.badgeClass || 'muted';
+    row.slotExplain = slotSummary.detail || '';
+    row.slotTags = Array.isArray(slotSummary.tags) ? slotSummary.tags.slice() : [];
+    var probe = data && data.slot_probe && typeof data.slot_probe === 'object' ? data.slot_probe : null;
+    row.slotProbeOk = probe ? !!probe.ok : null;
+    // 结构层面：姓名位/日期位是否全部识别到
+    row.slotMissingName = row.slotTags.indexOf('姓名位缺失') >= 0;
+    row.slotMissingDate = row.slotTags.indexOf('日期位缺失') >= 0;
+    // 综合判定：只有真的能在文档落位、且姓名/日期位齐全才算可签
+    row.slotSignable =
+      row.slotProbeOk === true && !row.slotMissingName && !row.slotMissingDate;
     if (data && data.content_sha256) {
       row.contentSha256 = String(data.content_sha256);
     }
     if (isNoSignRequiredForFile(fileId, data)) {
       row.detectedRoleIds = [];
       row.rolesLabel = '无需签字';
+      row.slotLabel = '无需签字';
+      row.slotRolesLine = '';
+      row.slotLayoutLine = '';
+      row.slotBadgeClass = 'muted';
+      row.slotExplain = '规则标记该文档无需签字。';
+      row.slotTags = ['无需签字'];
+      row.slotProbeOk = true;
     }
+    var rs = data && data.rule_sync;
+    var syncHint = _formatRuleSyncHint(rs);
+    if (syncHint) {
+      row.detectExplain = row.detectExplain
+        ? row.detectExplain + '\n【规则同步】' + syncHint
+        : '【规则同步】' + syncHint;
+    }
+  }
+
+  function _formatRuleSyncHint(rs) {
+    if (!rs || !rs.ok) return '';
+    var parts = [];
+    if (rs.pattern) {
+      var verb = rs.action === 'created' ? '已新增' : '已更新';
+      parts.push(
+        verb +
+          '角色规则 `' +
+          rs.pattern +
+          '` → sign_document_role_rules.json / signature_role_results_T2.md'
+      );
+    }
+    var slotRs = rs.slot_rule_sync;
+    if (slotRs && slotRs.ok && slotRs.pattern) {
+      var slotVerb = slotRs.action === 'created' ? '已新增' : '已更新';
+      parts.push(
+        slotVerb +
+          '签字位规则 `' +
+          slotRs.pattern +
+          '` → sign_slot_layout_rules.json / signature_slot_layout_document_rules_T2.md'
+      );
+    } else if (rs.slot_md_exported) {
+      parts.push('已导出 signature_slot_layout_document_rules_T2.md');
+    }
+    return parts.length ? parts.join('；') : '';
   }
 
   function roleLibrarySigReady(pair) {
@@ -6674,7 +7631,7 @@
     if (hint && !fq.sig) fq.sig = hint;
     var filter = document.createElement('input');
     filter.type = 'search';
-    filter.placeholder = '签署人筛选';
+    filter.placeholder = '筛选';
     filter.value = fq.sig || hint || '';
     var sel = document.createElement('select');
     sel.title = '签名素材（' + (strokeLoc === 'en' ? '英文' : '中文') + '）';
@@ -6799,7 +7756,7 @@
     var strokeLoc = _workbenchStrokeLocaleForRole(fileId, roleId, row);
     var dateFilter = document.createElement('input');
     dateFilter.type = 'search';
-    dateFilter.placeholder = '签署人筛选';
+    dateFilter.placeholder = '筛选';
     dateFilter.value = fq.date || hint || '';
     var dateSel = document.createElement('select');
     fillRoleItemSelectLocale(dateSel, 'date', pair.date || '', dateFilter.value, strokeLoc);
@@ -6953,6 +7910,10 @@
     if (isNoSignRequiredForFile(fileId)) {
       row.status = '无需签字';
       row.rolesLabel = '无需签字（用例表）';
+      row.slotLabel = '无需签字';
+      row.slotExplain = '规则标记该文档无需签字。';
+      row.slotTags = ['无需签字'];
+      row.slotSignable = true;
       row._wbPipelineDone = true;
       row._wbMatchAttempted = true;
       schedulePersistFileSessionCache(fileId);
@@ -6963,6 +7924,33 @@
     var mat = row.material || assessFileMaterialStatus(fileId);
     if (!roles.length) {
       row.status = (fileUiCache[fileId] || {}).lastDetectError || '未识别到签字位';
+      row.slotLabel = '不可签';
+      row.slotBadgeClass = 'fail';
+      row.slotRolesLine = '';
+      row.slotLayoutLine = '';
+      row.slotExplain = (fileUiCache[fileId] || {}).lastDetectError || '未识别到签字位';
+      row.slotTags = ['未识别到签字位', '不可签'];
+      row.slotSignable = false;
+      return;
+    }
+    if (row.slotProbeOk === false) {
+      row.status = '签字位不完整';
+      if (!row.slotLabel || row.slotLabel === '—') {
+        row.slotLabel = '不可签';
+      }
+      row.slotBadgeClass = row.slotBadgeClass || 'fail';
+      row.slotTags = Array.isArray(row.slotTags) ? row.slotTags.slice() : [];
+      if (row.slotTags.indexOf('不可签') < 0) row.slotTags.push('不可签');
+      row.slotSignable = false;
+      return;
+    }
+    if (row.slotMissingName || row.slotMissingDate) {
+      // 结构分析显示缺位 → 主状态也应显示缺位，避免和签字位列「自相矛盾」
+      var miss = [];
+      if (row.slotMissingName) miss.push('姓名位');
+      if (row.slotMissingDate) miss.push('日期位');
+      row.status = '签字位不完整（缺' + miss.join('、') + '）';
+      row.slotSignable = false;
       return;
     }
     if (mat.state === 'full' || (mat.matched > 0 && !mat.missingRoleIds.length)) {
@@ -6975,45 +7963,951 @@
     schedulePersistFileSessionCache(fileId);
   }
 
-  function markWorkbenchRowDetectWrong(fileId, noteOpt) {
+  function markWorkbenchRowDetectWrong(fileId, noteOpt, opts) {
+    opts = opts || {};
     var row = __batchWorkbenchRows[String(fileId)];
     if (!row) return;
     row.status = '识别有误';
     row.manualDetectWrong = true;
     if (noteOpt) row.detectWrongNote = String(noteOpt);
     row._wbPipelineDone = true;
-    schedulePersistFileSessionCache(fileId);
-    renderBatchWorkbenchTable();
+    if (!opts.skipPersist) schedulePersistFileSessionCache(fileId);
+    if (!opts.skipRender) renderBatchWorkbenchTable();
   }
 
-  function markWorkbenchSelectedAsDetectWrong() {
-    var n = 0;
+  var __fileDetectCorrectionCache = {};
+  var __detectCorrectionEditingFileId = '';
+  /** 批量登记时为目标文件 id 列表；单文件时长度为 1 */
+  var __detectCorrectionEditingFileIds = [];
+  var __detectCorrectionLoadGen = 0;
+  var __detectCorrectionFormDirty = false;
+  var __detectCorrectionFormDirtyBound = false;
+
+  var DETECT_CORRECTION_ROLE_OPTIONS = [
+    { id: 'author', label: '编写/编制' },
+    { id: 'reviewer', label: '审核/复核' },
+    { id: 'approver', label: '批准' },
+    { id: 'executor', label: '执行/测试' },
+    { id: 'reviewer_tail', label: '审核人员（文末）' },
+  ];
+
+  function _detectCorrectionModalEls() {
+    return {
+      modal: document.getElementById('detectCorrectionModal'),
+      wrong: document.getElementById('detectCorrectionWrong'),
+      saveRolesCb: document.getElementById('detectCorrectionSaveRolesCb'),
+      saveSlotCb: document.getElementById('detectCorrectionSaveSlotCb'),
+      rolesFieldset: document.getElementById('detectCorrectionRolesFieldset'),
+      rolesBox: document.getElementById('detectCorrectionRoles'),
+      slotFieldset: document.getElementById('detectCorrectionSlotFieldset'),
+      slotArrangement: document.getElementById('detectCorrectionArrangement'),
+      slotDateRelation: document.getElementById('detectCorrectionDateRelation'),
+      slotDatePosition: document.getElementById('detectCorrectionDatePosition'),
+      slotSeparator: document.getElementById('detectCorrectionSeparator'),
+      note: document.getElementById('detectCorrectionNote'),
+      keywords: document.getElementById('detectCorrectionKeywords'),
+      imgInput: document.getElementById('detectCorrectionImageInput'),
+      refList: document.getElementById('detectCorrectionRefList'),
+      msg: document.getElementById('detectCorrectionModalMsg'),
+      saveBtn: document.getElementById('detectCorrectionSaveBtn'),
+      cancelBtn: document.getElementById('detectCorrectionCancelBtn'),
+    };
+  }
+
+  function _collectExpectedSlotLayoutFromForm(els) {
+    if (!els) return null;
+    var out = {};
+    if (els.slotArrangement && els.slotArrangement.value) {
+      out.arrangement = String(els.slotArrangement.value);
+    }
+    if (els.slotDateRelation && els.slotDateRelation.value) {
+      out.date_relation = String(els.slotDateRelation.value);
+    }
+    if (els.slotDatePosition && els.slotDatePosition.value) {
+      out.date_position = String(els.slotDatePosition.value);
+    }
+    if (els.slotSeparator && els.slotSeparator.value) {
+      out.separator = String(els.slotSeparator.value);
+    }
+    if (!Object.keys(out).length) return null;
+    if (out.date_relation === 'same_cell') out.same_cell = true;
+    if (out.date_relation === 'different_cell') out.same_cell = false;
+    return out;
+  }
+
+  function _applyExpectedSlotLayoutToForm(els, esl) {
+    esl = esl && typeof esl === 'object' ? esl : {};
+    if (els.slotArrangement) {
+      els.slotArrangement.value = String(esl.arrangement || '');
+    }
+    if (els.slotDateRelation) {
+      els.slotDateRelation.value = String(esl.date_relation || '');
+    }
+    if (els.slotDatePosition) {
+      els.slotDatePosition.value = String(esl.date_position || '');
+    }
+    if (els.slotSeparator) {
+      els.slotSeparator.value = String(esl.separator || '');
+    }
+  }
+
+  function _setDetectCorrectionModalMsg(text, isErr) {
+    var els = _detectCorrectionModalEls();
+    if (!els.msg) return;
+    if (!text) {
+      els.msg.style.display = 'none';
+      els.msg.textContent = '';
+      return;
+    }
+    els.msg.style.display = 'block';
+    els.msg.style.color = isErr ? 'var(--error)' : 'var(--text-muted)';
+    els.msg.textContent = text;
+  }
+
+  function _referenceImageUrl(fileId, imageId) {
+    return (
+      apiUrl(
+        '/api/sign/files/' +
+          encodeURIComponent(fileId) +
+          '/detect-correction/reference-image/' +
+          encodeURIComponent(imageId)
+      ) + '?_=' + Date.now()
+    );
+  }
+
+  function renderDetectCorrectionRefImages(fileId) {
+    var els = _detectCorrectionModalEls();
+    if (!els.refList) return;
+    els.refList.innerHTML = '';
+    var corr = __fileDetectCorrectionCache[String(fileId)] || {};
+    var imgs = Array.isArray(corr.reference_images) ? corr.reference_images : [];
+    imgs.forEach(function (im) {
+      if (!im || !im.id) return;
+      var wrap = document.createElement('div');
+      wrap.className = 'sign-modal-ref-item';
+      var img = document.createElement('img');
+      img.src = _referenceImageUrl(fileId, im.id);
+      img.alt = im.filename || '参考图';
+      img.title = im.filename || '';
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'btn btn-secondary';
+      del.textContent = '×';
+      del.title = '删除';
+      del.addEventListener('click', function () {
+        fetchJson(
+          apiUrl(
+            '/api/sign/files/' +
+              encodeURIComponent(fileId) +
+              '/detect-correction/reference-image/' +
+              encodeURIComponent(im.id)
+          ),
+          { method: 'DELETE', timeoutMs: 30000 }
+        )
+          .then(function (r) {
+            var j = (r && r.data) || {};
+            if (!j.ok) {
+              _setDetectCorrectionModalMsg(j.error || '删除失败', true);
+              return;
+            }
+            corr.reference_images = imgs.filter(function (x) {
+              return String(x.id) !== String(im.id);
+            });
+            __fileDetectCorrectionCache[String(fileId)] = corr;
+            renderDetectCorrectionRefImages(fileId);
+          })
+          .catch(function (e) {
+            _setDetectCorrectionModalMsg((e && e.message) || '删除失败', true);
+          });
+      });
+      wrap.appendChild(img);
+      wrap.appendChild(del);
+      els.refList.appendChild(wrap);
+    });
+  }
+
+  function _bindDetectCorrectionFormDirtyOnce() {
+    if (__detectCorrectionFormDirtyBound) return;
+    var els = _detectCorrectionModalEls();
+    if (!els.modal) return;
+    __detectCorrectionFormDirtyBound = true;
+    function markDirty() {
+      __detectCorrectionFormDirty = true;
+    }
+    if (els.wrong) {
+      els.wrong.addEventListener('input', markDirty);
+      els.wrong.addEventListener('change', markDirty);
+    }
+    if (els.note) {
+      els.note.addEventListener('input', markDirty);
+      els.note.addEventListener('change', markDirty);
+    }
+    if (els.keywords) {
+      els.keywords.addEventListener('input', markDirty);
+      els.keywords.addEventListener('change', markDirty);
+    }
+    if (els.rolesBox) {
+      els.rolesBox.addEventListener('change', markDirty);
+    }
+    [els.slotArrangement, els.slotDateRelation, els.slotDatePosition, els.slotSeparator].forEach(
+      function (el) {
+        if (!el) return;
+        el.addEventListener('change', markDirty);
+      }
+    );
+    [els.saveRolesCb, els.saveSlotCb].forEach(function (el) {
+      if (!el) return;
+      el.addEventListener('change', function () {
+        markDirty();
+        _applyDetectCorrectionSectionEnabled();
+      });
+    });
+  }
+
+  function _readDetectCorrectionSaveScopes(template) {
+    template = template || {};
+    var cs = template.correction_save;
+    if (cs && typeof cs === 'object') {
+      return {
+        roles: cs.roles !== false,
+        slot: cs.slot !== false,
+      };
+    }
+    var hasRoles =
+      Array.isArray(template.expected_roles) && template.expected_roles.length > 0;
+    var esl = template.expected_slot_layout;
+    var hasSlot =
+      esl && typeof esl === 'object' && Object.keys(esl).length > 0;
+    if (hasRoles && !hasSlot) return { roles: true, slot: false };
+    if (hasSlot && !hasRoles) return { roles: false, slot: true };
+    return { roles: true, slot: true };
+  }
+
+  function _applyDetectCorrectionSaveScopesToForm(template) {
+    var els = _detectCorrectionModalEls();
+    var scopes = _readDetectCorrectionSaveScopes(template);
+    if (els.saveRolesCb) els.saveRolesCb.checked = scopes.roles;
+    if (els.saveSlotCb) els.saveSlotCb.checked = scopes.slot;
+    _applyDetectCorrectionSectionEnabled();
+  }
+
+  function _applyDetectCorrectionSectionEnabled() {
+    var els = _detectCorrectionModalEls();
+    var saveRoles = !els.saveRolesCb || els.saveRolesCb.checked;
+    var saveSlot = !els.saveSlotCb || els.saveSlotCb.checked;
+    if (els.rolesFieldset) {
+      els.rolesFieldset.disabled = !saveRoles;
+      els.rolesFieldset.style.opacity = saveRoles ? '1' : '0.55';
+    }
+    if (els.slotFieldset) {
+      els.slotFieldset.disabled = !saveSlot;
+      els.slotFieldset.style.opacity = saveSlot ? '1' : '0.55';
+    }
+  }
+
+  function _applyDetectCorrectionFormFromTemplate(els, template, detectedRoleIds) {
+    if (__detectCorrectionFormDirty) return;
+    template = template || {};
+    if (els.wrong) els.wrong.value = String(template.wrong_description || '');
+    if (els.note) els.note.value = String(template.expected_note || '');
+    if (els.keywords) {
+      var kws = Array.isArray(template.label_keywords) ? template.label_keywords : [];
+      els.keywords.value = kws.join('，');
+    }
+    var sel = {};
+    var exp = Array.isArray(template.expected_roles) ? template.expected_roles : [];
+    if (exp.length) {
+      exp.forEach(function (rid) {
+        sel[rid] = true;
+      });
+    } else {
+      (detectedRoleIds || []).forEach(function (rid) {
+        sel[rid] = true;
+      });
+    }
+    _buildDetectCorrectionRoleChecks(sel);
+    _applyExpectedSlotLayoutToForm(els, template.expected_slot_layout || {});
+    _applyDetectCorrectionSaveScopesToForm(template);
+  }
+
+  function _buildDetectCorrectionRoleChecks(selectedMap) {
+    var els = _detectCorrectionModalEls();
+    if (!els.rolesBox) return;
+    els.rolesBox.innerHTML = '';
+    DETECT_CORRECTION_ROLE_OPTIONS.forEach(function (opt) {
+      var lab = document.createElement('label');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.value = opt.id;
+      cb.checked = !!(selectedMap && selectedMap[opt.id]);
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(opt.label || roleLabel(opt.id)));
+      els.rolesBox.appendChild(lab);
+    });
+  }
+
+  function loadDetectCorrectionForFile(fileId) {
+    if (!fileId) return Promise.resolve({});
+    if (__fileDetectCorrectionCache[String(fileId)]) {
+      return Promise.resolve(__fileDetectCorrectionCache[String(fileId)]);
+    }
+    return fetchJson(apiUrl('/api/sign/files/' + encodeURIComponent(fileId) + '/detect-correction'), {
+      timeoutMs: 30000,
+    })
+      .then(function (r) {
+        var j = (r && r.data) || {};
+        var corr = j.ok && j.correction ? j.correction : {};
+        __fileDetectCorrectionCache[String(fileId)] = corr;
+        return corr;
+      })
+      .catch(function () {
+        return {};
+      });
+  }
+
+  function _getWorkbenchSelectedFileIds() {
+    var ids = [];
     savedFiles.forEach(function (rec) {
       if (!rec || !rec.id) return;
       var row = __batchWorkbenchRows[String(rec.id)];
-      if (!row || !row.selected) return;
-      markWorkbenchRowDetectWrong(rec.id, '人工标记：识别角色与规则不符，待修正后重新识别');
-      n++;
+      if (row && row.selected) ids.push(String(rec.id));
     });
-    setBatchWorkbenchMsg(
-      n ? '已将 ' + n + ' 个已勾选文件标为「识别有误」' : '请先勾选要标记的文件',
-      !n
-    );
+    return ids;
+  }
+
+  function _renderDetectCorrectionBatchFileList(fileIds) {
+    var ul = document.getElementById('detectCorrectionBatchFileList');
+    var scopeHint = document.getElementById('detectCorrectionScopeHint');
+    if (!ul) return;
+    ul.innerHTML = '';
+    if (!fileIds || fileIds.length <= 1) {
+      ul.style.display = 'none';
+      if (scopeHint) {
+        scopeHint.textContent =
+          '说明错在哪；勾选本次要保存的范围。保存后点「识别」会重跑需签角色与签字位并带入登记。';
+      }
+      return;
+    }
+    ul.style.display = 'block';
+    if (scopeHint) {
+      scopeHint.textContent =
+        '以下登记将应用到已勾选的 ' +
+        fileIds.length +
+        ' 个文件（各文件会记录当时识别到的错误角色）。参考图上传至 FTP 后，各文件登记共用同一 ftp_path。';
+    }
+    fileIds.forEach(function (fid) {
+      var rec = savedFiles.find(function (x) {
+        return x && String(x.id) === String(fid);
+      });
+      var li = document.createElement('li');
+      li.textContent = rec && rec.name ? _fileBaseNameOnly(rec.name) : fid;
+      ul.appendChild(li);
+    });
+  }
+
+  function _updateDetectCorrectionSaveBtnLabel(n) {
+    var btn = document.getElementById('detectCorrectionSaveBtn');
+    if (!btn) return;
+    if (n > 1) {
+      btn.textContent = '保存并标为识别有误（' + n + ' 个文件）';
+    } else {
+      btn.textContent = '保存并标为识别有误';
+    }
+  }
+
+  function openDetectCorrectionDialog(fileIdOrIds, opt) {
+    opt = opt && typeof opt === 'object' ? opt : {};
+    var els = _detectCorrectionModalEls();
+    var ids = [];
+    if (Array.isArray(fileIdOrIds)) {
+      ids = fileIdOrIds.map(String).filter(Boolean);
+    } else if (fileIdOrIds) {
+      ids = [String(fileIdOrIds)];
+    }
+    if (!ids.length) return;
+    if (!els.modal) {
+      setBatchWorkbenchMsg('登记表单未加载，请 Ctrl+F5 强刷页面后重试', true);
+      return;
+    }
+    __detectCorrectionEditingFileIds = ids.slice();
+    __detectCorrectionEditingFileId = ids[0];
+    __detectCorrectionLoadGen += 1;
+    var loadGen = __detectCorrectionLoadGen;
+    __detectCorrectionFormDirty = false;
+    _bindDetectCorrectionFormDirtyOnce();
+    _setDetectCorrectionModalMsg('', false);
+    _updateDetectCorrectionSaveBtnLabel(ids.length);
+    _renderDetectCorrectionBatchFileList(ids);
+    var title = document.getElementById('detectCorrectionTitle');
+    if (title) {
+      if (ids.length > 1) {
+        title.textContent = '批量登记识别纠正（' + ids.length + ' 个文件）';
+      } else {
+        var rec0 = savedFiles.find(function (x) {
+          return x && String(x.id) === ids[0];
+        });
+        title.textContent =
+          '登记识别纠正' + (rec0 && rec0.name ? ' — ' + _fileBaseNameOnly(rec0.name) : '');
+      }
+    }
+    var scopeHint = document.getElementById('detectCorrectionScopeHint');
+    if (scopeHint && ids.length <= 1) {
+      scopeHint.textContent =
+        '说明错在哪；勾选本次要保存的范围（需签角色 / 签字位版式可只选其一）。保存后点「识别」会同时重跑角色与签字位并带入登记。';
+    }
+    if (els.saveRolesCb) els.saveRolesCb.checked = true;
+    if (els.saveSlotCb) els.saveSlotCb.checked = true;
+    _applyDetectCorrectionSectionEnabled();
+    if (els.wrong) {
+      els.wrong.value = '';
+      els.wrong.placeholder =
+        '例如：把用例表列头「测试人」误识别为编写；或漏识别批准人；或日期应在角色下方而非右方';
+    }
+    if (els.note) els.note.value = '';
+    if (els.keywords) els.keywords.value = '';
+    _applyExpectedSlotLayoutToForm(els, {});
+    _buildDetectCorrectionRoleChecks({});
+    renderDetectCorrectionRefImages(ids[0]);
+    els.modal.classList.add('show');
+    els.modal.setAttribute('aria-hidden', 'false');
+    var primaryId = ids[0];
+    var detected = mergeDetectedRolesForFile(primaryId).map(function (x) {
+      return x.id;
+    });
+    if (ids.length > 1) {
+      _setDetectCorrectionModalMsg('正在加载已有登记（仅首条）…', false);
+    }
+    loadDetectCorrectionForFile(primaryId)
+      .then(function (template) {
+        if (loadGen !== __detectCorrectionLoadGen) return;
+        _applyDetectCorrectionFormFromTemplate(els, template || {}, detected);
+        renderDetectCorrectionRefImages(primaryId);
+        if (ids.length > 1) {
+          _setDetectCorrectionModalMsg('', false);
+        }
+      })
+      .catch(function (e) {
+        if (loadGen !== __detectCorrectionLoadGen) return;
+        _setDetectCorrectionModalMsg(
+          '加载历史登记失败：' + ((e && e.message) || '请检查服务是否已重启'),
+          true
+        );
+      });
+  }
+
+  function closeDetectCorrectionDialog() {
+    var els = _detectCorrectionModalEls();
+    if (!els.modal) return;
+    els.modal.classList.remove('show');
+    els.modal.setAttribute('aria-hidden', 'true');
+    __detectCorrectionEditingFileId = '';
+    __detectCorrectionEditingFileIds = [];
+    _setDetectCorrectionModalMsg('', false);
+    _renderDetectCorrectionBatchFileList([]);
+    _updateDetectCorrectionSaveBtnLabel(1);
+  }
+
+  function _collectDetectCorrectionSharedFromForm() {
+    var els = _detectCorrectionModalEls();
+    var wrong = els.wrong ? String(els.wrong.value || '').trim() : '';
+    if (!wrong) return { error: '请填写「错在哪」' };
+    var saveRoles = !els.saveRolesCb || els.saveRolesCb.checked;
+    var saveSlot = !els.saveSlotCb || els.saveSlotCb.checked;
+    if (!saveRoles && !saveSlot) {
+      return { error: '请至少勾选一项「本次保存范围」' };
+    }
+    var expected = [];
+    if (els.rolesBox) {
+      var cbs = els.rolesBox.querySelectorAll('input[type="checkbox"]');
+      for (var i = 0; i < cbs.length; i++) {
+        if (cbs[i].checked) expected.push(String(cbs[i].value || '').trim());
+      }
+    }
+    var kws = [];
+    if (els.keywords) {
+      String(els.keywords.value || '')
+        .split(/[,，;；\s]+/)
+        .forEach(function (p) {
+          p = String(p || '').trim();
+          if (p && kws.indexOf(p) < 0) kws.push(p);
+        });
+    }
+    var slotLayout = saveSlot ? _collectExpectedSlotLayoutFromForm(els) : null;
+    return {
+      shared: {
+        wrong_description: wrong,
+        expected_roles: expected,
+        expected_note: els.note ? String(els.note.value || '').trim() : '',
+        label_keywords: kws,
+        expected_slot_layout: slotLayout,
+        saveRoles: saveRoles,
+        saveSlot: saveSlot,
+        correction_save: { roles: saveRoles, slot: saveSlot },
+      },
+    };
+  }
+
+  function _collectDetectCorrectionPayloadForFile(fileId, shared) {
+    var prev = __fileDetectCorrectionCache[String(fileId)] || {};
+    var payload = {
+      wrong_description: shared.wrong_description,
+      expected_note: shared.expected_note,
+      wrong_roles_detected: mergeDetectedRolesForFile(fileId).map(function (x) {
+        return x.id;
+      }),
+      label_keywords: shared.label_keywords.slice(),
+      reference_images: Array.isArray(prev.reference_images) ? prev.reference_images.slice() : [],
+      correction_save: shared.correction_save || { roles: true, slot: true },
+    };
+    if (shared.saveRoles) {
+      payload.expected_roles = shared.expected_roles.slice();
+    } else if (Array.isArray(prev.expected_roles)) {
+      payload.expected_roles = prev.expected_roles.slice();
+    } else {
+      payload.expected_roles = [];
+    }
+    if (shared.saveSlot) {
+      if (shared.expected_slot_layout) {
+        payload.expected_slot_layout = shared.expected_slot_layout;
+      }
+    } else if (prev.expected_slot_layout) {
+      payload.expected_slot_layout = prev.expected_slot_layout;
+    }
+    return payload;
+  }
+
+  function saveDetectCorrectionDialog() {
+    var ids =
+      __detectCorrectionEditingFileIds && __detectCorrectionEditingFileIds.length
+        ? __detectCorrectionEditingFileIds.slice()
+        : __detectCorrectionEditingFileId
+          ? [__detectCorrectionEditingFileId]
+          : [];
+    if (!ids.length) return Promise.resolve();
+    var built = _collectDetectCorrectionSharedFromForm();
+    if (built.error) {
+      _setDetectCorrectionModalMsg(built.error, true);
+      return Promise.resolve();
+    }
+    var els = _detectCorrectionModalEls();
+    if (els.saveBtn) els.saveBtn.disabled = true;
+    _setDetectCorrectionModalMsg('正在保存…', false);
+    var noteShort = (built.shared.wrong_description || '').slice(0, 80);
+    var items = ids.map(function (fid) {
+      return {
+        file_id: fid,
+        correction: _collectDetectCorrectionPayloadForFile(fid, built.shared),
+      };
+    });
+
+    function _afterSaveResults(okIds, failN, saveResp) {
+      var j = saveResp || {};
+      (okIds || []).forEach(function (fid) {
+        var payload = null;
+        items.forEach(function (it) {
+          if (String(it.file_id) === String(fid)) payload = it.correction;
+        });
+        if (payload) {
+          __fileDetectCorrectionCache[String(fid)] = payload;
+        }
+        markWorkbenchRowDetectWrong(fid, '已登记纠正：' + noteShort, {
+          skipPersist: true,
+          skipRender: true,
+        });
+      });
+      closeDetectCorrectionDialog();
+      try {
+        renderBatchWorkbenchTable();
+      } catch (_) {}
+      var okN = (okIds || []).length;
+      var ruleHint = '';
+      if (ids.length > 1 && Array.isArray(j.rule_syncs)) {
+        var rsN = 0;
+        j.rule_syncs.forEach(function (rs) {
+          if (rs && rs.ok) rsN++;
+        });
+        if (rsN) ruleHint = '；已同步角色/签字位规则至 JSON（' + rsN + ' 条）';
+      } else if (j.rule_sync) {
+        var oneHint = _formatRuleSyncHint(j.rule_sync);
+        if (oneHint) ruleHint = '；' + oneHint;
+      }
+      if (ids.length > 1) {
+        setBatchWorkbenchMsg(
+          (failN
+            ? '批量登记完成：成功 ' + okN + ' 个，失败 ' + failN + ' 个'
+            : '已对 ' + okN + ' 个文件保存纠正登记，重新识别时将自动带入') + ruleHint,
+          !!failN
+        );
+      } else if (okN) {
+        setBatchWorkbenchMsg(
+          '已保存识别纠正登记，重新识别时将自动带入' + ruleHint,
+          false
+        );
+      } else {
+        setBatchWorkbenchMsg('保存失败', true);
+      }
+      flushLightFileSessionCaches(okIds).catch(function () {});
+    }
+
+    if (ids.length > 1) {
+      var batchTimeout = _detectCorrectionBatchTimeoutMs(ids.length);
+      _setDetectCorrectionModalMsg(
+        '正在批量保存 ' + ids.length + ' 个文件（最长约 ' + Math.round(batchTimeout / 1000) + 's）…',
+        false
+      );
+      return fetchJsonWithRetry(
+        apiUrl('/api/sign/files/detect-correction/batch'),
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: items }),
+          timeoutMs: batchTimeout,
+        },
+        {
+          maxTry: 2,
+          delayMs: 1500,
+          onRetry: function (n) {
+            _setDetectCorrectionModalMsg('保存较慢，正在重试（' + n + '/2）…', false);
+          },
+        }
+      )
+        .then(function (r) {
+          var j = (r && r.data) || {};
+          if (!j.ok) {
+            _setDetectCorrectionModalMsg(j.error || '批量保存失败', true);
+            return;
+          }
+          var okIds = Array.isArray(j.ok_ids) ? j.ok_ids : [];
+          var failN = Number(j.fail_count) || 0;
+          if (failN && Array.isArray(j.failed) && j.failed.length) {
+            console.warn('[detect-correction batch]', j.failed);
+          }
+          return _afterSaveResults(okIds, failN, j);
+        })
+        .catch(function (e) {
+          _setDetectCorrectionModalMsg((e && e.message) || '批量保存失败', true);
+        })
+        .finally(function () {
+          if (els.saveBtn) els.saveBtn.disabled = false;
+        });
+    }
+
+    var fid0 = ids[0];
+    var payload0 = items[0].correction;
+    return fetchJson(apiUrl('/api/sign/files/' + encodeURIComponent(fid0) + '/detect-correction'), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ correction: payload0 }),
+      timeoutMs: 60000,
+    })
+      .then(function (r) {
+        var j = (r && r.data) || {};
+        if (!j.ok) {
+          _setDetectCorrectionModalMsg(j.error || '保存失败', true);
+          return;
+        }
+        __fileDetectCorrectionCache[String(fid0)] = j.correction || payload0;
+        return _afterSaveResults([fid0], 0, j);
+      })
+      .catch(function (e) {
+        _setDetectCorrectionModalMsg((e && e.message) || '保存失败', true);
+      })
+      .finally(function () {
+        if (els.saveBtn) els.saveBtn.disabled = false;
+      });
+  }
+
+  function _attachDetectCorrectionImageToFiles(ids, imageMeta) {
+    if (!imageMeta || !imageMeta.id) return;
+    ids.forEach(function (fid) {
+      var corr = __fileDetectCorrectionCache[String(fid)] || {};
+      var imgs = Array.isArray(corr.reference_images) ? corr.reference_images.slice() : [];
+      var dup = imgs.some(function (x) {
+        return (
+          String(x.id) === String(imageMeta.id) ||
+          (imageMeta.ftp_path && String(x.ftp_path) === String(imageMeta.ftp_path))
+        );
+      });
+      if (!dup) imgs.push(imageMeta);
+      corr.reference_images = imgs;
+      __fileDetectCorrectionCache[String(fid)] = corr;
+    });
+  }
+
+  function uploadDetectCorrectionImages(fileIdOrIds, fileList) {
+    var ids = [];
+    if (Array.isArray(fileIdOrIds)) {
+      ids = fileIdOrIds.map(String).filter(Boolean);
+    } else if (fileIdOrIds) {
+      ids = [String(fileIdOrIds)];
+    }
+    if (!ids.length || !fileList || !fileList.length) return Promise.resolve();
+    var chain = Promise.resolve();
+    Array.prototype.forEach.call(fileList, function (f) {
+      chain = chain.then(function () {
+        var fd = new FormData();
+        fd.append('file', f);
+        if (ids.length > 1) {
+          return fetch(apiUrl('/api/sign/detect-correction/reference-image'), {
+            method: 'POST',
+            body: fd,
+            credentials: 'same-origin',
+          }).then(function (resp) {
+            return resp.json().then(function (j) {
+              if (!resp.ok || !j.ok) throw new Error(j.error || '上传失败');
+              _attachDetectCorrectionImageToFiles(ids, j.image);
+            });
+          });
+        }
+        var fid = ids[0];
+        return fetch(
+          apiUrl(
+            '/api/sign/files/' +
+              encodeURIComponent(fid) +
+              '/detect-correction/reference-image'
+          ),
+          { method: 'POST', body: fd, credentials: 'same-origin' }
+        ).then(function (resp) {
+          return resp.json().then(function (j) {
+            if (!resp.ok || !j.ok) throw new Error(j.error || '上传失败');
+            _attachDetectCorrectionImageToFiles([fid], j.image);
+          });
+        });
+      });
+    });
+    return chain.then(function () {
+      renderDetectCorrectionRefImages(ids[0]);
+      if (ids.length > 1) {
+        _setDetectCorrectionModalMsg(
+          '参考图已上传至 FTP，' + ids.length + ' 个文件共用同一文件链接',
+          false
+        );
+      }
+    });
+  }
+
+  function initDetectCorrectionModal() {
+    var els = _detectCorrectionModalEls();
+    if (!els.modal) return;
+    if (els.cancelBtn) {
+      els.cancelBtn.addEventListener('click', function () {
+        closeDetectCorrectionDialog();
+      });
+    }
+    if (els.saveBtn) {
+      els.saveBtn.addEventListener('click', function () {
+        saveDetectCorrectionDialog();
+      });
+    }
+    if (els.imgInput) {
+      els.imgInput.addEventListener('change', function () {
+        var fids =
+          __detectCorrectionEditingFileIds && __detectCorrectionEditingFileIds.length
+            ? __detectCorrectionEditingFileIds.slice()
+            : __detectCorrectionEditingFileId
+              ? [__detectCorrectionEditingFileId]
+              : [];
+        if (!fids.length || !els.imgInput.files || !els.imgInput.files.length) return;
+        _setDetectCorrectionModalMsg('正在上传参考图…', false);
+        uploadDetectCorrectionImages(fids, els.imgInput.files)
+          .then(function () {
+            if (fids.length <= 1) {
+              _setDetectCorrectionModalMsg('参考图已上传', false);
+            }
+            els.imgInput.value = '';
+          })
+          .catch(function (e) {
+            _setDetectCorrectionModalMsg((e && e.message) || '上传失败', true);
+          });
+      });
+    }
+    els.modal.addEventListener('click', function (ev) {
+      if (ev.target === els.modal) closeDetectCorrectionDialog();
+    });
+  }
+
+  function markWorkbenchSelectedAsDetectWrong() {
+    var selected = _getWorkbenchSelectedFileIds();
+    if (!selected.length) {
+      setBatchWorkbenchMsg('请先勾选要批量登记的文件', true);
+      return;
+    }
+    openDetectCorrectionDialog(selected);
   }
 
   function _workbenchStatusBucket(shown) {
     var t = String(shown || '').trim();
     if (t === '识别有误') return '识别有误';
     if (t === '待匹配') return '待匹配';
+    if (t === '无可用素材') return '无可用素材';
     if (/识别失败/.test(t)) return '识别失败';
     if (/识别超时/.test(t)) return '识别超时';
     if (/未识别/.test(t)) return '未识别';
+    if (/签字位不完整/.test(t)) return '签字位不完整';
     if (t === '就绪') return '就绪';
     if (t === '部分就绪') return '部分就绪';
     if (t === '无需签字') return '无需签字';
+    if (/^已签字/.test(t) || t === '已签字') return '已签字';
+    if (/签字失败/.test(t)) return '签字失败';
+    if (/保存映射失败/.test(t)) return '保存映射失败';
+    if (/^签字中/.test(t)) return '签字中';
     if (/识别|匹配|分析/.test(t)) return '识别中';
-    if (t === '—' || !t) return '待处理';
+    if (t === '—' || !t || t === '待处理') return '待处理';
     return t;
+  }
+
+  function _getWorkbenchSlotFilterCatalogMap() {
+    var map = {};
+    WORKBENCH_SLOT_FILTER_GROUPS.forEach(function (grp) {
+      (grp.items || []).forEach(function (it) {
+        var v = _normalizeWorkbenchSlotTag(it && it.value != null ? it.value : it);
+        if (!v) return;
+        map[v] = it.label || v;
+      });
+    });
+    return map;
+  }
+
+  function _workbenchSlotFilterGroupForTag(tag) {
+    var t = _normalizeWorkbenchSlotTag(tag);
+    if (!t) return '其它';
+    var i;
+    for (i = 0; i < WORKBENCH_SLOT_FILTER_GROUPS.length; i++) {
+      var grp = WORKBENCH_SLOT_FILTER_GROUPS[i];
+      var found = (grp.items || []).some(function (it) {
+        var v = _normalizeWorkbenchSlotTag(it && it.value != null ? it.value : it);
+        return v === t;
+      });
+      if (found) return grp.title;
+    }
+    if (/^版式-/.test(t)) return '版式';
+    if (/^分隔-/.test(t)) return '分隔方式';
+    if (/识别|未识别/.test(t)) return '识别过程';
+    return '其它';
+  }
+
+  function _buildWorkbenchSlotFilterGroupsForUi(extraTags) {
+    var catalogMap = _getWorkbenchSlotFilterCatalogMap();
+    var out = WORKBENCH_SLOT_FILTER_GROUPS.map(function (grp) {
+      return {
+        title: grp.title,
+        items: (grp.items || []).map(function (it) {
+          var value = _normalizeWorkbenchSlotTag(it && it.value != null ? it.value : it);
+          return { value: value, label: it.label || value };
+        }),
+      };
+    });
+    var extras = [];
+    (extraTags || []).forEach(function (tag) {
+      var v = _normalizeWorkbenchSlotTag(tag);
+      if (!v || catalogMap[v]) return;
+      if (extras.indexOf(v) < 0) extras.push(v);
+    });
+    extras.sort();
+    if (extras.length) {
+      out.push({
+        title: '其它（本次列表）',
+        items: extras.map(function (v) {
+          return { value: v, label: v };
+        }),
+      });
+    }
+    return out;
+  }
+
+  function _workbenchRowSlotFilterKeys(row) {
+    var keys = [];
+    if (!row) return keys;
+    function add(k) {
+      k = _normalizeWorkbenchSlotTag(k);
+      if (!k || keys.indexOf(k) >= 0) return;
+      keys.push(k);
+    }
+    var tags = Array.isArray(row.slotTags) ? row.slotTags : [];
+    tags.forEach(add);
+    add(row.slotLabel);
+    return keys;
+  }
+
+  function _slotFilterValueMatchesRow(filterValue, rowKeys) {
+    filterValue = _normalizeWorkbenchSlotTag(filterValue);
+    if (!filterValue) return false;
+    var aliases = WORKBENCH_SLOT_FILTER_MATCH_KEYS[filterValue];
+    var candidates = aliases ? aliases.slice() : [filterValue];
+    if (candidates.indexOf(filterValue) < 0) candidates.unshift(filterValue);
+    for (var i = 0; i < candidates.length; i++) {
+      if (rowKeys.indexOf(candidates[i]) >= 0) return true;
+    }
+    return false;
+  }
+
+  function _renderGroupedWorkbenchFilterBox(boxEl, groups, dataAttr, onChange) {
+    if (!boxEl) return;
+    boxEl.innerHTML = '';
+    (groups || []).forEach(function (grp) {
+      var items = grp.items || [];
+      if (!items.length) return;
+      var section = document.createElement('div');
+      section.className = 'wb-filter-group';
+      var titleEl = document.createElement('span');
+      titleEl.className = 'wb-filter-group-title';
+      titleEl.textContent = grp.title || '';
+      section.appendChild(titleEl);
+      var itemsWrap = document.createElement('div');
+      itemsWrap.className = 'wb-filter-group-items';
+      items.forEach(function (item) {
+        var value = typeof item === 'string' ? item : item.value;
+        var label = typeof item === 'string' ? item : item.label || item.value;
+        if (!value) return;
+        var lab = document.createElement('label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.setAttribute(dataAttr, value);
+        if (item && item.checked) cb.checked = true;
+        if (onChange) {
+          cb.addEventListener('change', onChange);
+        }
+        lab.appendChild(cb);
+        lab.appendChild(document.createTextNode(label));
+        itemsWrap.appendChild(lab);
+      });
+      section.appendChild(itemsWrap);
+      boxEl.appendChild(section);
+    });
+  }
+
+  function _initWorkbenchStatusFilterCheckboxes() {
+    if (!batchWorkbenchFilterStatusBox) return;
+    _renderGroupedWorkbenchFilterBox(
+      batchWorkbenchFilterStatusBox,
+      WORKBENCH_STATUS_FILTER_GROUPS,
+      'data-wb-status'
+    );
+  }
+
+  function _workbenchStatusFilterIsAllSelected() {
+    if (!batchWorkbenchFilterStatusBox) return false;
+    var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
+    if (!cbs.length) return false;
+    var n = 0;
+    for (var i = 0; i < cbs.length; i++) {
+      if (cbs[i].checked) n++;
+    }
+    return n >= cbs.length;
+  }
+
+  function _updateWorkbenchStatusFilterToggleLabel() {
+    if (!batchWorkbenchFilterStatusToggle) return;
+    var n = __wbFilterStatuses.length;
+    if (!n) {
+      batchWorkbenchFilterStatusToggle.textContent = '状态筛选 ▼';
+      return;
+    }
+    if (_workbenchStatusFilterIsAllSelected()) {
+      batchWorkbenchFilterStatusToggle.textContent = '状态：全部 ▼';
+      return;
+    }
+    batchWorkbenchFilterStatusToggle.textContent = '状态：已选 ' + n + ' 项 ▼';
   }
 
   function _isWorkbenchDetectIssueStatus(shown) {
@@ -7031,9 +8925,8 @@
     var out = [];
     var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
     for (var i = 0; i < cbs.length; i++) {
-      var cb = cbs[i];
-      if (cb.checked) {
-        var v = String(cb.getAttribute('data-wb-status') || '').trim();
+      if (cbs[i].checked) {
+        var v = String(cbs[i].getAttribute('data-wb-status') || '').trim();
         if (v) out.push(v);
       }
     }
@@ -7041,11 +8934,13 @@
   }
 
   function _bindWorkbenchStatusFilterCheckboxes() {
+    _initWorkbenchStatusFilterCheckboxes();
     if (!batchWorkbenchFilterStatusBox) return;
     var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
     for (var i = 0; i < cbs.length; i++) {
       cbs[i].addEventListener('change', function () {
         __wbFilterStatuses = _readWorkbenchFilterStatusesFromUi();
+        _updateWorkbenchStatusFilterToggleLabel();
         renderBatchWorkbenchTable();
       });
     }
@@ -7060,6 +8955,224 @@
       cbs[i].checked = !!keys[v];
     }
     __wbFilterStatuses = _readWorkbenchFilterStatusesFromUi();
+    _updateWorkbenchStatusFilterToggleLabel();
+  }
+
+  function _selectAllWorkbenchStatusFilters() {
+    if (!batchWorkbenchFilterStatusBox) return;
+    var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
+    for (var i = 0; i < cbs.length; i++) cbs[i].checked = true;
+    __wbFilterStatuses = _readWorkbenchFilterStatusesFromUi();
+    _updateWorkbenchStatusFilterToggleLabel();
+    renderBatchWorkbenchTable();
+  }
+
+  function _clearWorkbenchStatusFilters() {
+    if (!batchWorkbenchFilterStatusBox) return;
+    var cbs = batchWorkbenchFilterStatusBox.querySelectorAll('input[data-wb-status]');
+    for (var i = 0; i < cbs.length; i++) cbs[i].checked = false;
+    __wbFilterStatuses = [];
+    _updateWorkbenchStatusFilterToggleLabel();
+    renderBatchWorkbenchTable();
+  }
+
+  function _toggleWorkbenchStatusFilterPanel(open) {
+    if (!batchWorkbenchFilterStatusWrap) return;
+    if (open) batchWorkbenchFilterStatusWrap.classList.add('open');
+    else batchWorkbenchFilterStatusWrap.classList.remove('open');
+  }
+
+  function _normalizeWorkbenchSlotTag(tag) {
+    return String(tag || '').trim();
+  }
+
+  function _collectWorkbenchSlotTagsFromRows() {
+    var seen = {};
+    var out = [];
+    savedFiles.forEach(function (rec) {
+      if (!rec || !rec.id) return;
+      _workbenchRowSlotFilterKeys(__batchWorkbenchRows[String(rec.id)] || {}).forEach(function (k) {
+        if (!k || seen[k]) return;
+        seen[k] = true;
+        out.push(k);
+      });
+    });
+    return out;
+  }
+
+  function _collectWorkbenchSlotFilterCatalogValues() {
+    var out = [];
+    var seen = {};
+    WORKBENCH_SLOT_FILTER_GROUPS.forEach(function (grp) {
+      (grp.items || []).forEach(function (it) {
+        var v = _normalizeWorkbenchSlotTag(it && it.value != null ? it.value : it);
+        if (!v || seen[v]) return;
+        seen[v] = true;
+        out.push(v);
+      });
+    });
+    return out;
+  }
+
+  function _workbenchSlotFilterIsAllSelected() {
+    if (!batchWorkbenchFilterSlotBox) return false;
+    var cbs = batchWorkbenchFilterSlotBox.querySelectorAll('input[data-wb-slot-tag]');
+    if (!cbs.length) return false;
+    var n = 0;
+    for (var i = 0; i < cbs.length; i++) {
+      if (cbs[i].checked) n++;
+    }
+    return n >= cbs.length;
+  }
+
+  function _updateWorkbenchSlotFilterToggleLabel() {
+    if (!batchWorkbenchFilterSlotToggle) return;
+    var n = __wbFilterSlotTags.length;
+    if (!n) {
+      batchWorkbenchFilterSlotToggle.textContent = '签字位 ▼';
+      return;
+    }
+    if (_workbenchSlotFilterIsAllSelected()) {
+      batchWorkbenchFilterSlotToggle.textContent = '签字位：全部 ▼';
+      return;
+    }
+    batchWorkbenchFilterSlotToggle.textContent = '签字位：' + n + ' 项 ▼';
+  }
+
+  function _readWorkbenchFilterSlotTagsFromUi() {
+    if (!batchWorkbenchFilterSlotBox) return [];
+    var out = [];
+    var cbs = batchWorkbenchFilterSlotBox.querySelectorAll('input[data-wb-slot-tag]');
+    for (var i = 0; i < cbs.length; i++) {
+      if (!cbs[i].checked) continue;
+      var v = _normalizeWorkbenchSlotTag(cbs[i].getAttribute('data-wb-slot-tag'));
+      if (v) out.push(v);
+    }
+    return out;
+  }
+
+  function _setWorkbenchFilterSlotChecks(tagKeys) {
+    if (!batchWorkbenchFilterSlotBox) return;
+    var keys = tagKeys || {};
+    var cbs = batchWorkbenchFilterSlotBox.querySelectorAll('input[data-wb-slot-tag]');
+    for (var i = 0; i < cbs.length; i++) {
+      var v = _normalizeWorkbenchSlotTag(cbs[i].getAttribute('data-wb-slot-tag'));
+      cbs[i].checked = !!keys[v];
+    }
+    __wbFilterSlotTags = _readWorkbenchFilterSlotTagsFromUi();
+    _updateWorkbenchSlotFilterToggleLabel();
+  }
+
+  var __wbSlotFilterUiBuilt = false;
+  var __wbSlotFilterExtrasSig = '';
+  var __wbSlotFilterOnChange = null;
+
+  function _workbenchSlotFilterExtrasSignature(rowTags) {
+    return (rowTags || [])
+      .slice()
+      .sort()
+      .join('\u0001');
+  }
+
+  function _syncWorkbenchSlotFilterAvailableTags(rowTags) {
+    var catalogValues = _collectWorkbenchSlotFilterCatalogValues();
+    __wbAvailableSlotTags = catalogValues.slice();
+    (rowTags || []).forEach(function (t) {
+      t = _normalizeWorkbenchSlotTag(t);
+      if (t && __wbAvailableSlotTags.indexOf(t) < 0) __wbAvailableSlotTags.push(t);
+    });
+    var allowed = {};
+    __wbAvailableSlotTags.forEach(function (x) {
+      allowed[x] = true;
+    });
+    __wbFilterSlotTags = __wbFilterSlotTags.filter(function (x) {
+      return allowed[x];
+    });
+  }
+
+  /** 签字位筛选 DOM 只构建一次；勿在 renderBatchWorkbenchTable 里重复调用 */
+  function _refreshWorkbenchSlotFilterOptions(opt) {
+    if (!batchWorkbenchFilterSlotBox) return;
+    opt = opt && typeof opt === 'object' ? opt : {};
+    var rowTags = _collectWorkbenchSlotTagsFromRows();
+    _syncWorkbenchSlotFilterAvailableTags(rowTags);
+    var extrasSig = _workbenchSlotFilterExtrasSignature(rowTags);
+    if (__wbSlotFilterUiBuilt && !opt.force && extrasSig === __wbSlotFilterExtrasSig) {
+      _updateWorkbenchSlotFilterToggleLabel();
+      return;
+    }
+    __wbSlotFilterExtrasSig = extrasSig;
+    var selected = {};
+    __wbFilterSlotTags.forEach(function (x) {
+      selected[x] = true;
+    });
+    if (!__wbSlotFilterOnChange) {
+      __wbSlotFilterOnChange = function () {
+        __wbFilterSlotTags = _readWorkbenchFilterSlotTagsFromUi();
+        _updateWorkbenchSlotFilterToggleLabel();
+        renderBatchWorkbenchTable();
+      };
+    }
+    var slotGroups = _buildWorkbenchSlotFilterGroupsForUi(rowTags);
+    _renderGroupedWorkbenchFilterBox(
+      batchWorkbenchFilterSlotBox,
+      slotGroups.map(function (g) {
+        return {
+          title: g.title,
+          items: g.items.map(function (it) {
+            return {
+              value: it.value,
+              label: it.label || it.value,
+              checked: !!selected[it.value],
+            };
+          }),
+        };
+      }),
+      'data-wb-slot-tag',
+      __wbSlotFilterOnChange
+    );
+    __wbSlotFilterUiBuilt = true;
+    _setWorkbenchFilterSlotChecks(
+      __wbFilterSlotTags.reduce(function (m, x) {
+        m[x] = true;
+        return m;
+      }, {})
+    );
+  }
+
+  function _selectAllWorkbenchSlotFilters() {
+    if (!batchWorkbenchFilterSlotBox) return;
+    var cbs = batchWorkbenchFilterSlotBox.querySelectorAll('input[data-wb-slot-tag]');
+    for (var i = 0; i < cbs.length; i++) cbs[i].checked = true;
+    __wbFilterSlotTags = _readWorkbenchFilterSlotTagsFromUi();
+    _updateWorkbenchSlotFilterToggleLabel();
+    renderBatchWorkbenchTable();
+  }
+
+  function _clearWorkbenchSlotFilters() {
+    if (!batchWorkbenchFilterSlotBox) return;
+    var cbs = batchWorkbenchFilterSlotBox.querySelectorAll('input[data-wb-slot-tag]');
+    for (var i = 0; i < cbs.length; i++) cbs[i].checked = false;
+    __wbFilterSlotTags = [];
+    _updateWorkbenchSlotFilterToggleLabel();
+    renderBatchWorkbenchTable();
+  }
+
+  function _toggleWorkbenchSlotFilterPanel(open) {
+    if (!batchWorkbenchFilterSlotWrap) return;
+    if (open) batchWorkbenchFilterSlotWrap.classList.add('open');
+    else batchWorkbenchFilterSlotWrap.classList.remove('open');
+  }
+
+  function _workbenchRowMatchesSlotFilter(row) {
+    if (!__wbFilterSlotTags.length) return false;
+    if (_workbenchSlotFilterIsAllSelected()) return true;
+    var rowKeys = _workbenchRowSlotFilterKeys(row);
+    if (!rowKeys.length) return false;
+    for (var i = 0; i < __wbFilterSlotTags.length; i++) {
+      if (_slotFilterValueMatchesRow(__wbFilterSlotTags[i], rowKeys)) return true;
+    }
+    return false;
   }
 
   function _setWorkbenchFilterDetectIssuesOnly() {
@@ -7072,8 +9185,15 @@
     renderBatchWorkbenchTable();
   }
 
+  function _setWorkbenchFilterNotSignableOnly() {
+    _setWorkbenchFilterStatusChecks({});
+    _setWorkbenchFilterSlotChecks({ 不可签: true });
+    renderBatchWorkbenchTable();
+  }
+
   function _workbenchRowMatchesStatusFilter(row) {
     if (!__wbFilterStatuses.length) return false;
+    if (_workbenchStatusFilterIsAllSelected()) return true;
     var shown = row ? String(row.status || '') : '';
     var bucket = _workbenchStatusBucket(shown);
     for (var i = 0; i < __wbFilterStatuses.length; i++) {
@@ -7153,14 +9273,16 @@
     __wbFilterNameTerms = [];
     __wbFilterNameDraft = '';
     __wbFilterStatuses = [];
+    __wbFilterSlotTags = [];
     if (batchWorkbenchFilterName) batchWorkbenchFilterName.value = '';
     _setWorkbenchFilterStatusChecks({});
+    _setWorkbenchFilterSlotChecks({});
     _renderWorkbenchFilterNameTags();
     renderBatchWorkbenchTable();
   }
 
   function _workbenchHasActiveFilter() {
-    return __wbFilterNameTerms.length > 0 || __wbFilterStatuses.length > 0;
+    return __wbFilterNameTerms.length > 0 || __wbFilterStatuses.length > 0 || __wbFilterSlotTags.length > 0;
   }
 
   function _workbenchNameFilterTerms() {
@@ -7529,17 +9651,22 @@
     if (t > 0 && d > t) d = t;
     var pct = t > 0 ? Math.round((d / t) * 100) : 0;
     var line = text || (t > 0 ? '进度 ' + d + '/' + t + '（' + pct + '%）' : '处理中…');
+    if (isBatchWorkbenchMode()) {
+      if (batchWorkbenchProgressWrap && batchWorkbenchProgressBar && batchWorkbenchProgressText) {
+        var show = !!keepVisible || t > 0;
+        batchWorkbenchProgressWrap.style.display = show ? 'block' : 'none';
+        if (show) {
+          batchWorkbenchProgressBar.max = t > 0 ? t : 100;
+          batchWorkbenchProgressBar.value = t > 0 ? d : 0;
+          batchWorkbenchProgressText.textContent = line;
+        } else {
+          batchWorkbenchProgressText.textContent = '';
+        }
+      }
+      return;
+    }
     if (__pageProgressDepth > 0 || keepVisible || t > 0) {
       updatePageProgress(line, { done: d, total: t });
-    }
-    if (batchWorkbenchProgressWrap && batchWorkbenchProgressBar && batchWorkbenchProgressText) {
-      var show = !!keepVisible || t > 0;
-      batchWorkbenchProgressWrap.style.display = 'none';
-      if (show) {
-        batchWorkbenchProgressBar.max = t > 0 ? t : 100;
-        batchWorkbenchProgressBar.value = t > 0 ? d : 0;
-        batchWorkbenchProgressText.textContent = line;
-      }
     }
   }
 
@@ -7549,6 +9676,12 @@
     return {
       status: row.status || '',
       rolesLabel: row.rolesLabel || '',
+      slotLabel: row.slotLabel || '',
+      slotRolesLine: row.slotRolesLine || '',
+      slotLayoutLine: row.slotLayoutLine || '',
+      slotBadgeClass: row.slotBadgeClass || '',
+      slotExplain: row.slotExplain || '',
+      slotTags: Array.isArray(row.slotTags) ? row.slotTags.slice() : [],
       detectExplain: row.detectExplain || '',
       detectWrongNote: row.detectWrongNote || '',
       manualDetectWrong: !!row.manualDetectWrong,
@@ -7566,12 +9699,24 @@
     if (!fileId || !wb || typeof wb !== 'object') return;
     var row = __batchWorkbenchRows[String(fileId)];
     if (!row) return;
-    if (wb.status != null) row.status = String(wb.status);
+    if (wb.status != null) {
+      var stCached = String(wb.status);
+      // 刷新页面时勿恢复「识别中/匹配素材」等中间态，否则签字位列会一直显示处理中
+      if (!_isWorkbenchRowPipelineBusy(stCached)) {
+        row.status = stCached;
+      }
+    }
     if (typeof wb.manualDetectWrong === 'boolean') {
       row.manualDetectWrong = wb.manualDetectWrong;
     }
     if (wb.detectWrongNote != null) row.detectWrongNote = String(wb.detectWrongNote);
     if (wb.rolesLabel != null) row.rolesLabel = String(wb.rolesLabel);
+    if (wb.slotLabel != null) row.slotLabel = String(wb.slotLabel);
+    if (wb.slotRolesLine != null) row.slotRolesLine = String(wb.slotRolesLine);
+    if (wb.slotLayoutLine != null) row.slotLayoutLine = String(wb.slotLayoutLine);
+    if (wb.slotBadgeClass != null) row.slotBadgeClass = String(wb.slotBadgeClass);
+    if (wb.slotExplain != null) row.slotExplain = String(wb.slotExplain);
+    if (Array.isArray(wb.slotTags)) row.slotTags = wb.slotTags.slice();
     if (wb.detectExplain != null) row.detectExplain = String(wb.detectExplain);
     if (wb.editor != null) row.editor = String(wb.editor);
     if (wb.reviewer != null) row.reviewer = String(wb.reviewer);
@@ -7584,20 +9729,54 @@
   }
 
   var __persistFileCacheTimers = {};
-  function persistFileSessionCacheNow(fileId) {
-    if (!fileId) return Promise.resolve();
+  function _fileSessionCachePayload(fileId, lightOnly) {
     var payload = {};
-    var st = fileUiCache[String(fileId)] || {};
-    if (st.lastDetectData) payload.detect = st.lastDetectData;
+    if (!lightOnly) {
+      var st = fileUiCache[String(fileId)] || {};
+      if (st.lastDetectData) payload.detect = st.lastDetectData;
+    }
     var wb = workbenchStateFromRow(fileId);
     if (wb) payload.workbench = wb;
+    var corr = __fileDetectCorrectionCache[String(fileId)];
+    if (corr && typeof corr === 'object' && Object.keys(corr).length) {
+      payload.detect_correction = corr;
+    }
+    return payload;
+  }
+
+  function persistFileSessionCacheNow(fileId, lightOnly) {
+    if (!fileId) return Promise.resolve();
+    var payload = _fileSessionCachePayload(fileId, !!lightOnly);
     if (!Object.keys(payload).length) return Promise.resolve();
     return fetchJson(apiUrl('/api/sign/files/' + encodeURIComponent(fileId) + '/file-cache'), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      timeoutMs: 60000,
+      timeoutMs: lightOnly ? 45000 : 60000,
     }).catch(function () {});
+  }
+
+  function _detectCorrectionBatchTimeoutMs(count) {
+    var n = Math.max(1, count || 1);
+    return Math.min(600000, Math.max(120000, 90000 + n * 2000));
+  }
+
+  function flushLightFileSessionCaches(fileIds) {
+    var ids = (fileIds || []).map(String).filter(Boolean);
+    if (!ids.length) return Promise.resolve();
+    var i = 0;
+    var chunk = 6;
+    function nextChunk() {
+      var slice = ids.slice(i, i + chunk);
+      if (!slice.length) return Promise.resolve();
+      i += chunk;
+      return Promise.all(
+        slice.map(function (fid) {
+          return persistFileSessionCacheNow(fid, true);
+        })
+      ).then(nextChunk);
+    }
+    return nextChunk();
   }
 
   function schedulePersistFileSessionCache(fileId) {
@@ -7631,7 +9810,31 @@
     );
   }
 
-  function hydrateFileCachesFromServer() {
+  function _applyOneFileSessionCacheEntry(fid, ent) {
+    ent = ent || {};
+    if (ent.detect) {
+      cacheDetectResultForFile(fid, ent.detect, ent.detect.error || '');
+    }
+    if (ent.map) {
+      cachePatchCurrentRoleMap(fid, ent.map);
+      _lastPersistedRoleMapStable[String(fid)] = _roleMapStableJson(ent.map);
+    }
+    if (ent.detect_correction && typeof ent.detect_correction === 'object') {
+      __fileDetectCorrectionCache[fid] = ent.detect_correction;
+    }
+    if (ent.workbench) {
+      applyWorkbenchStateFromCache(fid, ent.workbench);
+    } else if (ent.detect) {
+      syncWorkbenchRowFromDetect(fid, ent.detect);
+    }
+    var row = __batchWorkbenchRows[String(fid)];
+    if (row) {
+      finalizeWorkbenchRowStatus(fid);
+    }
+  }
+
+  function hydrateFileCachesFromServer(opt) {
+    opt = opt && typeof opt === 'object' ? opt : {};
     if (!IS_FILE_SIGN_PAGE) return Promise.resolve();
     if (__fileCacheHydratePromise) return __fileCacheHydratePromise;
     __fileCacheHydratePromise = fetchJsonWithRetry(
@@ -7642,28 +9845,34 @@
       .then(function (r) {
         var j = (r && r.data) || {};
         if (!j.ok || !j.caches || typeof j.caches !== 'object') return;
-        Object.keys(j.caches).forEach(function (fid) {
-          var ent = j.caches[fid] || {};
-          if (ent.detect) {
-            cacheDetectResultForFile(fid, ent.detect, ent.detect.error || '');
+        var keys = Object.keys(j.caches);
+        if (!keys.length) return;
+        var caches = j.caches;
+        var idx = 0;
+        var chunk = opt.chunkSize > 0 ? opt.chunkSize : 12;
+        return new Promise(function (resolve) {
+          function step() {
+            var end = Math.min(idx + chunk, keys.length);
+            for (; idx < end; idx++) {
+              _applyOneFileSessionCacheEntry(keys[idx], caches[keys[idx]]);
+            }
+            if (opt.onProgress) {
+              try {
+                opt.onProgress(idx, keys.length);
+              } catch (_) {}
+            }
+            if (idx < keys.length) {
+              requestAnimationFrame(step);
+            } else {
+              try {
+                _refreshWorkbenchSlotFilterOptions();
+                renderBatchWorkbenchTable();
+              } catch (_) {}
+              resolve();
+            }
           }
-          if (ent.map) {
-            cachePatchCurrentRoleMap(fid, ent.map);
-            _lastPersistedRoleMapStable[String(fid)] = _roleMapStableJson(ent.map);
-          }
-          if (ent.workbench) {
-            applyWorkbenchStateFromCache(fid, ent.workbench);
-          } else if (ent.detect) {
-            syncWorkbenchRowFromDetect(fid, ent.detect);
-          }
-          var row = __batchWorkbenchRows[String(fid)];
-          if (row) {
-            finalizeWorkbenchRowStatus(fid);
-          }
+          requestAnimationFrame(step);
         });
-        try {
-          renderBatchWorkbenchTable();
-        } catch (_) {}
       })
       .catch(function (e) {
         var msg = (e && e.message) || String(e);
@@ -7725,8 +9934,9 @@
       }
       if (!nameHit) return false;
     }
-    if (!__wbFilterStatuses.length) return true;
-    return _workbenchRowMatchesStatusFilter(row);
+    if (__wbFilterStatuses.length && !_workbenchRowMatchesStatusFilter(row)) return false;
+    if (__wbFilterSlotTags.length && !_workbenchRowMatchesSlotFilter(row)) return false;
+    return true;
   }
 
   function _updateWorkbenchFilterHint(shown, total) {
@@ -7743,7 +9953,18 @@
       parts.push('文件名[' + __wbFilterNameTerms.join('|') + ']');
     }
     if (__wbFilterStatuses.length) {
-      parts.push('状态[' + __wbFilterStatuses.join('|') + ']');
+      if (_workbenchStatusFilterIsAllSelected()) {
+        parts.push('状态[全部]');
+      } else {
+        parts.push('状态[' + __wbFilterStatuses.join('|') + ']');
+      }
+    }
+    if (__wbFilterSlotTags.length) {
+      if (_workbenchSlotFilterIsAllSelected()) {
+        parts.push('签字位[全部]');
+      } else {
+        parts.push('签字位[' + __wbFilterSlotTags.join('|') + ']');
+      }
     }
     if (sel) parts.push('已勾选 ' + sel + ' 个');
     batchWorkbenchFilterHint.textContent = parts.join(' · ');
@@ -7802,7 +10023,7 @@
       return '检查模板签批栏标签（编写/审核/批准）是否规范，或修正 JSON 规则后批量重新识别';
     }
     if (/识别有误/.test(s)) {
-      return '人工标记识别有误：修正规则 JSON 后勾选并点「批量识别签字位」重新识别';
+      return '人工标记识别有误：保存纠正登记后点「批量识别（角色+签字位）」重新识别';
     }
     if (/待匹配/.test(s)) {
       return '识别结果可用，点「批量匹配素材」或补全库素材';
@@ -7943,6 +10164,8 @@
         country: String(ctx.country || '').trim(),
         status: isHandoff ? '待处理' : '—',
         rolesLabel: '—',
+        slotLabel: '—',
+        slotTags: [],
       };
     });
   }
@@ -7965,6 +10188,7 @@
       .then(function () {
         if (isBatchWorkbenchMode()) {
           syncHiddenBatchPicks();
+          _refreshWorkbenchSlotFilterOptions();
           renderBatchWorkbenchTable();
         }
       });
@@ -8019,6 +10243,8 @@
         country: String(ctx.country || '').trim(),
         status: isHandoff ? '待处理' : '—',
         rolesLabel: '—',
+        slotLabel: '—',
+        slotTags: [],
       };
     });
   }
@@ -8091,6 +10317,8 @@
           country: String(ctx.country || '').trim(),
           status: isHandoff ? '待处理' : '—',
           rolesLabel: '—',
+          slotLabel: '—',
+          slotTags: [],
         };
       }
       var row = __batchWorkbenchRows[fid];
@@ -8147,6 +10375,7 @@
         });
         workbenchRematchFileMaterials(fid);
       });
+      tdLoc.className = 'col-locale';
       tdLoc.appendChild(locSel);
       var tdEdSig = mkWorkbenchRoleSigCell(fid, 'author', row);
       var tdEdDate = mkWorkbenchRoleDateCell(fid, 'author', row);
@@ -8164,23 +10393,25 @@
       tdMat.appendChild(badge);
 
       var tdRoles = document.createElement('td');
+      tdRoles.className = 'col-roles';
       var _rolesTxt = row.rolesLabel || '—';
+      var _slotExplain = row.slotExplain || '';
       var _detExplain = row.detectExplain || '';
       tdRoles.textContent = _rolesTxt;
       tdRoles.title = _detExplain ? (_rolesTxt + '\n' + _detExplain) : _rolesTxt;
-      tdRoles.style.maxWidth = '220px';
-      tdRoles.style.overflow = 'hidden';
-      tdRoles.style.textOverflow = 'ellipsis';
-      tdRoles.style.whiteSpace = 'nowrap';
+
+      var tdSlot = document.createElement('td');
+      _renderWorkbenchSlotCell(tdSlot, row);
 
       var tdSt = document.createElement('td');
       tdSt.className = 'col-status';
       var _stShown = row.status || '—';
       tdSt.textContent = _stShown;
       // 完整错误/原因显示在 tooltip，避免列宽吞掉用户能定位问题的关键信息
-      tdSt.title = (_rolesTxt && _rolesTxt !== '—')
-        ? (_stShown + '\n' + _rolesTxt + (_detExplain ? ('\n' + _detExplain) : ''))
-        : (_detExplain ? (_stShown + '\n' + _detExplain) : _stShown);
+      tdSt.title = _stShown;
+      if (_rolesTxt && _rolesTxt !== '—') tdSt.title += '\n需签：' + _rolesTxt;
+      if (_slotExplain) tdSt.title += '\n' + _slotExplain;
+      if (_detExplain) tdSt.title += '\n' + _detExplain;
       if (/失败|超时|未识别|识别有误/.test(_stShown)) {
         tdSt.style.color = '#c62828';
         tdSt.style.fontWeight = '600';
@@ -8194,13 +10425,14 @@
       }
 
       var tdOp = document.createElement('td');
+      tdOp.className = 'col-op';
       var btnDet = document.createElement('button');
       btnDet.type = 'button';
       btnDet.className = 'btn btn-secondary';
       btnDet.style.padding = '4px 8px';
       btnDet.style.fontSize = '0.82rem';
       btnDet.textContent = '识别';
-      btnDet.title = '重新识别当前文档的签字角色（清空缓存，强制重跑）';
+      btnDet.title = '重新识别需签角色与签字位版式（不匹配素材库）';
       btnDet.addEventListener('click', function () {
         // 强制重新识别：清掉缓存与"已处理"标记，确保真的重跑而不是直接命中缓存
         var st = fileUiCache[fid] || {};
@@ -8214,13 +10446,12 @@
           rrow._wbPipelineDone = false;
           rrow._wbMatchAttempted = false;
           rrow.manualDetectWrong = false;
-          rrow.detectWrongNote = '';
           rrow.status = '识别中…';
-          rrow.rolesLabel = '识别中…';
+          rrow.slotTags = ['识别中'];
         }
         try { renderBatchWorkbenchTable(); } catch (_) {}
         withButtonBusy(btnDet, '识别中…', function () {
-          return processBatchWorkbenchFileIds([fid], false, {
+          return processBatchWorkbenchFileIds([fid], true, {
             hideMask: true,
             forceReprocess: true,
           });
@@ -8237,21 +10468,20 @@
       btnCanvas.addEventListener('click', function () {
         selectWorkbenchFileForAdvanced(fid);
       });
-      if (!row.manualDetectWrong && _stShown !== '识别有误') {
-        var btnWrong = document.createElement('button');
-        btnWrong.type = 'button';
-        btnWrong.className = 'btn btn-secondary';
-        btnWrong.style.padding = '4px 8px';
-        btnWrong.style.fontSize = '0.82rem';
-        btnWrong.style.marginLeft = '4px';
-        btnWrong.textContent = '标误';
-        btnWrong.title = '人工标记：识别角色与规则不符';
-        btnWrong.addEventListener('click', function (ev) {
-          ev.stopPropagation();
-          markWorkbenchRowDetectWrong(fid, '人工标记：识别角色与规则不符');
-        });
-        tdOp.appendChild(btnWrong);
-      }
+      var btnWrong = document.createElement('button');
+      btnWrong.type = 'button';
+      btnWrong.className = 'btn btn-secondary';
+      btnWrong.style.padding = '4px 8px';
+      btnWrong.style.fontSize = '0.82rem';
+      btnWrong.style.marginLeft = '4px';
+      btnWrong.textContent = row.manualDetectWrong || _stShown === '识别有误' ? '改登记' : '标误';
+      btnWrong.title =
+        '登记识别纠正：勾选保存需签角色和/或签字位版式，重新识别时自动带入';
+      btnWrong.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        openDetectCorrectionDialog(fid);
+      });
+      tdOp.appendChild(btnWrong);
       tdOp.appendChild(btnDet);
       tdOp.appendChild(btnCanvas);
 
@@ -8273,6 +10503,7 @@
       tr.appendChild(tdApDate);
       tr.appendChild(tdMat);
       tr.appendChild(tdRoles);
+      tr.appendChild(tdSlot);
       tr.appendChild(tdSt);
       tr.appendChild(tdOp);
       batchWorkbenchBody.appendChild(tr);
@@ -8310,6 +10541,10 @@
     if (shouldSkipDetectPipelineForFile(fileId) && !opts.forceReprocess) {
       row.status = '无需签字';
       row.rolesLabel = '无需签字（用例表）';
+      row.slotLabel = '无需签字';
+      row.slotExplain = '规则标记该文档无需签字。';
+      row.slotTags = ['无需签字'];
+      row.slotSignable = true;
       row.detectedRoleIds = [];
       row._wbPipelineDone = true;
       row._wbMatchAttempted = true;
@@ -8327,9 +10562,10 @@
     __aiwordHandoffTargetFileId = fileId;
     selectedFileId = fileId;
     if (!fileUiCache[fileId]) fileUiCache[fileId] = {};
+    row._wbProcessing = true;
     if (!skipDetect) {
       row.status = '识别中…';
-      row.rolesLabel = '识别中…';
+      row.slotTags = ['识别中'];
       fileUiCache[fileId].lastDetectData = null;
       fileUiCache[fileId].lastDetectError = '';
       fileUiCache[fileId].detectedOnce = false;
@@ -8363,7 +10599,7 @@
             if (ok || retryLeft <= 0) return !!ok;
             var waitMs = 800 + (2 - retryLeft) * 700;
             row.status = '识别重试中…';
-            row.rolesLabel = '识别失败，自动重试…';
+            row.slotTags = ['识别中'];
             renderBatchWorkbenchTable();
             return new Promise(function (resolve) {
               setTimeout(resolve, waitMs);
@@ -8382,9 +10618,7 @@
         var roleList = mergeDetectedRolesForFile(fileId);
         if (detectOk === false || !stDet || !stDet.ok) {
           row.status = '识别失败';
-          if (row.rolesLabel === '—' || row.rolesLabel === '识别中…') {
-            row.rolesLabel = (fileUiCache[fileId] || {}).lastDetectError || '识别失败';
-          }
+          row.slotTags = ['识别失败', '不可签'];
           return Promise.reject(new Error('识别失败'));
         }
         if (!roleList.length) {
@@ -8392,6 +10626,7 @@
           row.rolesLabel =
             (fileUiCache[fileId] || {}).lastDetectError ||
             '未匹配到编制/编写/审核/批准等标签';
+          row.slotTags = ['未识别到签字位', '不可签'];
           setBatchWorkbenchMsg(
             (row.name || fileId) + '：' + row.rolesLabel + '（可检查 Word 签批栏是否在页脚表格）',
             true
@@ -8422,6 +10657,7 @@
           if (/超时|timeout|aborted|已取消上传/i.test(String(msg))) {
             row.status = '识别超时';
             row.rolesLabel = '识别超时（' + msg + '）。可在右侧素材区手动选择签名后再次保存，或在「系统设置 → SIGN_DETECT_TIMEOUT_MS」中加大超时。';
+            row.slotTags = ['识别超时', '不可签'];
             setBatchWorkbenchMsg(
               '「' + nm + '」识别超时（' + msg + '），将继续处理下一个文件。\n' +
                 '该文件可稍后在表格点击「识别」按钮单独重试，' +
@@ -8430,9 +10666,7 @@
             );
           } else {
             row.status = '识别失败';
-            if (row.rolesLabel === '—' || row.rolesLabel === '识别中…') {
-              row.rolesLabel = msg;
-            }
+            row.slotTags = ['识别失败', '不可签'];
             setBatchWorkbenchMsg(
               '「' + nm + '」识别失败：' + msg + '，将继续处理下一个文件。',
               'warn'
@@ -8450,6 +10684,9 @@
         selectedFileId = prevSel;
         renderBatchWorkbenchTable();
         syncHiddenBatchPicks();
+      })
+      .finally(function () {
+        row._wbProcessing = false;
       });
   }
 
@@ -8461,14 +10698,25 @@
       setBatchWorkbenchProgress(0, 0, '', false);
       return Promise.resolve();
     }
-    if (!runOpt.skipPageProgress) {
+    var wbMode = isBatchWorkbenchMode();
+    if (!runOpt.skipPageProgress && !wbMode) {
       beginPageProgress(
-        detectOnly ? '批量识别签字位…' : '批量识别并匹配素材…',
+        detectOnly ? '批量识别角色与签字位…' : '批量识别并匹配素材…',
         { done: 0, total: ids.length }
       );
     }
-    setBatchWorkbenchMsg('正在处理 ' + ids.length + ' 个文件…', false);
-    setBatchWorkbenchProgress(0, ids.length, '识别与素材匹配 0/' + ids.length + '（0%）', true);
+    if (!wbMode) {
+      setBatchWorkbenchMsg('正在处理 ' + ids.length + ' 个文件…', false);
+    }
+    setBatchWorkbenchProgress(
+      0,
+      ids.length,
+      (detectOnly ? '批量识别（角色+签字位）' : '识别+匹配') +
+        ' 0/' +
+        ids.length +
+        '（0%）',
+      true
+    );
     // 批量入口统一刷新一次签署人库；后续每文件不再单独触发刷新，
     // 防止某次抖动让 signersList 清空、后续文件全都「找不到签署人」。
     // 若 boot 阶段已经拉过且 signersList 非空，则直接跳过这次刷新，避免重复请求拖慢启动。
@@ -8482,17 +10730,22 @@
         var nm = row && row.name ? row.name : fid;
         var nmShort = nm.length > 28 ? nm.slice(0, 26) + '…' : nm;
         var elapsedSec = Math.max(0, Math.round((Date.now() - startTs) / 1000));
-        setBatchWorkbenchMsg(
-          '识别匹配中 ' + (idx + 1) + '/' + ids.length +
-            '：' + nmShort +
-            '（已耗时 ' + elapsedSec + 's，可继续操作其它行）',
-          false
-        );
         var curPct = ids.length ? Math.round((idx / ids.length) * 100) : 0;
         setBatchWorkbenchProgress(
           idx,
           ids.length,
-          '识别与素材匹配 ' + idx + '/' + ids.length + '（' + curPct + '%） · 正在处理：' + nmShort,
+          (detectOnly ? '批量识别（角色+签字位）' : '识别+匹配') +
+            ' ' +
+            idx +
+            '/' +
+            ids.length +
+            '（' +
+            curPct +
+            '%） · ' +
+            nmShort +
+            ' · 已耗时 ' +
+            elapsedSec +
+            's',
           true
         );
         return processBatchWorkbenchFile(fid, {
@@ -8538,9 +10791,17 @@
       setBatchWorkbenchProgress(
         ids.length,
         ids.length,
-        '识别与素材匹配 ' + ids.length + '/' + ids.length + '（100%） · 已完成',
+        (detectOnly ? '批量识别（角色+签字位）' : '识别+匹配') +
+          ' ' +
+          ids.length +
+          '/' +
+          ids.length +
+          '（100%） · 已完成',
         true
       );
+      setTimeout(function () {
+        setBatchWorkbenchProgress(0, 0, '', false);
+      }, 5000);
       if (runOpt.hideMask !== false) {
         _hideAiwordHandoffLoadingMask();
       }
@@ -8551,6 +10812,9 @@
           ids[0];
         selectWorkbenchFileForMaterialEdit(pick, { scroll: false });
       }
+      try {
+        _refreshWorkbenchSlotFilterOptions();
+      } catch (_) {}
     })
     .finally(function () {
       if (!runOpt.skipPageProgress) endPageProgress();
@@ -8696,7 +10960,7 @@
     );
     if (__batchWorkbenchPipelineRunning) {
       setBatchWorkbenchMsg(
-        '上一轮批量识别仍在进行，新增文件已加入列表，可稍后点击「批量识别签字位」继续。',
+        '上一轮批量识别仍在进行，新增文件已加入列表，可稍后点击「批量识别（角色+签字位）」继续。',
         'warn'
       );
       return Promise.resolve();
@@ -10173,7 +12437,9 @@
     var trackDetectProgress = !opts.skipPageProgress && !opts.batchSilent;
     var detectRetryScheduled = false;
     if (trackDetectProgress) {
-      beginPageProgress('正在识别签字位：' + (_fileDisplayNameById(fileId) || fileId));
+      beginPageProgress(
+        '正在识别需签角色与签字位：' + (_fileDisplayNameById(fileId) || fileId)
+      );
     }
     if (redetectRolesBtn) {
       redetectRolesBtn.disabled = true;
@@ -10299,6 +12565,22 @@
           if (!fileUiCache[fileId].lastDetectError) {
             fileUiCache[fileId].lastDetectError =
               '未在文档中匹配到编制/编写/审核/批准或 Author/Reviewer/Approver 等签字标签';
+          }
+        }
+        if (detectOk) {
+          var probe = stDet && stDet.slot_probe && typeof stDet.slot_probe === 'object'
+            ? stDet.slot_probe
+            : null;
+          if (probe && probe.ok === false) {
+            detectOk = false;
+            var miss = Array.isArray(probe.missing_roles)
+              ? probe.missing_roles.map(function (x) { return roleLabel(x); }).join('、')
+              : '';
+            fileUiCache[fileId].lastDetectError =
+              '已识别到角色，但签字位可落位校验未通过' +
+              (miss ? '（未落位：' + miss + '）' : '') +
+              (probe.error ? '：' + String(probe.error) : '');
+            cacheDetectResultForFile(fileId, stDet, fileUiCache[fileId].lastDetectError);
           }
         }
         if (!opts.batchSilent) {
@@ -11224,26 +13506,65 @@
         );
       });
     } else {
-      bootChain = (IS_FILE_SIGN_PAGE || IS_MATERIALS_PAGE ? refreshSigners() : Promise.resolve())
+      bootChain = Promise.resolve()
+        .then(function () {
+          if (!IS_FILE_SIGN_PAGE && !IS_MATERIALS_PAGE) return;
+          beginPageProgress('正在加载页面…');
+          var loaders = [];
+          if (IS_FILE_SIGN_PAGE || IS_MATERIALS_PAGE) {
+            loaders.push(
+              refreshSigners({
+                skipPageProgress: true,
+                compact: IS_FILE_SIGN_PAGE,
+                deferRender: IS_FILE_SIGN_PAGE,
+              })
+            );
+          }
+          if (IS_FILE_SIGN_PAGE) {
+            loaders.push(
+              refreshFileList({ softFail: true, skipPageProgress: true, silent: true })
+            );
+          }
+          return Promise.all(loaders);
+        })
         .then(function () {
           if (IS_FILE_SIGN_PAGE) {
-            return refreshFileList({ softFail: true, skipPageProgress: true })
-              .then(function () {
-                if (savedFiles.length) {
-                  enableBatchWorkbenchMode();
-                  mergeBatchWorkbenchRowsFromSavedFiles();
-                  return hydrateFileCachesFromServer();
-                }
+            if (savedFiles.length) {
+              enableBatchWorkbenchMode();
+              mergeBatchWorkbenchRowsFromSavedFiles();
+              syncHiddenBatchPicks();
+              _refreshWorkbenchSlotFilterOptions();
+              renderBatchWorkbenchTable();
+              setBatchWorkbenchMsg('文件列表已就绪，正在后台恢复识别缓存…', false);
+              hydrateFileCachesFromServer({
+                onProgress: function (done, total) {
+                  if (total > 0 && done < total && done % 24 === 0) {
+                    setBatchWorkbenchMsg(
+                      '正在恢复识别缓存 ' + done + '/' + total + '…',
+                      false
+                    );
+                  }
+                },
               })
-              .then(function () {
-                syncHiddenBatchPicks();
-                renderBatchWorkbenchTable();
-                refreshSignedList({ skipPageProgress: true });
-                syncLibraryRolesModeRow();
-                updateSubmitState();
-              });
+                .then(function () {
+                  setBatchWorkbenchMsg('', false);
+                })
+                .catch(function () {
+                  setBatchWorkbenchMsg('', false);
+                });
+            } else {
+              syncHiddenBatchPicks();
+              renderBatchWorkbenchTable();
+            }
+            refreshSignedList({ skipPageProgress: true });
+            syncLibraryRolesModeRow();
+            updateSubmitState();
           }
+          endPageProgress();
           return _bootAfterSigners();
+        })
+        .catch(function () {
+          endPageProgress();
         });
     }
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sign_handlers.config import ROLE_ID_TO_KEYWORD, canonical_sign_role_id, role_keywords
+from sign_handlers.docx_revision_text import cell_effective_text, paragraph_effective_text
 from sign_handlers.label_match import cell_text_matches_keyword, xlsx_cell_has_leading_role_keyword
 
 _DATE_TOKENS = (
@@ -410,7 +411,7 @@ def _apply_docx_table_triad_boost(doc, role_ids_found: Dict[str, float]) -> None
         ids: set = set()
         for row in table.rows:
             for cell in row.cells:
-                ids.update(_cell_role_ids_multiline(_norm(cell.text or "")))
+                ids.update(_cell_role_ids_multiline(_norm(cell_effective_text(cell) or "")))
         hit = ids & core
         if not hit:
             continue
@@ -649,7 +650,7 @@ def _harvest_roles_docx_tables(doc) -> Dict[str, float]:
     for table in _iter_docx_tables_for_detect(doc):
         for row in table.rows:
             for cell in row.cells:
-                s = _norm(cell.text or "")
+                s = _norm(cell_effective_text(cell) or "")
                 if not s or len(s) > 120:
                     continue
                 for rid in _cell_role_ids_multiline(s):
@@ -666,7 +667,7 @@ def _harvest_roles_docx_headers_footers(doc) -> Dict[str, float]:
                 if hf is None:
                     continue
                 for p in hf.paragraphs:
-                    t = _norm(p.text or "")
+                    t = _norm(paragraph_effective_text(p) or "")
                     if not t:
                         continue
                     for rid in _paragraph_role_ids(t):
@@ -674,7 +675,7 @@ def _harvest_roles_docx_headers_footers(doc) -> Dict[str, float]:
                 for table in hf.tables:
                     for row in table.rows:
                         for cell in row.cells:
-                            s = _norm(cell.text or "")
+                            s = _norm(cell_effective_text(cell) or "")
                             if not s or len(s) > 120:
                                 continue
                             for rid in _cell_role_ids_multiline(s):
@@ -687,6 +688,9 @@ def _harvest_roles_docx_headers_footers(doc) -> Dict[str, float]:
 def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -> dict:
     from docx import Document
 
+    from sign_handlers.docx_revision_text import docx_has_track_changes
+
+    has_rev = docx_has_track_changes(path)
     doc = Document(path)
     if light:
         max_paragraphs = min(max_paragraphs, 300)
@@ -725,10 +729,10 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
     for ti, table in enumerate(tables_for_detect):
         rows_list = list(table.rows)
         for ri, row in enumerate(rows_list):
-            texts = [_norm(c.text or "") for c in row.cells]
+            texts = [_norm(cell_effective_text(c) or "") for c in row.cells]
             joined = " | ".join(t for t in texts if t)
             if ri + 1 < len(rows_list):
-                texts_next = [_norm(c.text or "") for c in rows_list[ri + 1].cells]
+                texts_next = [_norm(cell_effective_text(c) or "") for c in rows_list[ri + 1].cells]
                 joined_next = " | ".join(t for t in texts_next if t)
                 if joined_next:
                     joined = (joined + " | " + joined_next) if joined else joined_next
@@ -795,7 +799,7 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
     if light and _docx_has_core_triad(role_ids_found):
         para_cap = 0
     for pi, p in enumerate(doc.paragraphs[:para_cap]):
-        t = _norm(p.text or "")
+        t = _norm(paragraph_effective_text(p) or "")
         if not t:
             continue
         if not _paragraph_might_have_role(t):
@@ -840,6 +844,8 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
     role_ev = _compact_role_evidence(role_evidence)
     debug_summary = {
         "kind": "docx",
+        "track_changes_present": bool(has_rev),
+        "text_mode": "revision_accepted_ooxml",
         "light_scan": bool(light),
         "tables_scanned": len(tables_for_detect),
         "total_blocks": len(blocks),
@@ -866,17 +872,7 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
 def detect_file(path: str, source_name: str = "", mode: str = "auto") -> dict:
     ext = os.path.splitext(path)[1].lower()
     light = mode == "light"
-    if mode == "auto" and source_name:
-        try:
-            from sign_handlers.sign_document_role_rules import match_document_role_rule
-
-            rule = match_document_role_rule(source_name)
-            if rule and (rule.get("roles") or []) == []:
-                light = True
-            elif rule and rule.get("roles"):
-                light = True
-        except Exception:
-            pass
+    # 规则/标误只作为提示，不以其结论替代真实识别；auto 模式保持正常扫描深度。
     if ext == ".xlsx":
         return detect_xlsx(path)
     if ext == ".docx":

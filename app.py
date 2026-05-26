@@ -2485,6 +2485,7 @@ SIGN_SOURCE_DOC_EXT = SIGN_WORD_SOURCE_EXT | SIGN_EXCEL_SOURCE_EXT
 SIGN_ARCHIVE_ALLOWED_EXT = {".zip", ".7z", ".rar"}
 SIGN_UPLOAD_ALLOWED_EXT = SIGN_SOURCE_DOC_EXT | SIGN_ARCHIVE_ALLOWED_EXT
 SIGN_INBOX_ROOT = os.path.join(ROOT, "data", "sign_inbox")
+SIGN_DETECT_CORRECTIONS_ROOT = os.path.join(ROOT, "data", "sign_detect_corrections")
 SIGN_MAX_SAVED_FILES = 50
 _SIGN_FILE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -2513,6 +2514,152 @@ def _sign_ensure_session_inbox():
 
 def _sign_saved_disk_path(sid: str, file_id: str, ext: str) -> str:
     return os.path.join(SIGN_INBOX_ROOT, sid, file_id + ext.lower())
+
+
+def _parse_detect_correction_image_upload():
+    """解析参考图上传请求，返回 (blob, ext, display_name) 或 (None, error_msg)。"""
+    f = request.files.get("file") or request.files.get("image")
+    if not f or not getattr(f, "filename", None):
+        return None, None, None, "未选择图片"
+    raw_name = os.path.basename(str(f.filename).replace("\\", "/"))
+    ext = os.path.splitext(raw_name)[1].lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".webp"}:
+        return None, None, None, "仅支持 PNG/JPEG/WebP"
+    blob = f.read()
+    if not blob:
+        return None, None, None, "空文件"
+    if len(blob) > 2 * 1024 * 1024:
+        return None, None, None, "单张图片不能超过 2MB"
+    return blob, ext, raw_name, None
+
+
+def _get_file_detect_correction(file_id: str) -> dict:
+    from sign_handlers.file_session_cache import trim_detect_correction
+
+    if _sign_using_mysql():
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        data = mysql_store.get_file_detect_correction(file_id)
+    else:
+        _sign_ensure_session_inbox()
+        sid = session["sign_inbox_sid"]
+        from sign_handlers.sign_library_local import get_file_detect_correction as local_get
+
+        data = local_get(SIGN_INBOX_ROOT, sid, file_id)
+    return trim_detect_correction(data) if data else {}
+
+
+def _get_sign_file_source_name(file_id: str) -> str:
+    """待签文件展示名（用于规则 pattern 推断）。"""
+    if _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            row = mysql_store.get_file_row(file_id)
+            if row:
+                return str(row.get("name") or "").strip()
+        except Exception:
+            pass
+    else:
+        try:
+            _sign_ensure_session_inbox()
+            rec = _sign_find_record(file_id)
+            if rec:
+                return str(rec.get("name") or "").strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _sync_detect_correction_to_rules(
+    file_id: str, correction: dict, *, export_md: bool = False
+) -> dict:
+    """将标误登记同步到角色/签字位规则 JSON；MD 导出由调用方批量合并触发。"""
+    try:
+        from sign_handlers.detect_correction_rules import sync_rules_from_correction
+
+        src = _get_sign_file_source_name(file_id)
+        if not src:
+            return {"ok": False, "error": "无法获取文件名"}
+        return sync_rules_from_correction(src, correction, export_md=export_md)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _export_detect_correction_markdown_after_sync(corrections: list) -> dict:
+    """标误保存后至多导出一次角色/签字位 MD，避免每条登记启子进程卡住请求。"""
+    need_role_md = False
+    need_slot_md = False
+    for corr in corrections or []:
+        if not isinstance(corr, dict):
+            continue
+        scopes = (
+            corr.get("correction_save")
+            if isinstance(corr.get("correction_save"), dict)
+            else {}
+        )
+        save_roles = scopes.get("roles", True) if scopes else True
+        save_slot = scopes.get("slot", True) if scopes else True
+        wrong = str(corr.get("wrong_description") or "").strip()
+        esl = corr.get("expected_slot_layout")
+        has_slot = isinstance(esl, dict) and bool(esl)
+        if save_roles and wrong:
+            need_role_md = True
+        if save_slot and (has_slot or wrong):
+            need_slot_md = True
+    if not need_role_md and not need_slot_md:
+        return {"skipped": True}
+    out: dict = {}
+
+    def _run_exports() -> None:
+        if need_role_md:
+            try:
+                from sign_handlers.detect_correction_rules import export_rules_markdown
+
+                out["role_md"] = export_rules_markdown()
+            except Exception as e:
+                out["role_md"] = {"ok": False, "error": str(e)[:500]}
+        if need_slot_md:
+            try:
+                from sign_handlers.detect_correction_slot_rules import (
+                    export_slot_layout_markdown,
+                )
+
+                out["slot_md"] = export_slot_layout_markdown()
+            except Exception as e:
+                out["slot_md"] = {"ok": False, "error": str(e)[:500]}
+
+    skip_bg = (os.environ.get("SIGN_DETECT_CORRECTION_EXPORT_MD_SYNC") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if skip_bg:
+        _run_exports()
+        return out
+    import threading
+
+    threading.Thread(target=_run_exports, daemon=True).start()
+    return {"async": True, "need_role_md": need_role_md, "need_slot_md": need_slot_md}
+
+
+def _set_file_detect_correction(file_id: str, correction: dict) -> None:
+    from sign_handlers.file_session_cache import trim_detect_correction
+
+    payload = trim_detect_correction(correction)
+    if _sign_using_mysql():
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        mysql_store.set_file_detect_correction(file_id, payload)
+    else:
+        _sign_ensure_session_inbox()
+        sid = session["sign_inbox_sid"]
+        from sign_handlers.sign_library_local import set_file_detect_correction as local_set
+
+        local_set(SIGN_INBOX_ROOT, sid, file_id, payload)
 
 
 def _sign_upload_display_name(client_filename, allowed_exts=None):
@@ -2927,6 +3074,260 @@ def _decode_png_data_url_or_b64(s):
             return None
 
 
+def _keywords_from_label_preview(text, max_items=6):
+    t = str(text or "").strip()
+    if not t:
+        return []
+    out = []
+    seen = set()
+    for part in re.split(r"[|｜/:：,，;；\s]+", t):
+        p = str(part or "").strip()
+        if not p:
+            continue
+        if len(p) < 2 or len(p) > 24:
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _layout_loc_to_source_hints(loc_text):
+    """把 signature_layout 的 name_loc/date_loc 统一映射为 sign_engine 可消费的 row hint。"""
+    s = str(loc_text or "").strip()
+    if not s:
+        return []
+    out = []
+    # docx: table#2.r10.c1 -> table2.row10
+    m = re.match(r"^\s*table#?(\d+)\.r(\d+)\.c\d+\s*$", s, re.IGNORECASE)
+    if m:
+        out.append(f"table{int(m.group(1))}.row{int(m.group(2))}")
+    # docx: paragraph#5 -> paragraph5
+    m = re.match(r"^\s*paragraph#?(\d+)\s*$", s, re.IGNORECASE)
+    if m:
+        out.append(f"paragraph{int(m.group(1))}")
+    # xlsx: sheet1!r20.c3 -> sheet1.row20
+    m = re.match(r"^\s*sheet(\d+)!\s*r(\d+)\.c\d+\s*$", s, re.IGNORECASE)
+    if m:
+        out.append(f"sheet{int(m.group(1))}.row{int(m.group(2))}")
+    # 兜底：已有提示格式直接透传
+    if re.match(r"^\s*(?:sheet\d+|table\d+)\.row\d+\s*$", s, re.IGNORECASE):
+        out.append(s)
+    uniq = []
+    seen = set()
+    for h in out:
+        if h in seen:
+            continue
+        seen.add(h)
+        uniq.append(h)
+    return uniq
+
+
+def _layout_to_plan_types(layout_item):
+    """把 signature_layout 的关系字段映射为落位策略标签。"""
+    if not isinstance(layout_item, dict):
+        return []
+    rel = str(layout_item.get("date_relation") or "").strip()
+    pos = str(layout_item.get("date_position") or "").strip()
+    out = []
+    if rel == "same_cell":
+        out.append("same_cell_inline")
+    if rel == "different_cell" and pos == "right":
+        out.append("adjacent_right_cell")
+    if pos == "below":
+        out.append("below_cell")
+    return out
+
+
+def _build_placement_plan_from_detect(det, role_ids):
+    """
+    从 detect snapshot 提取“角色落位提示关键词”。
+    只做弱约束提示：签字引擎优先使用这些关键词，但仍保留兜底关键词扫描。
+    """
+    plan = {}
+    if not isinstance(det, dict):
+        return plan
+    role_ev = det.get("role_evidence") if isinstance(det.get("role_evidence"), dict) else {}
+    sl = det.get("signature_layout") if isinstance(det.get("signature_layout"), dict) else {}
+    sl_roles = sl.get("role_layouts") if isinstance(sl.get("role_layouts"), dict) else {}
+    for rid in role_ids or []:
+        rid_s = str(rid or "").strip()
+        if not rid_s:
+            continue
+        arr = role_ev.get(rid_s)
+        kws = []
+        hints = []
+        layout_types = []
+        if isinstance(arr, list):
+            for ev in arr[:5]:
+                if not isinstance(ev, dict):
+                    continue
+                kws.extend(_keywords_from_label_preview(ev.get("label_preview") or ""))
+                sh = str(ev.get("source_hint") or "").strip()
+                if sh:
+                    hints.append(sh)
+                sf = str(ev.get("slot_form") or ev.get("layout_form") or "").strip()
+                if "两行签批表" in sf:
+                    layout_types.append("two_row_signoff_table")
+                elif ("同字段" in sf) and ("占位" in sf):
+                    layout_types.append("same_cell_inline")
+                elif ("右侧" in sf) and ("单元格" in sf):
+                    layout_types.append("adjacent_right_cell")
+        if not kws and isinstance(det.get("blocks"), list):
+            for b in det.get("blocks")[:20]:
+                if not isinstance(b, dict):
+                    continue
+                fields = b.get("fields") if isinstance(b.get("fields"), list) else []
+                has_role = False
+                for f in fields:
+                    if not isinstance(f, dict):
+                        continue
+                    if str(f.get("type") or "") == "role_id" and str(f.get("name") or "") == rid_s:
+                        has_role = True
+                        break
+                if not has_role:
+                    continue
+                kws.extend(_keywords_from_label_preview(b.get("label_preview") or ""))
+                sh = str(b.get("source_hint") or "").strip()
+                if sh:
+                    hints.append(sh)
+                sf = str(b.get("slot_form") or b.get("layout_form") or "").strip()
+                if "两行签批表" in sf:
+                    layout_types.append("two_row_signoff_table")
+                elif ("同字段" in sf) and ("占位" in sf):
+                    layout_types.append("same_cell_inline")
+                elif ("右侧" in sf) and ("单元格" in sf):
+                    layout_types.append("adjacent_right_cell")
+                if len(kws) >= 8:
+                    break
+        if kws or hints or layout_types:
+            uniq = []
+            seen = set()
+            for kw in kws:
+                if kw in seen:
+                    continue
+                seen.add(kw)
+                uniq.append(kw)
+                if len(uniq) >= 8:
+                    break
+            huniq = []
+            hseen = set()
+            for h in hints:
+                if h in hseen:
+                    continue
+                hseen.add(h)
+                huniq.append(h)
+                if len(huniq) >= 12:
+                    break
+            lt_uniq = []
+            lt_seen = set()
+            for lt in layout_types:
+                if lt in lt_seen:
+                    continue
+                lt_seen.add(lt)
+                lt_uniq.append(lt)
+            plan[rid_s] = {"keywords": uniq, "source_hints": huniq, "layout_types": lt_uniq}
+        # 追加 signature_layout 的角色级提示，避免“版式识别对了但落位仍找不到”。
+        li = sl_roles.get(rid_s) if isinstance(sl_roles, dict) else None
+        if isinstance(li, dict):
+            p = plan.get(rid_s) if isinstance(plan.get(rid_s), dict) else {}
+            p_kws = list(p.get("keywords") or [])
+            p_hints = list(p.get("source_hints") or [])
+            p_lts = list(p.get("layout_types") or [])
+            for lk in _keywords_from_label_preview(li.get("label_preview") or ""):
+                if lk not in p_kws:
+                    p_kws.append(lk)
+            for loc_key in ("name_loc", "date_loc"):
+                for hh in _layout_loc_to_source_hints(li.get(loc_key) or ""):
+                    if hh not in p_hints:
+                        p_hints.append(hh)
+            for lt in _layout_to_plan_types(li):
+                if lt not in p_lts:
+                    p_lts.append(lt)
+            if p_kws or p_hints or p_lts:
+                plan[rid_s] = {
+                    "keywords": p_kws[:8],
+                    "source_hints": p_hints[:12],
+                    "layout_types": p_lts[:6],
+                }
+    return plan
+
+
+_SLOT_PROBE_DUMMY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
+
+
+def _probe_detect_slot_placement(
+    file_bytes: bytes,
+    ext: str,
+    base_name: str,
+    role_ids: list,
+    placement_plan: Optional[dict] = None,
+) -> dict:
+    """
+    用最小 PNG 对已识别角色做“可落位”探测：
+    - 不写入 signed_output
+    - 仅验证 sign_engine 能否在对应签字位完成落位
+    """
+    role_ids = [str(x or "").strip() for x in (role_ids or []) if str(x or "").strip()]
+    if not role_ids:
+        return {"ok": False, "error": "未识别到需签角色", "missing_roles": []}
+    try:
+        dummy_png = base64.b64decode(_SLOT_PROBE_DUMMY_PNG_B64)
+    except Exception:
+        return {"ok": False, "error": "构造签字位探测素材失败", "missing_roles": role_ids}
+
+    from sign_handlers import sign_document
+
+    sig_map = {rid: dummy_png for rid in role_ids}
+    date_map = {rid: dummy_png for rid in role_ids}
+    placement_result = {}
+    tmp_dir = tempfile.mkdtemp(prefix="aiprintword_slot_probe_")
+    try:
+        safe_in_name = secure_filename(os.path.basename(base_name or "")) or ("document" + ext)
+        if not safe_in_name.lower().endswith(ext):
+            safe_in_name = os.path.splitext(safe_in_name)[0] + ext
+        in_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex[:8]}_{safe_in_name}")
+        with open(in_path, "wb") as fp:
+            fp.write(file_bytes)
+        sign_document(
+            in_path,
+            sig_map,
+            date_map,
+            placement_plan=placement_plan,
+            placement_result=placement_result,
+        )
+        missing = []
+        for rid in role_ids:
+            one = placement_result.get(rid) if isinstance(placement_result, dict) else None
+            if not (isinstance(one, dict) and one.get("placed")):
+                missing.append(rid)
+        return {
+            "ok": not missing,
+            "error": "" if not missing else ("以下角色未找到可落位签字位：" + "、".join(missing)),
+            "missing_roles": missing,
+            "active_roles": role_ids,
+            "per_role_results": placement_result,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"签字位可落位探测失败: {e}",
+            "missing_roles": role_ids,
+            "active_roles": role_ids,
+            "per_role_results": placement_result,
+        }
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _sign_process_document_bytes(
     file_bytes: bytes,
     ext: str,
@@ -2936,6 +3337,8 @@ def _sign_process_document_bytes(
     date_map: dict,
     source_file_id: Optional[str],
     batch_id: Optional[str] = None,
+    placement_plan: Optional[dict] = None,
+    require_role_placement: bool = False,
 ) -> dict:
     """生成已签名文档字节；MySQL 模式下同时写入 sign_signed_output。返回 dict 含 ok / error / out_bytes 等。"""
     tmp_dir = tempfile.mkdtemp(prefix="aiprintword_sign_")
@@ -2949,10 +3352,41 @@ def _sign_process_document_bytes(
             fp.write(file_bytes)
         from sign_handlers import sign_document
 
-        out_path = sign_document(in_path, sig_map, date_map)
+        placement_result = {}
+        out_path = sign_document(
+            in_path,
+            sig_map,
+            date_map,
+            placement_plan=placement_plan,
+            placement_result=placement_result,
+        )
         dl_name = os.path.splitext(os.path.basename(base_name or "document"))[0] + "_signed" + ext
         with open(out_path, "rb") as fp:
             out_bytes = fp.read()
+        missing_roles = []
+        active_roles = []
+        fallback_roles = []
+        for rid in roles or []:
+            rid_s = str(rid or "").strip()
+            if not rid_s:
+                continue
+            if (rid_s not in sig_map) and (rid_s not in date_map):
+                continue
+            active_roles.append(rid_s)
+            one = placement_result.get(rid_s) if isinstance(placement_result, dict) else None
+            if not (isinstance(one, dict) and one.get("placed")):
+                missing_roles.append(rid_s)
+            elif str(one.get("placed_by") or "") == "fallback_keywords":
+                fallback_roles.append(rid_s)
+        if require_role_placement and missing_roles:
+            return {
+                "ok": False,
+                "error": "以下角色未找到可落位签字位：" + "、".join(missing_roles),
+                "per_role_results": placement_result,
+                "missing_roles": missing_roles,
+                "active_roles": active_roles,
+                "fallback_roles": fallback_roles,
+            }
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
@@ -2984,6 +3418,10 @@ def _sign_process_document_bytes(
             "out_bytes": out_bytes,
             "dl_name": dl_name,
             "signed_id": signed_row_id,
+            "per_role_results": placement_result,
+            "missing_roles": missing_roles,
+            "active_roles": active_roles,
+            "fallback_roles": fallback_roles,
         }
     except Exception as e:
         if tmp_dir and os.path.isdir(tmp_dir):
@@ -3650,6 +4088,7 @@ def api_sign_file_cache_put(file_id):
     data = request.get_json(silent=True) or {}
     detect = data.get("detect")
     workbench = data.get("workbench")
+    detect_correction = data.get("detect_correction")
     try:
         if _sign_using_mysql():
             from sign_handlers import mysql_store
@@ -3659,21 +4098,239 @@ def api_sign_file_cache_put(file_id):
                 mysql_store.set_file_detect_snapshot(file_id, detect)
             if isinstance(workbench, dict):
                 mysql_store.set_file_workbench_state(file_id, workbench)
+            if isinstance(detect_correction, dict):
+                mysql_store.set_file_detect_correction(file_id, detect_correction)
         else:
             _sign_ensure_session_inbox()
             sid = session["sign_inbox_sid"]
             from sign_handlers.sign_library_local import (
                 set_file_detect_snapshot as local_set_detect,
                 set_file_workbench_state as local_set_wb,
+                set_file_detect_correction as local_set_corr,
             )
 
             if isinstance(detect, dict):
                 local_set_detect(SIGN_INBOX_ROOT, sid, file_id, detect)
             if isinstance(workbench, dict):
                 local_set_wb(SIGN_INBOX_ROOT, sid, file_id, workbench)
+            if isinstance(detect_correction, dict):
+                local_set_corr(SIGN_INBOX_ROOT, sid, file_id, detect_correction)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/files/<file_id>/detect-correction", methods=["GET", "PUT"])
+def api_sign_file_detect_correction(file_id):
+    """读取/保存人工识别纠正登记（错在哪、正确角色、标签提示、参考图元数据）。"""
+    if not _SIGN_FILE_ID_RE.match(file_id or ""):
+        return jsonify({"ok": False, "error": "无效的文件 id"}), 400
+    if request.method == "GET":
+        return jsonify({"ok": True, "correction": _get_file_detect_correction(file_id)})
+    data = request.get_json(silent=True) or {}
+    correction = data.get("correction")
+    if not isinstance(correction, dict):
+        return jsonify({"ok": False, "error": "缺少 correction 对象"}), 400
+    try:
+        from datetime import datetime, timezone
+
+        correction = dict(correction)
+        correction["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _set_file_detect_correction(file_id, correction)
+        from sign_handlers.file_session_cache import trim_detect_correction
+
+        rule_sync = _sync_detect_correction_to_rules(file_id, correction, export_md=False)
+        md_export = _export_detect_correction_markdown_after_sync([correction])
+        return jsonify(
+            {
+                "ok": True,
+                "correction": trim_detect_correction(correction),
+                "rule_sync": rule_sync,
+                "md_export": md_export,
+            }
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/files/detect-correction/batch", methods=["PUT"])
+def api_sign_detect_correction_batch():
+    """批量保存识别纠正登记（单次请求，避免前端逐条 PUT 超时）。"""
+    data = request.get_json(silent=True) or {}
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False, "error": "缺少 items 数组"}), 400
+    if len(items) > 500:
+        return jsonify({"ok": False, "error": "单次最多登记 500 个文件"}), 400
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    ok_ids = []
+    failed = []
+    batch_pairs = []
+    for it in items:
+        if not isinstance(it, dict):
+            failed.append({"file_id": "", "error": "条目格式无效"})
+            continue
+        fid = str(it.get("file_id") or "").strip()
+        corr = it.get("correction")
+        if not _SIGN_FILE_ID_RE.match(fid):
+            failed.append({"file_id": fid, "error": "无效的文件 id"})
+            continue
+        if not isinstance(corr, dict):
+            failed.append({"file_id": fid, "error": "缺少 correction"})
+            continue
+        payload = dict(corr)
+        payload["updated_at"] = ts
+        batch_pairs.append((fid, payload))
+        ok_ids.append(fid)
+    if batch_pairs:
+        try:
+            if _sign_using_mysql():
+                from sign_handlers import mysql_store
+
+                mysql_store.ensure_sign_mysql()
+                mysql_store.set_file_detect_correction_batch(batch_pairs)
+            else:
+                for fid, payload in batch_pairs:
+                    _set_file_detect_correction(fid, payload)
+        except Exception as e:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "批量写入失败：" + str(e),
+                    "ok_count": 0,
+                    "fail_count": len(batch_pairs),
+                }
+            ), 500
+    rule_syncs = []
+    for fid, payload in batch_pairs:
+        rs = _sync_detect_correction_to_rules(fid, payload, export_md=False)
+        rs["file_id"] = fid
+        rule_syncs.append(rs)
+    md_export = _export_detect_correction_markdown_after_sync(
+        [p for _fid, p in batch_pairs]
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "ok_count": len(ok_ids),
+            "fail_count": len(failed),
+            "ok_ids": ok_ids,
+            "failed": failed[:50],
+            "rule_syncs": rule_syncs[:50],
+            "md_export": md_export,
+        }
+    )
+
+
+@app.route("/api/sign/detect-correction/reference-image", methods=["POST"])
+def api_sign_detect_correction_image_upload_shared():
+    """上传共享参考图（FTP），供批量登记时多条记录共用同一 ftp_path。"""
+    blob, ext, raw_name, err = _parse_detect_correction_image_upload()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        from sign_handlers.detect_correction_storage import upload_reference_image_bytes
+
+        meta = upload_reference_image_bytes(
+            blob, ext, shared=True, filename=raw_name
+        )
+        return jsonify({"ok": True, "image": meta})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route(
+    "/api/sign/files/<file_id>/detect-correction/reference-image",
+    methods=["POST"],
+)
+def api_sign_file_detect_correction_image_upload(file_id):
+    """上传「正确签批样式」参考截图至 FTP（PNG/JPEG/WebP，单张≤2MB，每文件最多6张）。"""
+    if not _SIGN_FILE_ID_RE.match(file_id or ""):
+        return jsonify({"ok": False, "error": "无效的文件 id"}), 400
+    blob, ext, raw_name, err = _parse_detect_correction_image_upload()
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        from datetime import datetime, timezone
+        from sign_handlers.detect_correction_storage import upload_reference_image_bytes
+
+        corr = _get_file_detect_correction(file_id)
+        imgs = list(corr.get("reference_images") or [])
+        if len(imgs) >= 6:
+            return jsonify({"ok": False, "error": "每文件最多保存 6 张参考图"}), 400
+        meta = upload_reference_image_bytes(
+            blob, ext, file_id=file_id, shared=False, filename=raw_name
+        )
+        imgs.append(meta)
+        corr["reference_images"] = imgs
+        corr["updated_at"] = meta.get("uploaded_at") or datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _set_file_detect_correction(file_id, corr)
+        return jsonify({"ok": True, "image": meta})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route(
+    "/api/sign/files/<file_id>/detect-correction/reference-image/<image_id>",
+    methods=["GET", "DELETE"],
+)
+def api_sign_file_detect_correction_image(file_id, image_id):
+    if not _SIGN_FILE_ID_RE.match(file_id or ""):
+        return jsonify({"ok": False, "error": "无效的文件 id"}), 400
+    if not re.match(r"^[0-9a-f]{8,32}$", str(image_id or "")):
+        return jsonify({"ok": False, "error": "无效的图片 id"}), 400
+    corr = _get_file_detect_correction(file_id)
+    meta = None
+    for x in corr.get("reference_images") or []:
+        if str(x.get("id") or "") == image_id:
+            meta = x
+            break
+    if request.method == "DELETE":
+        try:
+            from sign_handlers.detect_correction_storage import (
+                delete_reference_image_on_ftp,
+            )
+
+            if meta:
+                delete_reference_image_on_ftp(meta, file_id=file_id)
+            imgs = [
+                x
+                for x in (corr.get("reference_images") or [])
+                if str(x.get("id") or "") != image_id
+            ]
+            corr["reference_images"] = imgs
+            _set_file_detect_correction(file_id, corr)
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    if meta and str(meta.get("ftp_path") or "").strip():
+        try:
+            from sign_handlers.detect_correction_storage import (
+                download_reference_image,
+            )
+
+            data, mime = download_reference_image(meta)
+            return Response(data, mimetype=mime)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 404
+    from sign_handlers.detect_correction_storage import legacy_local_path
+
+    legacy = legacy_local_path(SIGN_DETECT_CORRECTIONS_ROOT, file_id, image_id)
+    if legacy and os.path.isfile(legacy):
+        mime = "image/png"
+        if legacy.endswith(".jpg") or legacy.endswith(".jpeg"):
+            mime = "image/jpeg"
+        elif legacy.endswith(".webp"):
+            mime = "image/webp"
+        return send_from_directory(
+            os.path.dirname(legacy), os.path.basename(legacy), mimetype=mime
+        )
+    return jsonify({"ok": False, "error": "图片不存在"}), 404
 
 
 @app.route("/api/sign/files", methods=["GET"])
@@ -4025,10 +4682,23 @@ def api_sign_detect():
             result = dict(result)
             result["file_id"] = file_id
             result["source_name"] = src_name
+            correction = _get_file_detect_correction(file_id)
+            _corr_wrong = str((correction or {}).get("wrong_description") or "").strip()
+            _corr_slot = (correction or {}).get("expected_slot_layout")
+            _corr_has_slot = isinstance(_corr_slot, dict) and bool(_corr_slot)
             try:
                 from sign_handlers.sign_document_role_rules import apply_document_role_rules
 
                 result = apply_document_role_rules(result, src_name)
+            except Exception:
+                pass
+            try:
+                from sign_handlers.detect_correction import apply_detect_correction
+
+                if correction:
+                    result = apply_detect_correction(
+                        result, correction, source_name=src_name
+                    )
             except Exception:
                 pass
             blob_for_hash = mysql_blob
@@ -4042,6 +4712,61 @@ def api_sign_detect():
                 import hashlib
 
                 result["content_sha256"] = hashlib.sha256(blob_for_hash).hexdigest()
+            if result.get("ok"):
+                try:
+                    from sign_handlers import ROLE_ID_TO_KEYWORD
+
+                    role_ids = []
+                    seen = set()
+                    for rr in (result.get("roles") or []):
+                        if not isinstance(rr, dict):
+                            continue
+                        rid = str(rr.get("id") or "").strip()
+                        if not rid or rid in seen or rid not in ROLE_ID_TO_KEYWORD:
+                            continue
+                        seen.add(rid)
+                        role_ids.append(rid)
+                    if role_ids:
+                        detect_ext = str(os.path.splitext(in_path)[1] or ext or "").lower()
+                        kind = str(result.get("kind") or "").lower()
+                        if kind == "docx":
+                            detect_ext = ".docx"
+                        elif kind == "xlsx":
+                            detect_ext = ".xlsx"
+                        if detect_ext not in (".docx", ".xlsx"):
+                            detect_ext = ".docx" if ext in (".doc", ".docx") else ".xlsx"
+                        probe_bytes = blob_for_hash
+                        if not isinstance(probe_bytes, (bytes, bytearray)):
+                            with open(in_path, "rb") as pf:
+                                probe_bytes = pf.read()
+                        probe_plan = _build_placement_plan_from_detect(result, role_ids)
+                        result["slot_probe"] = _probe_detect_slot_placement(
+                            bytes(probe_bytes),
+                            detect_ext,
+                            src_name or (file_id + detect_ext),
+                            role_ids,
+                            placement_plan=probe_plan,
+                        )
+                        try:
+                            from sign_handlers.signature_layout import (
+                                analyze_signature_layout,
+                            )
+
+                            layout_info = analyze_signature_layout(
+                                in_path,
+                                detect_ext,
+                                role_ids,
+                                source_name=src_name or "",
+                            )
+                            result["signature_layout"] = layout_info
+                        except Exception as _layout_exc:
+                            result["signature_layout"] = {
+                                "ok": False,
+                                "error": str(_layout_exc),
+                                "role_layouts": {},
+                            }
+                except Exception:
+                    pass
             if result.get("ok"):
                 try:
                     if _sign_using_mysql():
@@ -4408,6 +5133,16 @@ def api_sign():
             if not base_name.lower().endswith(ext):
                 base_name = base_name + ext
 
+    placement_plan = None
+    if file_id and _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            det = mysql_store.get_file_detect_snapshot(file_id)
+            placement_plan = _build_placement_plan_from_detect(det or {}, roles)
+        except Exception:
+            placement_plan = None
+
     res = _sign_process_document_bytes(
         file_bytes,
         ext,
@@ -4417,6 +5152,8 @@ def api_sign():
         date_map,
         file_id or None,
         batch_id=uuid.uuid4().hex,
+        placement_plan=placement_plan,
+        require_role_placement=False,
     )
     if not res.get("ok"):
         return jsonify({"ok": False, "error": res.get("error", "失败")}), 500
@@ -4491,17 +5228,31 @@ def _mysql_api_error_message(exc: Exception) -> str:
 def api_sign_signers_list():
     """签署人库列表（MySQL 多机共享；否则存于当前会话目录）。"""
     brief = (request.args.get("brief") or "").strip().lower() in ("1", "true", "yes")
+    compact = (request.args.get("compact") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     try:
         if _sign_using_mysql():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            rows = (
-                mysql_store.list_signers_brief()
-                if brief
-                else mysql_store.list_signers()
+            if brief:
+                rows = mysql_store.list_signers_brief()
+            elif compact:
+                rows = mysql_store.list_signers_compact()
+            else:
+                rows = mysql_store.list_signers()
+            return jsonify(
+                {
+                    "ok": True,
+                    "db_share": True,
+                    "brief": brief,
+                    "compact": compact,
+                    "signers": rows,
+                }
             )
-            return jsonify({"ok": True, "db_share": True, "brief": brief, "signers": rows})
         _sign_ensure_session_inbox()
         sid = session["sign_inbox_sid"]
         from sign_handlers.sign_library_local import list_signers as local_list_signers
@@ -5252,6 +6003,8 @@ def api_sign_batch():
                     }
                 )
                 continue
+            det_snapshot = mysql_store.get_file_detect_snapshot(fid) or {}
+            placement_plan = _build_placement_plan_from_detect(det_snapshot, roles)
             res = _sign_process_document_bytes(
                 row["file_data"],
                 ext,
@@ -5261,6 +6014,8 @@ def api_sign_batch():
                 date_map,
                 fid,
                 batch_id=batch_id,
+                placement_plan=placement_plan,
+                require_role_placement=True,
             )
             if not res.get("ok"):
                 results.append(
@@ -5270,6 +6025,9 @@ def api_sign_batch():
                         "error": res.get("error", "失败"),
                         "applied_n": len(applied),
                         "skipped_n": len(skipped),
+                        "missing_roles": res.get("missing_roles") or [],
+                        "fallback_roles": res.get("fallback_roles") or [],
+                        "per_role_results": res.get("per_role_results") or {},
                     }
                 )
             else:
@@ -5301,6 +6059,9 @@ def api_sign_batch():
                         "skipped_n": len(skipped),
                         "applied": ap_txt[:1200],
                         "skipped": sk_txt[:1200],
+                        "missing_roles": res.get("missing_roles") or [],
+                        "fallback_roles": res.get("fallback_roles") or [],
+                        "per_role_results": res.get("per_role_results") or {},
                     }
                 )
         except Exception as e:

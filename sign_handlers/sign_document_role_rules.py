@@ -142,70 +142,49 @@ def _filter_blocks_by_roles(blocks: Any, allowed_roles: List[str]) -> List[Dict[
 
 
 def apply_document_role_rules(result: Dict[str, Any], source_name: str) -> Dict[str, Any]:
-    """按文件名规则修正文档角色；人工维护规则命中后以规则为准。"""
+    """按文件名规则补充识别提示；不覆盖文档实识别结果。"""
     if not isinstance(result, dict):
         return result
     rule = match_document_role_rule(source_name)
     if not rule:
         return result
     roles_from_rule = [r for r in (rule.get("roles") or []) if r in ROLE_ID_TO_KEYWORD]
+    result = dict(result)
     result["document_role_rule"] = {
         "matched": True,
         "pattern": rule.get("pattern"),
         "roles": roles_from_rule,
-        "override": True,
+        "override": False,
+        "hint_only": True,
         "no_sign_required": not bool(roles_from_rule),
         "sign_policy": rule.get("sign_policy")
         or ("no_sign" if not roles_from_rule else "detect_roles"),
         "category": rule.get("category") or "",
         "label": rule.get("label") or "",
     }
-    if not roles_from_rule:
-        result["roles"] = []
-        result["blocks"] = []
-        result["role_evidence"] = {}
-        result["debug_summary"] = {
-            "rule_override": True,
-            "override_pattern": rule.get("pattern"),
-            "override_roles": [],
-        }
-        # 仅约定「用例表」在未识别成功时也视为完成；其它 no_sign 规则仍保留真实识别结果供排查
-        if (rule.get("category") or "") == "use_case_spec_table":
-            result["ok"] = True
-            result.pop("error", None)
-            result.pop("error_code", None)
-        return result
-    original_roles = [str((x or {}).get("id") or "") for x in (result.get("roles") or []) if isinstance(x, dict)]
-    result["roles"] = [
-        {"id": rid, "confidence": 0.99, "source": "document_role_rule"}
-        for rid in roles_from_rule
-    ]
-    result["blocks"] = _filter_blocks_by_roles(result.get("blocks"), roles_from_rule)
+
+    # 仅补充 role_evidence 提示，不替换 roles/blocks。
     role_evidence = result.get("role_evidence")
     if isinstance(role_evidence, dict):
-        result["role_evidence"] = {
-            rid: role_evidence.get(rid, [])
-            for rid in roles_from_rule
-            if isinstance(role_evidence.get(rid), list)
-        }
+        role_ev_out = dict(role_evidence)
     else:
-        result["role_evidence"] = {}
+        role_ev_out = {}
     for rid in roles_from_rule:
-        ev = result["role_evidence"].setdefault(rid, [])
+        ev = role_ev_out.setdefault(rid, [])
         if not ev:
             ev.append(
                 {
-                    "confidence": 0.99,
-                    "source_hint": "document_name_rule",
-                    "matched_rules": ["document_role_rule_override"],
+                    "confidence": 0.9,
+                    "source_hint": "document_name_rule_hint",
+                    "matched_rules": ["document_role_rule_hint"],
                     "label_preview": str(rule.get("pattern") or ""),
                 }
             )
-    result["debug_summary"] = {
-        "rule_override": True,
-        "override_pattern": rule.get("pattern"),
-        "override_roles": roles_from_rule,
-        "dropped_roles": [rid for rid in original_roles if rid and rid not in set(roles_from_rule)],
-    }
+    result["role_evidence"] = role_ev_out
+    ds = dict(result.get("debug_summary") or {})
+    ds["rule_hint_only"] = True
+    ds["rule_pattern"] = rule.get("pattern")
+    ds["rule_roles"] = roles_from_rule
+    result["debug_summary"] = ds
     return result
 

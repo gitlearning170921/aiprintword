@@ -389,6 +389,7 @@ def _ensure_sign_file_columns(conn) -> None:
             for sql in (
                 "ALTER TABLE sign_uploaded_file ADD COLUMN detect_snapshot_json MEDIUMTEXT NULL",
                 "ALTER TABLE sign_uploaded_file ADD COLUMN workbench_state_json TEXT NULL",
+                "ALTER TABLE sign_uploaded_file ADD COLUMN detect_correction_json TEXT NULL",
             ):
                 try:
                     cur.execute(sql)
@@ -2599,7 +2600,7 @@ def _sync_legacy_signer_stroke(
         )
 
 
-def list_signers() -> List[dict]:
+def list_signers(*, compact: bool = False) -> List[dict]:
     ensure_sign_mysql()
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
@@ -2680,6 +2681,16 @@ def list_signers() -> List[dict]:
         sig_items: List[dict] = []
         date_items: List[dict] = []
         for i, it in enumerate(sig_items_raw):
+            if compact:
+                sig_items.append(
+                    {
+                        "id": it["id"],
+                        "signer_id": signer_id,
+                        "locale": it.get("locale") or "zh",
+                        "kind": "sig",
+                    }
+                )
+                continue
             ut = it.get("updated_at")
             ftp_path = (it.get("ftp_path") or "").strip()
             fe = (it.get("ftp_last_error") or "").strip()
@@ -2699,6 +2710,16 @@ def list_signers() -> List[dict]:
                 }
             )
         for i, it in enumerate(date_items_raw):
+            if compact:
+                date_items.append(
+                    {
+                        "id": it["id"],
+                        "signer_id": signer_id,
+                        "locale": it.get("locale") or "zh",
+                        "kind": "date",
+                    }
+                )
+                continue
             ut = it.get("updated_at")
             ftp_path = (it.get("ftp_path") or "").strip()
             fe = (it.get("ftp_last_error") or "").strip()
@@ -2720,20 +2741,26 @@ def list_signers() -> List[dict]:
         has_sig = bool(sig_items) or has_set_sig or bool(r.get("leg_sig"))
         has_date = bool(date_items) or has_set_date or bool(r.get("leg_date"))
         pie = pieces_by_signer.get(signer_id) or {x: False for x in all_piece_kinds()}
-        out.append(
-            {
-                "id": signer_id,
-                "name": r["name"],
-                "has_sig": has_sig,
-                "has_date": has_date,
-                "created_at": ts.isoformat(sep=" ") if ts is not None else None,
-                "stroke_sets": stroke_sets,
-                "sig_items": sig_items,
-                "date_items": date_items,
-                "date_piece_en": pie,
-            }
-        )
+        entry: Dict[str, Any] = {
+            "id": signer_id,
+            "name": r["name"],
+            "has_sig": has_sig,
+            "has_date": has_date,
+            "created_at": ts.isoformat(sep=" ") if ts is not None else None,
+            "stroke_sets": [] if compact else stroke_sets,
+            "sig_items": sig_items,
+            "date_items": date_items,
+            "date_piece_en": pie,
+        }
+        if compact:
+            entry["compact"] = True
+        out.append(entry)
     return out
+
+
+def list_signers_compact() -> List[dict]:
+    """签字工作台启动：仅 id/locale 级笔迹条目，减小 JSON 与前端解析耗时。"""
+    return list_signers(compact=True)
 
 
 def list_signers_brief() -> List[dict]:
@@ -3235,6 +3262,52 @@ def set_file_workbench_state(file_id: str, state: dict) -> None:
             )
 
 
+def set_file_detect_correction(file_id: str, correction: dict) -> None:
+    set_file_detect_correction_batch([(file_id, correction)])
+
+
+def set_file_detect_correction_batch(pairs) -> None:
+    """在同一连接/事务内批量写入 detect_correction_json，减少远程 MySQL 往返。"""
+    from sign_handlers.file_session_cache import trim_detect_correction
+
+    if not pairs:
+        return
+    ensure_sign_mysql()
+    rows = []
+    for file_id, correction in pairs:
+        fid = str(file_id or "").strip()
+        if not fid or not isinstance(correction, dict):
+            continue
+        blob = json.dumps(trim_detect_correction(correction), ensure_ascii=False)
+        rows.append((blob, fid))
+    if not rows:
+        return
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            for blob, fid in rows:
+                cur.execute(
+                    "UPDATE sign_uploaded_file SET detect_correction_json=%s WHERE id=%s",
+                    (blob, fid),
+                )
+
+
+def get_file_detect_correction(file_id: str) -> Optional[dict]:
+    from sign_handlers.file_session_cache import trim_detect_correction, _json_load
+
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT detect_correction_json FROM sign_uploaded_file WHERE id=%s",
+                (file_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    data = trim_detect_correction(_json_load(row.get("detect_correction_json")))
+    return data if data else None
+
+
 def get_file_workbench_state(file_id: str) -> Optional[dict]:
     from sign_handlers.file_session_cache import trim_workbench_state, _json_load
 
@@ -3275,7 +3348,12 @@ def _role_map_light_from_rows(rows: List[dict]) -> Dict[str, Any]:
 
 def list_file_session_caches() -> Dict[str, dict]:
     """返回各文件的 detect / workbench / role-map 缓存（用于页面恢复，批量 SQL）。"""
-    from sign_handlers.file_session_cache import trim_detect_snapshot, trim_workbench_state, _json_load
+    from sign_handlers.file_session_cache import (
+        trim_detect_correction,
+        trim_detect_snapshot,
+        trim_workbench_state,
+        _json_load,
+    )
 
     ensure_sign_mysql()
     try:
@@ -3289,9 +3367,10 @@ def list_file_session_caches() -> Dict[str, dict]:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, detect_snapshot_json, workbench_state_json "
+                "SELECT id, detect_snapshot_json, workbench_state_json, detect_correction_json "
                 "FROM sign_uploaded_file "
                 "WHERE detect_snapshot_json IS NOT NULL OR workbench_state_json IS NOT NULL "
+                "OR detect_correction_json IS NOT NULL "
                 "ORDER BY created_at DESC LIMIT %s",
                 (limit,),
             )
@@ -3327,6 +3406,9 @@ def list_file_session_caches() -> Dict[str, dict]:
         wb = trim_workbench_state(_json_load(row.get("workbench_state_json")))
         if wb:
             entry["workbench"] = wb
+        corr = trim_detect_correction(_json_load(row.get("detect_correction_json")))
+        if corr:
+            entry["detect_correction"] = corr
         m = maps_by_file.get(fid)
         if m:
             entry["map"] = m

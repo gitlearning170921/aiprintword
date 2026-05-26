@@ -32,6 +32,12 @@ def trim_detect_snapshot(data: Any) -> Dict[str, Any]:
     return out
 
 
+def trim_detect_correction(data: Any) -> Dict[str, Any]:
+    from sign_handlers.detect_correction import trim_detect_correction as _trim
+
+    return _trim(data)
+
+
 def trim_workbench_state(data: Any) -> Dict[str, Any]:
     if not isinstance(data, dict):
         return {}

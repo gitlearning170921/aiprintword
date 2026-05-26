@@ -45,6 +45,90 @@ _DATE_LABEL_KEYWORDS = ("日期", "Date")
 _GAP_PX = 6
 
 
+def _planned_keywords_for_role(
+    role_id: str,
+    placement_plan: dict | None,
+) -> list[str]:
+    if not isinstance(placement_plan, dict):
+        return []
+    role_plan = placement_plan.get(str(role_id))
+    if not isinstance(role_plan, dict):
+        return []
+    kws = role_plan.get("keywords")
+    if not isinstance(kws, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in kws:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _planned_source_hints_for_role(
+    role_id: str,
+    placement_plan: dict | None,
+) -> list[str]:
+    if not isinstance(placement_plan, dict):
+        return []
+    role_plan = placement_plan.get(str(role_id))
+    if not isinstance(role_plan, dict):
+        return []
+    arr = role_plan.get("source_hints")
+    if not isinstance(arr, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in arr:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _planned_layout_types_for_role(
+    role_id: str,
+    placement_plan: dict | None,
+) -> list[str]:
+    if not isinstance(placement_plan, dict):
+        return []
+    role_plan = placement_plan.get(str(role_id))
+    if not isinstance(role_plan, dict):
+        return []
+    arr = role_plan.get("layout_types")
+    if not isinstance(arr, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in arr:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _parse_xlsx_row_hint(source_hint: str) -> tuple[int | None, int] | None:
+    s = str(source_hint or "").strip()
+    m = re.match(r"^\s*sheet(\d+)\.row(\d+)\s*$", s, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.match(r"^\s*table(\d+)\.row(\d+)\s*$", s, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.match(r"^\s*row(\d+)\s*$", s, re.IGNORECASE)
+    if m:
+        return None, int(m.group(1))
+    return None
+
+
 def _col_width_px(ws, col_idx: int) -> int:
     """Excel 列宽到像素的近似换算（足够用于锚点/缩放）。"""
     try:
@@ -295,11 +379,165 @@ def _add_sig_and_date_after_label_in_cell(
     ws.add_image(date_img)
 
 
+def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int) -> bool:
+    cell = ws.cell(row=r, column=c)
+    val = cell.value
+    ct = str(val).strip() if val is not None else ""
+    if not (cell_text_matches_keyword(val, kw) or xlsx_cell_has_leading_role_keyword(val, kw)):
+        return False
+    if cell_is_bare_role_column_header(val, kw):
+        return False
+    has_blank_right = c + 1 <= int(ws.max_column or 1) and _is_emptyish(
+        ws.cell(row=r, column=c + 1).value
+    )
+    has_blank_below = r + 1 <= max_r and _is_emptyish(ws.cell(row=r + 1, column=c).value)
+    signoff_slot = cell_is_role_signoff_label_slot(val, kw)
+    inline_slot = cell_has_label_inline_reservation(val, kw)
+    date_ctx = _has_date_context_nearby(ws, r, c, val)
+    if not (signoff_slot or inline_slot or ((has_blank_right or has_blank_below) and date_ctx)):
+        return False
+    sig_cell = ws.cell(row=r, column=c + 1)
+    inline_x = cell_inline_insert_offset_px(val, kw) if signoff_slot else None
+    if sig and (not _is_slot_target(sig_cell.value)):
+        if inline_x is None:
+            return False
+    date_label_cell, date_cell = _find_date_cell_same_row(ws, r, c)
+    if date_cell is None:
+        c2 = ws.cell(row=r, column=c + 2)
+        if _is_slot_target(c2.value):
+            date_cell = c2
+        else:
+            d1 = ws.cell(row=r + 1, column=c + 1)
+            if _is_slot_target(d1.value):
+                date_cell = d1
+            else:
+                d0 = ws.cell(row=r + 1, column=c)
+                if _is_slot_target(d0.value):
+                    date_cell = d0
+    placed_any = False
+    if inline_x is not None and sig and dt:
+        _add_sig_and_date_after_label_in_cell(ws, sig, dt, cell, inline_x)
+        placed_any = True
+    elif inline_x is not None and sig:
+        _add_png_after_label_in_cell(ws, sig, cell, inline_x)
+        placed_any = True
+    if sig and not placed_any:
+        if _is_slot_target(sig_cell.value):
+            sig_cell.value = None
+            _add_png(
+                ws,
+                sig,
+                _merged_top_left_coordinate(ws, sig_cell),
+                sig_cell,
+            )
+            placed_any = True
+        if not placed_any and has_blank_below:
+            below = ws.cell(row=r + 1, column=c)
+            below.value = None
+            _add_png(
+                ws,
+                sig,
+                _merged_top_left_coordinate(ws, below),
+                below,
+            )
+            placed_any = True
+        if not placed_any:
+            sig_inline_x = cell_inline_insert_offset_px(cell.value, kw)
+            if sig_inline_x is not None:
+                if dt and cell_has_signoff_inline_reservation(val, kw):
+                    _add_sig_and_date_after_label_in_cell(
+                        ws, sig, dt, cell, sig_inline_x
+                    )
+                else:
+                    _add_png_after_label_in_cell(
+                        ws, sig, cell, sig_inline_x
+                    )
+                placed_any = True
+    if dt and not placed_any:
+        if signoff_slot:
+            max_c = int(ws.max_column or 1)
+            for dc in range(c + 2, min(c + 8, max_c + 1)):
+                dcell = ws.cell(row=r, column=dc)
+                dv = dcell.value
+                if (
+                    cell_looks_like_signoff_date_label(dv)
+                    and not cell_has_role_keyword(dv, kw)
+                ):
+                    break
+                if _is_slot_target(dv):
+                    dcell.value = None
+                    _add_png(
+                        ws,
+                        dt,
+                        _merged_top_left_coordinate(ws, dcell),
+                        dcell,
+                    )
+                    placed_any = True
+                    break
+        if (
+            not placed_any
+            and signoff_slot
+            and cell_has_signoff_inline_reservation(val, kw)
+        ):
+            inline_dt_x = cell_inline_insert_offset_px(val, kw)
+            if inline_dt_x is not None:
+                if sig:
+                    _add_sig_and_date_after_label_in_cell(
+                        ws, sig, dt, cell, inline_dt_x
+                    )
+                else:
+                    _add_png_after_label_in_cell(
+                        ws, dt, cell, inline_dt_x
+                    )
+                placed_any = True
+        if (
+            not placed_any
+            and not signoff_slot
+            and date_cell is not None
+            and _is_slot_target(date_cell.value)
+        ):
+            date_cell.value = None
+            _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
+            placed_any = True
+        elif not placed_any:
+            date_inline_x = None
+            if date_label_cell is not None:
+                date_inline_x = cell_inline_insert_offset_px(date_label_cell.value, "Date")
+                if date_inline_x is None:
+                    date_inline_x = cell_inline_insert_offset_px(date_label_cell.value, "日期")
+            if date_label_cell is not None and date_inline_x is not None:
+                _add_png_after_label_in_cell(ws, dt, date_label_cell, date_inline_x)
+                placed_any = True
+            elif date_cell is not None:
+                date_cell.value = None
+                _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
+                placed_any = True
+            elif (not _is_slot_target(sig_cell.value)) and sig:
+                dnext = ws.cell(row=r, column=c + 2)
+                if _is_slot_target(dnext.value):
+                    dnext.value = None
+                    _add_png(
+                        ws,
+                        dt,
+                        _merged_top_left_coordinate(ws, dnext),
+                        dnext,
+                    )
+                    placed_any = True
+            if not placed_any:
+                below = f"{get_column_letter(c + 1)}{r + 1}"
+                below_cell = ws.cell(row=r + 1, column=c + 1)
+                _add_png(ws, dt, below, below_cell)
+                placed_any = True
+    return placed_any
+
+
 def sign_xlsx(
     path: str,
     role_to_signature_png: dict,
     role_to_date_png: dict,
     out_path: Optional[str] = None,
+    placement_plan: dict | None = None,
+    placement_result: dict | None = None,
 ) -> str:
     path = os.path.abspath(path)
     if out_path is None:
@@ -322,195 +560,100 @@ def sign_xlsx(
             if dt is None and db:
                 dt = db
         if not sig and not dt:
+            if isinstance(placement_result, dict):
+                placement_result[str(role_id)] = {
+                    "applied_sig": False,
+                    "applied_date": False,
+                    "placed": False,
+                    "placed_by": "skip_no_material",
+                    "keywords": [],
+                }
             continue
         placed = False
-        kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
-        for kw in kws:
-            if placed:
-                break
-            for ws in wb.worksheets:
-                if placed:
-                    break
-                max_r = int(ws.max_row or 1)
-                row_range = (
-                    range(max_r, 0, -1) if max_r > 10 else range(1, max_r + 1)
-                )
-                for r in row_range:
+        placed_by = ""
+        fallback_kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
+        planned_kws = _planned_keywords_for_role(role_id, placement_plan)
+        planned_hints = _planned_source_hints_for_role(role_id, placement_plan)
+        planned_layout_types = _planned_layout_types_for_role(role_id, placement_plan)
+        kws = []
+        seen_kw: set[str] = set()
+        for kw in planned_kws + fallback_kws:
+            if kw in seen_kw:
+                continue
+            seen_kw.add(kw)
+            kws.append(kw)
+        if isinstance(placement_result, dict):
+            placement_result[str(role_id)] = {
+                "applied_sig": bool(sig),
+                "applied_date": bool(dt),
+                "placed": False,
+                "placed_by": "",
+                "keywords": kws[:],
+                "source_hints": planned_hints[:],
+                "layout_types": planned_layout_types[:],
+            }
+        if planned_hints and kws:
+            for hint in planned_hints:
+                parsed = _parse_xlsx_row_hint(hint)
+                if not parsed:
+                    continue
+                sheet_no, row_no = parsed
+                if row_no <= 0:
+                    continue
+                ws_candidates = []
+                if sheet_no is None:
+                    ws_candidates = list(wb.worksheets)
+                elif 1 <= sheet_no <= len(wb.worksheets):
+                    ws_candidates = [wb.worksheets[sheet_no - 1]]
+                for kw in kws:
                     if placed:
                         break
-                    for c in range(1, min(int(ws.max_column or 1), 128) + 1):
-                        cell = ws.cell(row=r, column=c)
-                        val = cell.value
-                        ct = str(val).strip() if val is not None else ""
-                        if not (
-                            cell_text_matches_keyword(val, kw)
-                            or xlsx_cell_has_leading_role_keyword(val, kw)
-                        ):
+                    for ws in ws_candidates:
+                        max_r = int(ws.max_row or 1)
+                        if row_no > max_r:
                             continue
-                        if cell_is_bare_role_column_header(val, kw):
-                            continue
-                        has_blank_right = c + 1 <= int(ws.max_column or 1) and _is_emptyish(
-                            ws.cell(row=r, column=c + 1).value
-                        )
-                        has_blank_below = r + 1 <= max_r and _is_emptyish(
-                            ws.cell(row=r + 1, column=c).value
-                        )
-                        signoff_slot = cell_is_role_signoff_label_slot(val, kw)
-                        inline_slot = cell_has_label_inline_reservation(val, kw)
-                        date_ctx = _has_date_context_nearby(ws, r, c, val)
-                        if not (signoff_slot or inline_slot or ((has_blank_right or has_blank_below) and date_ctx)):
-                            continue
-                        sig_cell = ws.cell(row=r, column=c + 1)
-                        inline_x = (
-                            cell_inline_insert_offset_px(val, kw)
-                            if signoff_slot
-                            else None
-                        )
-                        # 若要贴签名，签名格必须为空；签批栏同格留位时允许在标签格内拼接
-                        if sig and (not _is_slot_target(sig_cell.value)):
-                            if inline_x is None:
-                                continue
-                        date_label_cell, date_cell = _find_date_cell_same_row(ws, r, c)
-                        if date_cell is None:
-                            c2 = ws.cell(row=r, column=c + 2)
-                            if _is_slot_target(c2.value):
-                                date_cell = c2
-                            else:
-                                d1 = ws.cell(row=r + 1, column=c + 1)
-                                if _is_slot_target(d1.value):
-                                    date_cell = d1
-                                else:
-                                    d0 = ws.cell(row=r + 1, column=c)
-                                    if _is_slot_target(d0.value):
-                                        date_cell = d0
-                        placed_any = False
-                        if inline_x is not None and sig and dt:
-                            _add_sig_and_date_after_label_in_cell(
-                                ws, sig, dt, cell, inline_x
-                            )
-                            placed_any = True
-                        elif inline_x is not None and sig:
-                            _add_png_after_label_in_cell(ws, sig, cell, inline_x)
-                            placed_any = True
-                        if sig and not placed_any:
-                            # 1) 右侧空白格（签批栏「测试人/日期：」等）
-                            if _is_slot_target(sig_cell.value):
-                                sig_cell.value = None
-                                _add_png(
-                                    ws,
-                                    sig,
-                                    _merged_top_left_coordinate(ws, sig_cell),
-                                    sig_cell,
-                                )
-                                placed_any = True
-                            # 2) 下方空白格
-                            if not placed_any and has_blank_below:
-                                below = ws.cell(row=r + 1, column=c)
-                                below.value = None
-                                _add_png(
-                                    ws,
-                                    sig,
-                                    _merged_top_left_coordinate(ws, below),
-                                    below,
-                                )
-                                placed_any = True
-                            # 3) 同格标签后留白/下划线 → 紧挨标签
-                            if not placed_any:
-                                sig_inline_x = cell_inline_insert_offset_px(cell.value, kw)
-                                if sig_inline_x is not None:
-                                    if dt and cell_has_signoff_inline_reservation(val, kw):
-                                        _add_sig_and_date_after_label_in_cell(
-                                            ws, sig, dt, cell, sig_inline_x
-                                        )
-                                    else:
-                                        _add_png_after_label_in_cell(
-                                            ws, sig, cell, sig_inline_x
-                                        )
-                                    placed_any = True
-                        if dt and not placed_any:
-                            # 签批栏「测试人/日期」：签名在 c+1，日期在 c+2（与复核人一致）
-                            if signoff_slot:
-                                max_c = int(ws.max_column or 1)
-                                for dc in range(c + 2, min(c + 8, max_c + 1)):
-                                    dcell = ws.cell(row=r, column=dc)
-                                    dv = dcell.value
-                                    if (
-                                        cell_looks_like_signoff_date_label(dv)
-                                        and not cell_has_role_keyword(dv, kw)
-                                    ):
-                                        break
-                                    if _is_slot_target(dv):
-                                        dcell.value = None
-                                        _add_png(
-                                            ws,
-                                            dt,
-                                            _merged_top_left_coordinate(ws, dcell),
-                                            dcell,
-                                        )
-                                        placed_any = True
-                                        break
-                            if (
-                                not placed_any
-                                and signoff_slot
-                                and cell_has_signoff_inline_reservation(val, kw)
-                            ):
-                                inline_dt_x = cell_inline_insert_offset_px(val, kw)
-                                if inline_dt_x is not None:
-                                    if sig:
-                                        _add_sig_and_date_after_label_in_cell(
-                                            ws, sig, dt, cell, inline_dt_x
-                                        )
-                                    else:
-                                        _add_png_after_label_in_cell(
-                                            ws, dt, cell, inline_dt_x
-                                        )
-                                    placed_any = True
-                            # 非签批栏：Date/日期 标签右侧空白格；签批栏勿误落到独立 Date 列
-                            if (
-                                not placed_any
-                                and not signoff_slot
-                                and date_cell is not None
-                                and _is_slot_target(date_cell.value)
-                            ):
-                                date_cell.value = None
-                                _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
-                                placed_any = True
-                            elif not placed_any:
-                                # 若 Date/日期 标签格本身是“同格留空占位”，且没有可用的右侧空白格，才退化为同格插入
-                                date_inline_x = None
-                                if date_label_cell is not None:
-                                    date_inline_x = _cell_inline_insert_offset_px(date_label_cell.value, "Date")
-                                    if date_inline_x is None:
-                                        date_inline_x = _cell_inline_insert_offset_px(date_label_cell.value, "日期")
-                                if date_label_cell is not None and date_inline_x is not None:
-                                    _add_png_after_label_in_cell(ws, dt, date_label_cell, date_inline_x)
-                                    placed_any = True
-                                elif date_cell is not None:
-                                    # 非空也允许覆盖（用户明确选择了日期素材）
-                                    date_cell.value = None
-                                    _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
-                                    placed_any = True
-                                elif (not _is_slot_target(sig_cell.value)) and sig:
-                                    # 仅一格留白：日期紧跟签名格后一列
-                                    dnext = ws.cell(row=r, column=c + 2)
-                                    if _is_slot_target(dnext.value):
-                                        dnext.value = None
-                                        _add_png(
-                                            ws,
-                                            dt,
-                                            _merged_top_left_coordinate(ws, dnext),
-                                            dnext,
-                                        )
-                                        placed_any = True
-                                if not placed_any:
-                                    # 找不到日期单元格时：放到签名格下方（兜底）
-                                    below = f"{get_column_letter(c + 1)}{r + 1}"
-                                    below_cell = ws.cell(row=r + 1, column=c + 1)
-                                    _add_png(ws, dt, below, below_cell)
-                                    placed_any = True
-                        if not placed_any:
-                            continue
-                        placed = True
+                        for c in range(1, min(int(ws.max_column or 1), 128) + 1):
+                            if _try_place_at_keyword_cell(ws, row_no, c, kw, sig, dt, max_r):
+                                placed = True
+                                placed_by = "planned_source_hint"
+                                break
+                            if placed:
+                                break
+                        if placed:
+                            break
+                if placed:
+                    break
+        if not placed:
+            for kw in kws:
+                if placed:
+                    break
+                for ws in wb.worksheets:
+                    if placed:
                         break
+                    max_r = int(ws.max_row or 1)
+                    row_range = (
+                        range(max_r, 0, -1) if max_r > 10 else range(1, max_r + 1)
+                    )
+                    for r in row_range:
+                        if placed:
+                            break
+                        for c in range(1, min(int(ws.max_column or 1), 128) + 1):
+                            if _try_place_at_keyword_cell(ws, r, c, kw, sig, dt, max_r):
+                                placed = True
+                                if not placed_by:
+                                    placed_by = (
+                                        "planned_keywords" if planned_kws else "fallback_keywords"
+                                    )
+                                break
+                            if placed:
+                                break
+        if isinstance(placement_result, dict):
+            one = placement_result.get(str(role_id)) or {}
+            one["placed"] = bool(placed)
+            if placed:
+                one["placed_by"] = placed_by or "fallback_keywords"
+            else:
+                one["placed_by"] = "not_found"
+            placement_result[str(role_id)] = one
     wb.save(out_path)
     return out_path

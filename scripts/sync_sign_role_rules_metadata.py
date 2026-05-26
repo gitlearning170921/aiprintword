@@ -19,6 +19,12 @@ USE_CASE_SPEC_PATTERNS = {
     "传统算法测试用例表",
 }
 
+TEST_TASK_NO_SIGN_PATTERNS = {
+    "测试任务执行表",
+    "测试任务表",
+    "用户测试任务表",
+}
+
 
 def roles_label(roles):
     if not roles:
@@ -31,6 +37,16 @@ def use_case_spec_category(pattern: str) -> str:
         return "use_case_spec_table"
     if "用例表" in pattern and "用例执行" not in pattern:
         return "use_case_spec_table"
+    return ""
+
+
+def test_task_no_sign_category(pattern: str) -> str:
+    if pattern in TEST_TASK_NO_SIGN_PATTERNS:
+        return "test_task_no_sign"
+    if "测试任务执行表" in pattern:
+        return "test_task_no_sign"
+    if "测试任务表" in pattern and "用例" not in pattern:
+        return "test_task_no_sign"
     return ""
 
 
@@ -52,13 +68,18 @@ def main():
             item["sign_policy"] = "no_sign"
             item["no_sign_required"] = True
             item["label"] = "无需签字"
-            cat = use_case_spec_category(pat)
+            cat = test_task_no_sign_category(pat) or use_case_spec_category(pat)
             if cat:
                 item["category"] = cat
                 if not item.get("note"):
-                    item["note"] = (
-                        "人工约定：用例表不签字；对应用例执行表需 executor+reviewer。"
-                    )
+                    if cat == "test_task_no_sign":
+                        item["note"] = (
+                            "人工约定：测试任务表/测试任务执行表无需签字。"
+                        )
+                    else:
+                        item["note"] = (
+                            "人工约定：用例表不签字；对应用例执行表需 executor+reviewer。"
+                        )
             elif not item.get("note"):
                 item["note"] = (
                     "本类附件无签批栏，不进签字流程；仍会轻量解析文档（非用例表快速跳过）。"
@@ -80,6 +101,7 @@ def main():
         "detect_roles": "sign_policy=detect_roles：正常识别签字角色并进入匹配/签字流程",
         "no_sign": "sign_policy=no_sign：工作台「无需签字」，roles 强制为空",
         "use_case_spec_table": "category=use_case_spec_table：用例表；批量可跳过签字位识别",
+        "test_task_no_sign": "category=test_task_no_sign：测试任务表/测试任务执行表；无需签字",
         "use_case_execution": "含「用例执行表/用例执行记录」：识别 executor+reviewer",
         "other_files": "未命中规则：按正文签批栏自动识别",
     }

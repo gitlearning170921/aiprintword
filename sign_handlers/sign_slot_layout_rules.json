@@ -1,5 +1,141 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "document_layout_rules": [
+    {
+      "pattern": "ECGAP-NTS-001 网络安全测试方案",
+      "match": "contains",
+      "note": "人工签字位标误：漏识别审核、批准人员，角色与日期版本识别错误；角色从上到下排列",
+      "source_example": "ECGAP-NTS-001 网络安全测试方案（A0）.docx",
+      "learned_from_correction": true,
+      "arrangement": "vertical",
+      "date_relation": "different_cell",
+      "date_position": "right",
+      "separator": "cell",
+      "same_cell": false,
+      "arrangement_label": "角色从上到下排列",
+      "signature_slot_forms": [
+        "右侧空白单元格"
+      ],
+      "date_layout_forms": [
+        "日期在右相邻单元格"
+      ],
+      "layout_types": [
+        "adjacent_right_cell"
+      ]
+    },
+    {
+      "pattern": "ECGAP-CRR-001 代码评审报告",
+      "match": "contains",
+      "note": "人工签字位标误：日期应该在角色下方；角色从左到右排列",
+      "source_example": "ECGAP-CRR-001 代码评审报告（A0）.docx",
+      "learned_from_correction": true,
+      "arrangement": "horizontal",
+      "date_relation": "different_cell",
+      "date_position": "below",
+      "separator": "cell",
+      "same_cell": false,
+      "arrangement_label": "角色从左到右排列",
+      "signature_slot_forms": [
+        "右侧空白单元格"
+      ],
+      "date_layout_forms": [
+        "日期在下方相邻/偏右单元格"
+      ],
+      "layout_types": [
+        "two_row_signoff_table"
+      ]
+    },
+    {
+      "pattern": "QR-SMP7.5.6-01-02 现成软件列表",
+      "match": "contains",
+      "note": "人工签字位标误：漏识别批准人，角色日期在同一个字段中、/分隔；角色从左到右排列",
+      "source_example": "QR-SMP7.5.6-01-02 现成软件列表（A0）.docx",
+      "learned_from_correction": true,
+      "arrangement": "horizontal",
+      "date_relation": "paragraph_inline",
+      "date_position": "inline",
+      "separator": "slash",
+      "arrangement_label": "角色从左到右排列",
+      "signature_slot_forms": [],
+      "date_layout_forms": [
+        "与角色同一单元格/字段标记"
+      ],
+      "layout_types": []
+    },
+    {
+      "pattern": "ECGAP-NTR-001 网络安全测试报告",
+      "match": "contains",
+      "note": "人工签字位标误：漏识别审核、批准人员，角色与日期版本识别错误；角色从上到下排列",
+      "source_example": "ECGAP-NTR-001 网络安全测试报告（A0）.docx",
+      "learned_from_correction": true,
+      "arrangement": "vertical",
+      "date_relation": "different_cell",
+      "date_position": "right",
+      "separator": "cell",
+      "same_cell": false,
+      "arrangement_label": "角色从上到下排列",
+      "signature_slot_forms": [
+        "右侧空白单元格"
+      ],
+      "date_layout_forms": [
+        "日期在右相邻单元格"
+      ],
+      "layout_types": [
+        "adjacent_right_cell"
+      ]
+    },
+    {
+      "pattern": "ECGAP-NSR-001 网络安全风险管理报告",
+      "match": "contains",
+      "note": "人工签字位标误：角色日期版式识别错误；角色从上到下排列",
+      "source_example": "ECGAP-NSR-001 网络安全风险管理报告（A0）.docx",
+      "learned_from_correction": true,
+      "arrangement": "vertical",
+      "date_relation": "different_cell",
+      "date_position": "right",
+      "separator": "cell",
+      "same_cell": false,
+      "arrangement_label": "角色从上到下排列",
+      "signature_slot_forms": [
+        "右侧空白单元格"
+      ],
+      "date_layout_forms": [
+        "日期在右相邻单元格"
+      ],
+      "layout_types": [
+        "adjacent_right_cell"
+      ]
+    }
+  ],
+  "layout_priority_rules": [
+    {
+      "layout_type": "two_row_signoff_table",
+      "priority": 100,
+      "match_contains": [
+        "两行签批表"
+      ],
+      "description": "两行签批表优先按角色行/日期行固定落位"
+    },
+    {
+      "layout_type": "same_cell_inline",
+      "priority": 80,
+      "match_contains": [
+        "同字段长空格占位",
+        "同字段下划线/点线占位"
+      ],
+      "description": "同字段占位优先同格内联插入"
+    },
+    {
+      "layout_type": "adjacent_right_cell",
+      "priority": 60,
+      "match_contains": [
+        "右侧空白单元格",
+        "日期在右相邻单元格",
+        "日期在右侧隔列单元格"
+      ],
+      "description": "优先右侧相邻/隔列空白格"
+    }
+  ],
   "signature_slot_forms": [
     "右侧空白单元格",
     "右侧已有姓名/日期值（需先删除电脑输入后重签）",
@@ -29,5 +165,6 @@
       "\\d{4}[./-]\\d{1,2}(?:[./-]\\d{1,2})?",
       "[\\u4e00-\\u9fff]{2,4}\\s*[/｜|]\\s*\\d{4}[./-]\\d{1,2}"
     ]
-  }
+  },
+  "updated": "2026-05-26"
 }

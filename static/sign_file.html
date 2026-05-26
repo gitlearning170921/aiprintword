@@ -30,12 +30,18 @@
     }
     .container { max-width: 880px; margin: 0 auto; }
     body.batch-workbench-mode {
-      padding: 12px 10px;
+      padding: 8px;
+      overflow-x: hidden;
     }
     body.batch-workbench-mode .container {
-      max-width: min(1960px, 99.5vw);
+      max-width: 100%;
       width: 100%;
       margin: 0 auto;
+      overflow-x: hidden;
+    }
+    body.batch-workbench-mode #batchWorkbenchCard {
+      padding: 12px 14px;
+      overflow: visible;
     }
     h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 8px; }
     .subtitle { color: var(--text-muted); font-size: 0.95rem; margin-bottom: 16px; }
@@ -180,8 +186,9 @@
     body.batch-workbench-mode .legacy-sign-flow { display: none !important; }
     body.batch-workbench-mode #uploadSaveCard { display: block !important; }
     #legacyFileListCard { display: none !important; }
-    #saveUploadProgressWrap,
-    #batchWorkbenchProgressWrap { display: none !important; }
+    #saveUploadProgressWrap { display: none !important; }
+    /* 工作台模式：顶栏全局进度与表格内状态列重复，仅保留工作台内进度条 */
+    body.batch-workbench-mode #signPageProgressWrap { display: none !important; }
     body.batch-workbench-mode #needSignCard {
       display: none !important;
     }
@@ -200,25 +207,109 @@
     .batch-wb-mat-badge.mat-partial { background: #fff3e0; color: #e65100; }
     .batch-wb-mat-badge.mat-none { background: #ffebee; color: #c62828; }
     .batch-wb-mat-badge.mat-unknown { background: #f5f5f5; color: #666; }
+    .sign-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 12000;
+      padding: 16px;
+    }
+    .sign-modal-backdrop.show { display: flex; }
+    .sign-modal-box {
+      background: var(--surface);
+      border-radius: 10px;
+      max-width: 560px;
+      width: 100%;
+      max-height: 90vh;
+      overflow: auto;
+      padding: 20px 22px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+      border: 1px solid var(--border);
+    }
+    .sign-modal-box h3 { margin: 0 0 12px; font-size: 1.05rem; }
+    .sign-modal-box textarea {
+      width: 100%;
+      min-height: 72px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 0.9rem;
+      resize: vertical;
+    }
+    .sign-modal-role-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      margin: 8px 0 12px;
+    }
+    .sign-modal-role-grid label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin: 0;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    .sign-modal-ref-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 8px 0;
+    }
+    .sign-modal-ref-list img {
+      max-width: 120px;
+      max-height: 80px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      object-fit: contain;
+      background: #fff;
+    }
+    .sign-modal-ref-item { position: relative; }
+    .sign-modal-ref-item button {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      padding: 0 5px;
+      font-size: 0.75rem;
+      line-height: 1.2;
+    }
+    .sign-modal-batch-files {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .sign-modal-batch-files li {
+      padding: 2px 0;
+      word-break: break-all;
+    }
     .batch-wb-mat-badge.mat-canvas { background: #e3f2fd; color: #1565c0; }
     .batch-workbench-table tr.row-editing { outline: 2px solid var(--accent); outline-offset: -2px; }
     #batchAdvancedHint { display: none; margin: 0 0 12px; }
     body.batch-workbench-mode.batch-advanced-mode #batchAdvancedHint { display: block; }
     .batch-workbench-wrap {
-      overflow-x: auto;
+      overflow: auto;
       margin-top: 10px;
       -webkit-overflow-scrolling: touch;
       width: 100%;
+      max-width: 100%;
+      max-height: calc(100vh - 240px);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
     }
     body.batch-workbench-mode .batch-workbench-wrap {
-      overflow-x: visible;
+      overflow: auto;
     }
     .batch-workbench-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.82rem;
+      font-size: 0.76rem;
       min-width: 0;
-      table-layout: auto;
+      table-layout: fixed;
     }
     .batch-workbench-table thead th.group-h {
       text-align: center;
@@ -227,8 +318,9 @@
     .batch-wb-cell-stack {
       display: flex;
       flex-direction: column;
-      gap: 4px;
-      min-width: 108px;
+      gap: 3px;
+      min-width: 0;
+      max-width: 100%;
     }
     .batch-wb-cell-stack label.wb-mini-label {
       font-size: 0.72rem;
@@ -246,44 +338,104 @@
     .batch-workbench-table th,
     .batch-workbench-table td {
       border: 1px solid var(--border);
-      padding: 8px 10px;
+      padding: 5px 4px;
       vertical-align: top;
+      white-space: normal;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      line-height: 1.3;
     }
-    .batch-workbench-table th { background: var(--surface2); font-weight: 600; white-space: nowrap; }
+    .batch-workbench-table th {
+      background: var(--surface2);
+      font-weight: 600;
+      white-space: normal;
+      font-size: 0.72rem;
+      line-height: 1.25;
+    }
     .batch-workbench-table input[type="text"],
     .batch-workbench-table input[type="date"],
+    .batch-workbench-table input[type="search"],
     .batch-workbench-table select {
       width: 100%;
-      min-width: 88px;
-      padding: 6px 8px;
+      min-width: 0;
+      max-width: 100%;
+      padding: 3px 4px;
       border: 1px solid var(--border);
-      border-radius: 6px;
-      font-size: 0.88rem;
+      border-radius: 4px;
+      font-size: 0.74rem;
       box-sizing: border-box;
     }
-    .batch-workbench-table .col-check { width: 36px; text-align: center; }
-    .batch-workbench-table .col-name { min-width: 160px; max-width: 240px; word-break: break-all; }
-    .batch-workbench-table .col-status { min-width: 72px; white-space: nowrap; color: var(--text-muted); }
+    .batch-workbench-table .col-check { width: 2.2em; text-align: center; }
+    .batch-workbench-table .col-name { width: 10%; }
+    .batch-workbench-table .col-wb-docdate { width: 6.5%; }
+    .batch-workbench-table .col-locale { width: 4.5%; }
+    .batch-workbench-table .col-wb-sig,
+    .batch-workbench-table .col-wb-date { width: 7%; }
+    .batch-workbench-table .col-material { width: 5.5%; }
+    .batch-workbench-table .col-roles { width: 7.5%; }
+    .batch-workbench-table .col-status {
+      width: 8%;
+      color: var(--text-muted);
+      white-space: normal;
+      cursor: help;
+    }
     .batch-workbench-table tr.row-selected { background: rgba(26,115,232,0.04); }
     .batch-workbench-table tr.row-error .col-status { color: var(--error); font-weight: 600; }
     .batch-workbench-table tr.row-error { background: rgba(198,40,40,0.04); }
     .batch-workbench-table tr.row-ready .col-status { color: #2e7d32; font-weight: 600; }
     .batch-workbench-table tr.row-busy .col-status { color: #1a73e8; }
     .batch-workbench-table tr.row-busy { background: rgba(26,115,232,0.03); }
-    .batch-workbench-table .col-status { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: help; }
+    .wb-toolbar-section[aria-label="筛选"] {
+      overflow: visible;
+    }
+    .wb-status-filter-wrap {
+      position: relative;
+      display: inline-block;
+      max-width: 100%;
+    }
+    .wb-filter-status-dropdown {
+      display: none;
+      position: absolute;
+      left: 0;
+      top: calc(100% + 4px);
+      z-index: 200;
+      min-width: 300px;
+      max-width: min(560px, 96vw);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .wb-status-filter-wrap.open .wb-filter-status-dropdown { display: block; }
+    .wb-filter-status-box-scroll {
+      max-height: min(70vh, 420px);
+      overflow-x: hidden;
+      overflow-y: auto;
+      padding: 8px 10px;
+      -webkit-overflow-scrolling: touch;
+    }
     .wb-filter-status-box {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      font-size: 0.82rem;
+    }
+    .wb-filter-group-title {
+      display: block;
+      font-size: 0.76rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin: 0 0 4px;
+      letter-spacing: 0.02em;
+    }
+    .wb-filter-group-items {
       display: flex;
       flex-wrap: wrap;
       gap: 6px 10px;
       align-items: center;
-      max-width: 520px;
-      padding: 6px 8px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      background: var(--surface2);
-      font-size: 0.82rem;
     }
-    .wb-filter-status-box label {
+    .wb-filter-status-box label,
+    .wb-filter-group-items label {
       display: inline-flex;
       align-items: center;
       gap: 4px;
@@ -323,9 +475,90 @@
     #batchWorkbenchMsg.btn-inline-feedback.is-ok { background:#e8f5e9; color:#1b5e20; border:1px solid #a5d6a7; padding:8px 12px; border-radius:6px; white-space:pre-wrap; }
     #batchWorkbenchMsg.btn-inline-feedback.is-warn { background:#fff3e0; color:#bf360c; border:1px solid #ffcc80; padding:8px 12px; border-radius:6px; white-space:pre-wrap; }
     #batchWorkbenchMsg.btn-inline-feedback.is-error { background:#ffebee; color:#b71c1c; border:1px solid #ef9a9a; padding:8px 12px; border-radius:6px; white-space:pre-wrap; }
+    .wb-toolbar {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .wb-toolbar-section {
+      padding: 10px 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .wb-toolbar-section-title {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 0.02em;
+      margin: 0 0 8px;
+      text-transform: none;
+    }
+    .wb-toolbar-section .btn-row {
+      margin-top: 0;
+      gap: 8px;
+    }
+    .wb-toolbar-filter-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .wb-toolbar-filter-row:last-child { margin-bottom: 0; }
+    .batch-workbench-table .col-slot {
+      width: 11%;
+      font-size: 0.74rem;
+      line-height: 1.3;
+      white-space: normal;
+    }
+    .batch-workbench-table .col-op {
+      width: 7.5%;
+      white-space: normal;
+    }
+    .batch-workbench-table .col-op .btn {
+      display: block;
+      width: 100%;
+      margin: 2px 0 0 !important;
+      padding: 3px 4px !important;
+      font-size: 0.7rem !important;
+      line-height: 1.2;
+      white-space: normal;
+      word-break: break-all;
+    }
+    .batch-workbench-table .col-material .batch-wb-mat-badge {
+      display: inline-block;
+      max-width: 100%;
+      white-space: normal;
+      word-break: break-word;
+      line-height: 1.25;
+    }
+    .batch-workbench-table .col-roles {
+      white-space: normal;
+      word-break: break-word;
+    }
+    .wb-slot-badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 4px;
+      font-size: 0.76rem;
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
+    .wb-slot-badge.ok { background: #e8f5e9; color: #1b5e20; }
+    .wb-slot-badge.fail { background: #ffebee; color: #b71c1c; }
+    .wb-slot-badge.warn { background: #fff3e0; color: #e65100; }
+    .wb-slot-badge.muted { background: #f0f0f0; color: #666; }
+    .wb-slot-roles { color: var(--text); font-size: 0.72rem; word-break: break-word; }
+    .wb-slot-layout { color: var(--text-muted); font-size: 0.68rem; margin-top: 2px; word-break: break-word; }
+    .batch-wb-cell-stack label.wb-mini-label { font-size: 0.68rem; }
+    .batch-wb-date-item,
+    .batch-wb-date-comp { min-width: 0; max-width: 100%; }
     #batchWorkbenchProgressWrap {
       display: none;
-      margin: 6px 0 10px;
+      margin: 0 0 10px;
       padding: 8px 10px;
       background: #f7f9fc;
       border: 1px solid #dce6f6;
@@ -481,52 +714,80 @@
         <div id="batchWorkbenchCard" class="card" style="display:none;">
           <h2>批量签字工作台</h2>
           <p class="hint">编审批与日期均在表格内配置（签署人筛选、签名/日期素材、日期方式、按角色签字版本）；「文档日期」来自 aiword，修改后将同步各角色日期并重新匹配素材。默认识别匹配后可一键批量签字；未匹配可开「高级模式」画布补签。</p>
-          <div class="btn-row" style="margin-bottom:10px;align-items:center;flex-wrap:wrap;gap:8px;">
-            <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-size:0.9rem;cursor:pointer;">
-              <input type="checkbox" id="batchWorkbenchSelectAll" checked> 全选
-            </label>
-            <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-size:0.9rem;cursor:pointer;">
-              <input type="checkbox" id="batchWorkbenchAdvancedCb"> 高级模式（画布补签）
-            </label>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchDetectBtn">批量识别签字位</button>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchApplyBtn">批量匹配素材</button>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchMarkDetectWrongBtn" title="人工标记：识别角色与规则不符">标为识别有误（已选）</button>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchDeleteBtn">批量删除已勾选</button>
-            <label style="margin:0;font-size:0.9rem;">批量版本</label>
-            <select id="batchWorkbenchLocaleBulk" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
-              <option value="">— 不修改 —</option>
-              <option value="zh">中文</option>
-              <option value="en">英文</option>
-            </select>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchLocaleApplyBtn">应用到已选</button>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchExportIssuesBtn">导出问题清单</button>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchRefreshBtn">刷新列表</button>
-            <button type="button" class="btn btn-primary" id="batchWorkbenchSignBtn">一键批量签字</button>
+          <div class="wb-toolbar">
+            <section class="wb-toolbar-section" aria-label="选择与模式">
+              <span class="wb-toolbar-section-title">① 选择与模式</span>
+              <div class="btn-row">
+                <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-size:0.9rem;cursor:pointer;">
+                  <input type="checkbox" id="batchWorkbenchSelectAll" checked> 全选文件
+                </label>
+                <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-size:0.9rem;cursor:pointer;">
+                  <input type="checkbox" id="batchWorkbenchAdvancedCb"> 高级模式（画布补签）
+                </label>
+              </div>
+            </section>
+            <section class="wb-toolbar-section" aria-label="批量操作">
+              <span class="wb-toolbar-section-title">② 批量操作</span>
+              <div class="btn-row">
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchDetectBtn" title="仅识别需签角色与签字位版式，不匹配素材库">批量识别（角色+签字位）</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchApplyBtn">批量匹配素材</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchMarkDetectWrongBtn" title="对已勾选文件批量登记纠正">标误/改登记</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchDeleteBtn">删除已选</button>
+                <label style="margin:0;font-size:0.88rem;align-self:center;">版本</label>
+                <select id="batchWorkbenchLocaleBulk" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
+                  <option value="">不修改</option>
+                  <option value="zh">中文</option>
+                  <option value="en">英文</option>
+                </select>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchLocaleApplyBtn">应用版本</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchExportIssuesBtn">导出问题</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchRefreshBtn">刷新列表</button>
+                <button type="button" class="btn btn-primary" id="batchWorkbenchSignBtn">一键批量签字</button>
+              </div>
+            </section>
+            <section class="wb-toolbar-section" aria-label="筛选">
+              <span class="wb-toolbar-section-title">③ 筛选</span>
+              <div class="wb-toolbar-filter-row">
+                <input type="search" id="batchWorkbenchFilterName" placeholder="文件名关键词，回车添加" style="flex:1;min-width:160px;max-width:320px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterClearBtn" style="font-size:0.86rem;">清除筛选</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterDetectIssuesBtn" style="font-size:0.86rem;">仅识别问题</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterNotSignableBtn" style="font-size:0.86rem;">仅不可签</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchSelectFilteredBtn" style="font-size:0.86rem;">勾选当前筛选</button>
+                <span id="batchWorkbenchFilterHint" class="hint" style="margin:0;"></span>
+              </div>
+              <div id="batchWorkbenchFilterNameTags" class="wb-filter-tags" style="margin:0 0 6px;display:none;"></div>
+              <div class="wb-toolbar-filter-row">
+                <div class="wb-status-filter-wrap" id="batchWorkbenchFilterStatusWrap">
+                  <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterStatusToggle" style="font-size:0.86rem;">处理状态 ▼</button>
+                  <div id="batchWorkbenchFilterStatusPanel" class="wb-filter-status-dropdown">
+                    <div class="wb-filter-status-box-scroll">
+                      <div id="batchWorkbenchFilterStatusBox" class="wb-filter-status-box"></div>
+                    </div>
+                  </div>
+                </div>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchStatusSelectAllBtn" style="font-size:0.8rem;">全选状态</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchStatusClearBtn" style="font-size:0.8rem;">清空状态</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchSelectByStatusBtn" style="font-size:0.8rem;">按状态勾选</button>
+              </div>
+              <div class="wb-toolbar-filter-row">
+                <div class="wb-status-filter-wrap" id="batchWorkbenchFilterSlotWrap">
+                  <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterSlotToggle" style="font-size:0.86rem;" title="按签字位结论、缺位、版式、分隔、识别过程筛选">签字位 ▼</button>
+                  <div id="batchWorkbenchFilterSlotPanel" class="wb-filter-status-dropdown">
+                    <div class="wb-filter-status-box-scroll">
+                      <div id="batchWorkbenchFilterSlotBox" class="wb-filter-status-box"></div>
+                    </div>
+                  </div>
+                </div>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchSlotSelectAllBtn" style="font-size:0.8rem;">全选</button>
+                <button type="button" class="btn btn-secondary" id="batchWorkbenchSlotClearBtn" style="font-size:0.8rem;">清空</button>
+              </div>
+              <p class="hint" style="margin:6px 0 0;font-size:0.82rem;">签字位列：先看「可签/不可签」，再看各角色姓名位·日期位；悬停可看版式说明。筛选可叠加，已勾选文件跨筛选保留。</p>
+            </section>
           </div>
-          <div class="btn-row" style="margin:0 0 6px;align-items:center;flex-wrap:wrap;gap:8px;">
-            <label style="margin:0;font-size:0.88rem;">筛选</label>
-            <input type="search" id="batchWorkbenchFilterName" placeholder="文件名关键词，回车筛选" style="flex:1;min-width:140px;max-width:280px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;">
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterClearBtn" style="font-size:0.88rem;">清除筛选</button>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchFilterDetectIssuesBtn" style="font-size:0.88rem;">仅筛识别问题</button>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchSelectFilteredBtn" style="font-size:0.88rem;">累加勾选当前筛选</button>
-            <span id="batchWorkbenchFilterHint" class="hint" style="margin:0;"></span>
+          <div id="batchWorkbenchProgressWrap" aria-live="polite">
+            <progress id="batchWorkbenchProgressBar" max="100" value="0"></progress>
+            <div id="batchWorkbenchProgressText" class="hint" style="margin:4px 0 0;"></div>
           </div>
-          <div id="batchWorkbenchFilterNameTags" class="wb-filter-tags" style="margin:0 0 8px;display:none;"></div>
-          <div id="batchWorkbenchFilterStatusBox" class="wb-filter-status-box" style="margin:0 0 8px;">
-            <span style="color:var(--text-muted);margin-right:4px;">状态</span>
-            <label><input type="checkbox" data-wb-status="识别有误">识别有误</label>
-            <label><input type="checkbox" data-wb-status="识别失败">识别失败</label>
-            <label><input type="checkbox" data-wb-status="识别超时">识别超时</label>
-            <label><input type="checkbox" data-wb-status="未识别">未识别</label>
-            <label><input type="checkbox" data-wb-status="待匹配">待匹配</label>
-            <label><input type="checkbox" data-wb-status="就绪">就绪</label>
-            <label><input type="checkbox" data-wb-status="部分就绪">部分就绪</label>
-            <label><input type="checkbox" data-wb-status="无需签字">无需签字</label>
-            <label><input type="checkbox" data-wb-status="待处理">待处理</label>
-            <label><input type="checkbox" data-wb-status="识别中">识别中</label>
-            <button type="button" class="btn btn-secondary" id="batchWorkbenchSelectByStatusBtn" style="font-size:0.82rem;margin-left:6px;">按状态全选</button>
-          </div>
-          <p class="hint" style="margin:0 0 8px;font-size:0.85rem;">文件名回车可多次筛选合并（OR）；状态勾选后点「按状态全选」或「累加勾选当前筛选」。已勾选跨筛选保留。</p>
           <p id="batchWorkbenchMsg" class="btn-inline-feedback" style="display:none;margin:0 0 8px;" role="status"></p>
           <div class="batch-workbench-wrap">
             <table class="batch-workbench-table" id="batchWorkbenchTable">
@@ -541,6 +802,7 @@
                   <th class="group-h" colspan="2">批准</th>
                   <th rowspan="2">库素材</th>
                   <th rowspan="2">需签角色</th>
+                  <th rowspan="2" title="可签/不可签；第二行各角色姓名·日期位是否识别到；第三行版式（悬停看详情）">签字位</th>
                   <th class="col-status" rowspan="2">状态</th>
                   <th rowspan="2">操作</th>
                 </tr>
@@ -667,6 +929,77 @@
     </div>
   </div>
 
+  <div id="detectCorrectionModal" class="sign-modal-backdrop" aria-hidden="true">
+    <div class="sign-modal-box" role="dialog" aria-labelledby="detectCorrectionTitle">
+      <h3 id="detectCorrectionTitle">登记识别纠正</h3>
+      <p id="detectCorrectionScopeHint" class="hint" style="margin:0 0 8px;font-size:0.85rem;">说明错在哪；勾选本次要保存的范围（需签角色 / 签字位版式可只选其一）。保存后点「识别」会同时重跑角色与签字位识别并带入登记。</p>
+      <ul id="detectCorrectionBatchFileList" class="sign-modal-batch-files" style="display:none;margin:0 0 10px;padding:8px 10px;max-height:100px;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--surface2);font-size:0.82rem;"></ul>
+      <label for="detectCorrectionWrong">错在哪（必填）</label>
+      <textarea id="detectCorrectionWrong" placeholder="例如：把用例表列头「测试人」误识别为编写；或漏识别批准人；或日期应在角色下方而非右方"></textarea>
+      <div id="detectCorrectionSaveScopes" class="sign-modal-save-scopes" style="margin:12px 0 8px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface2);">
+        <span style="font-size:0.88rem;font-weight:600;display:block;margin-bottom:6px;">本次保存范围</span>
+        <label style="display:inline-flex;align-items:center;gap:6px;margin-right:16px;font-size:0.88rem;cursor:pointer;">
+          <input type="checkbox" id="detectCorrectionSaveRolesCb" checked style="width:16px;height:16px;accent-color:var(--accent);">
+          需签角色纠正
+        </label>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:0.88rem;cursor:pointer;">
+          <input type="checkbox" id="detectCorrectionSaveSlotCb" checked style="width:16px;height:16px;accent-color:var(--accent);">
+          签字位版式纠正
+        </label>
+      </div>
+      <fieldset id="detectCorrectionRolesFieldset" style="margin-top:8px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;">
+        <legend style="font-size:0.9rem;padding:0 6px;">正确的需签角色</legend>
+        <div id="detectCorrectionRoles" class="sign-modal-role-grid"></div>
+      </fieldset>
+      <fieldset id="detectCorrectionSlotFieldset" style="margin-top:12px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;">
+        <legend style="font-size:0.9rem;padding:0 6px;">签字位版式（可选，针对日期与角色的相对关系）</legend>
+        <p class="hint" style="margin:0 0 8px;font-size:0.82rem;">排列方式指编制/审核/批准/执行/审核人员之间；其余三项指各角色的日期相对位置。</p>
+        <label for="detectCorrectionArrangement">角色排列方式</label>
+        <select id="detectCorrectionArrangement" style="width:100%;margin:4px 0 8px;padding:8px;border:1px solid var(--border);border-radius:6px;">
+          <option value="">（不登记，沿用自动识别）</option>
+          <option value="horizontal">从左到右</option>
+          <option value="vertical">从上到下</option>
+          <option value="mixed">混合排列</option>
+        </select>
+        <label for="detectCorrectionDateRelation">角色与日期是否同格</label>
+        <select id="detectCorrectionDateRelation" style="width:100%;margin:4px 0 8px;padding:8px;border:1px solid var(--border);border-radius:6px;">
+          <option value="">（不登记）</option>
+          <option value="same_cell">同一单元格</option>
+          <option value="different_cell">不同单元格</option>
+          <option value="paragraph_inline">正文段落</option>
+        </select>
+        <label for="detectCorrectionDatePosition">日期相对角色位置</label>
+        <select id="detectCorrectionDatePosition" style="width:100%;margin:4px 0 8px;padding:8px;border:1px solid var(--border);border-radius:6px;">
+          <option value="">（不登记）</option>
+          <option value="right">日期在角色右方</option>
+          <option value="below">日期在角色下方</option>
+          <option value="inline">与角色同行/同格内联</option>
+        </select>
+        <label for="detectCorrectionSeparator">分隔方式</label>
+        <select id="detectCorrectionSeparator" style="width:100%;margin:4px 0;padding:8px;border:1px solid var(--border);border-radius:6px;">
+          <option value="">（不登记）</option>
+          <option value="cell">单元格（分格）</option>
+          <option value="empty_cell">空单元格</option>
+          <option value="slash">/</option>
+          <option value="space">空格</option>
+          <option value="newline">换行</option>
+        </select>
+      </fieldset>
+      <label for="detectCorrectionNote" style="margin-top:8px;">补充说明（可选）</label>
+      <textarea id="detectCorrectionNote" placeholder="例如：签批栏在页脚表格第2行；日期在右侧隔列" style="min-height:48px;"></textarea>
+      <label for="detectCorrectionKeywords" style="margin-top:8px;">标签关键词提示（可选，逗号分隔）</label>
+      <input type="text" id="detectCorrectionKeywords" placeholder="作者, 审核, 批准" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;">
+      <label style="margin-top:12px;">正确签批样式参考图（可选，最多6张）</label>
+      <input type="file" id="detectCorrectionImageInput" accept="image/png,image/jpeg,image/webp" multiple style="margin:6px 0;">
+      <div id="detectCorrectionRefList" class="sign-modal-ref-list"></div>
+      <p id="detectCorrectionModalMsg" class="hint" style="margin:8px 0;display:none;"></p>
+      <div class="btn-row" style="margin-top:14px;justify-content:flex-end;">
+        <button type="button" class="btn btn-secondary" id="detectCorrectionCancelBtn">取消</button>
+        <button type="button" class="btn btn-primary" id="detectCorrectionSaveBtn">保存并标为识别有误</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     (function () {
       if (typeof window !== 'undefined' && window.location.protocol === 'file:') {
@@ -692,7 +1025,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js?v=58';
+      s.src = (p || '') + '/js/sign-page.js?v=87';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +

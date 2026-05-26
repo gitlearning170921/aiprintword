@@ -11,7 +11,8 @@ import re
 _JSON_NAME = "sign_slot_layout_rules.json"
 
 _DEFAULT_RULES: Dict[str, Any] = {
-    "schema_version": 1,
+    "schema_version": 2,
+    "layout_priority_rules": [],
     "replace_prefilled_slot": {
         "enabled": True,
         "max_text_len": 48,
@@ -69,7 +70,8 @@ def _prepare_rules(raw: Dict[str, Any]) -> Dict[str, Any]:
     )
     search_pats = _compile_patterns([str(x) for x in search_raw if str(x).strip()])
     return {
-        "schema_version": int(raw.get("schema_version", 1) or 1),
+        "schema_version": int(raw.get("schema_version", 2) or 2),
+        "layout_priority_rules": list(raw.get("layout_priority_rules") or []),
         "replace_prefilled_slot": {
             "enabled": enabled,
             "max_text_len": max(8, min(max_len, 200)),
@@ -102,7 +104,7 @@ def validate_sign_slot_layout_rules_payload(raw: Dict[str, Any]) -> Dict[str, An
     if not isinstance(raw, dict):
         raise ValueError("规则文件顶层必须为 JSON 对象")
     out: Dict[str, Any] = {
-        "schema_version": int(raw.get("schema_version", 1) or 1),
+        "schema_version": int(raw.get("schema_version", 2) or 2),
     }
     slot = raw.get("replace_prefilled_slot")
     if slot is None:
@@ -132,6 +134,29 @@ def validate_sign_slot_layout_rules_payload(raw: Dict[str, Any]) -> Dict[str, An
         "fullmatch_patterns": fullmatch,
         "search_patterns": search,
     }
+    if "layout_priority_rules" in raw:
+        if not isinstance(raw["layout_priority_rules"], list):
+            raise ValueError("layout_priority_rules 必须为数组")
+        norm_rules = []
+        for item in raw["layout_priority_rules"]:
+            if not isinstance(item, dict):
+                continue
+            lt = str(item.get("layout_type") or "").strip()
+            if not lt:
+                continue
+            norm_rules.append(
+                {
+                    "layout_type": lt,
+                    "priority": int(item.get("priority", 0) or 0),
+                    "match_contains": [
+                        str(x).strip()
+                        for x in (item.get("match_contains") or [])
+                        if str(x).strip()
+                    ],
+                    "description": str(item.get("description") or "").strip(),
+                }
+            )
+        out["layout_priority_rules"] = norm_rules
     # 透传文档化字段，便于后续维护（可选）
     if "signature_slot_forms" in raw:
         if not isinstance(raw["signature_slot_forms"], list):

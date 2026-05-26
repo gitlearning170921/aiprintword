@@ -35,6 +35,7 @@ from sign_handlers.label_match import (
     paragraph_text_keyword_end_offset,
     xlsx_cell_has_leading_role_keyword,
 )
+from sign_handlers.docx_revision_text import cell_effective_text, paragraph_effective_text
 from sign_handlers.png_word_compat import (
     prepare_png_for_word,
     prepare_signature_date_pair_for_word,
@@ -67,11 +68,20 @@ def _is_slot_target_text(s: str) -> bool:
 
 
 def _cell_text(cell) -> str:
-    return (cell.text or "").strip()
+    return (cell_effective_text(cell) or "").strip()
 
 
 def _paragraph_full_text(p: Paragraph) -> str:
-    return p.text or ""
+    return paragraph_effective_text(p) or ""
+
+
+def _run_visible_text(r) -> str:
+    try:
+        from sign_handlers.docx_revision_text import ooxml_effective_text
+
+        return ooxml_effective_text(r._element)
+    except Exception:
+        return r.text or ""
 
 
 def _run_has_underline_or_border(r) -> bool:
@@ -108,22 +118,30 @@ def _clear_runs_after_offset(p: Paragraph, start_char_offset: int) -> None:
     acc = 0
     truncate_after = None
     for i, r in enumerate(list(p.runs)):
-        rt = r.text or ""
+        rt = _run_visible_text(r)
         ln = len(rt)
+        if ln == 0 and (r.text or ""):
+            acc += len(r.text or "")
+            continue
         if acc + ln <= start_char_offset:
             acc += ln
             continue
         if acc >= start_char_offset:
-            r.text = ""
-            acc += ln
+            if _run_visible_text(r) or not (r.text or ""):
+                r.text = ""
+            acc += max(ln, len(r.text or ""))
             continue
         cut = start_char_offset - acc
-        r.text = rt[:cut]
+        if _run_visible_text(r):
+            raw = r.text or ""
+            r.text = raw[:cut] if raw else ""
         truncate_after = i
+        acc += ln
         break
     if truncate_after is not None:
         for r in list(p.runs)[truncate_after + 1 :]:
-            r.text = ""
+            if _run_visible_text(r) or not (r.text or ""):
+                r.text = ""
 
 
 def _truncate_after_offset_and_get_anchor_run_idx(
@@ -145,7 +163,7 @@ def _truncate_after_offset_and_get_anchor_run_idx(
         return len(p.runs) - 1
 
     def _run_is_placeholder(r) -> bool:
-        rt = r.text or ""
+        rt = _run_visible_text(r) or (r.text or "")
         # 下划线/边框 run 通常是“__ / 点线”占位；直接当作占位清空
         if _run_has_underline_or_border(r):
             return True
@@ -163,8 +181,11 @@ def _truncate_after_offset_and_get_anchor_run_idx(
     acc = 0
     last_nonempty_idx = 0
     for i, r in enumerate(list(p.runs)):
-        rt = r.text or ""
+        rt = _run_visible_text(r)
         ln = len(rt)
+        if not ln and (r.text or ""):
+            acc += len(r.text or "")
+            continue
         if rt:
             last_nonempty_idx = i
         seg = acc + ln
@@ -172,14 +193,14 @@ def _truncate_after_offset_and_get_anchor_run_idx(
             acc = seg
             continue
         if seg == start_char_offset:
-            # offset 恰好在 run 边界：只清空“占位类”的后续 run
             for rr in list(p.runs)[i + 1 :]:
                 if _run_is_placeholder(rr):
                     rr.text = ""
             return i
-        # acc < offset < seg：截断当前 run 并清空后续
         cut = start_char_offset - acc
-        r.text = rt[:cut]
+        raw = r.text or ""
+        if rt:
+            r.text = raw[:cut] if raw else ""
         for rr in list(p.runs)[i + 1 :]:
             if _run_is_placeholder(rr):
                 rr.text = ""
@@ -755,11 +776,166 @@ def _iter_body_paragraphs(doc: DocumentObject) -> list[Paragraph]:
     return list(doc.paragraphs)
 
 
+def _planned_keywords_for_role(
+    role_id: str,
+    placement_plan: dict | None,
+) -> list[str]:
+    if not isinstance(placement_plan, dict):
+        return []
+    role_plan = placement_plan.get(str(role_id))
+    if not isinstance(role_plan, dict):
+        return []
+    kws = role_plan.get("keywords")
+    if not isinstance(kws, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in kws:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _planned_source_hints_for_role(
+    role_id: str,
+    placement_plan: dict | None,
+) -> list[str]:
+    if not isinstance(placement_plan, dict):
+        return []
+    role_plan = placement_plan.get(str(role_id))
+    if not isinstance(role_plan, dict):
+        return []
+    arr = role_plan.get("source_hints")
+    if not isinstance(arr, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in arr:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _planned_layout_types_for_role(
+    role_id: str,
+    placement_plan: dict | None,
+) -> list[str]:
+    if not isinstance(placement_plan, dict):
+        return []
+    role_plan = placement_plan.get(str(role_id))
+    if not isinstance(role_plan, dict):
+        return []
+    arr = role_plan.get("layout_types")
+    if not isinstance(arr, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in arr:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _parse_docx_table_row_hint(source_hint: str) -> tuple[int, int] | None:
+    m = re.match(r"^\s*table(\d+)\.row(\d+)\s*$", str(source_hint or ""), re.IGNORECASE)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _parse_docx_paragraph_hint(source_hint: str) -> int | None:
+    m = re.match(r"^\s*paragraph(\d+)\s*$", str(source_hint or ""), re.IGNORECASE)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _try_table_role_at_row(
+    table: Table,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+    row_no_1based: int,
+) -> bool:
+    rows_list = list(table.rows)
+    ri = int(row_no_1based) - 1
+    if ri < 0 or ri >= len(rows_list):
+        return False
+    row = rows_list[ri]
+    cells = row.cells
+    for ci, cell in enumerate(cells):
+        ct = _cell_text(cell)
+        if not _cell_has_table_signoff_reservation(ct, keyword, cells, ci, rows_list, ri):
+            continue
+        if _place_sig_date_at_signoff_anchor(
+            cell, keyword, cells, ci, rows_list, ri, sig_png, date_png
+        ):
+            return True
+    return False
+
+
+def _try_docx_plan_placement(
+    doc: DocumentObject,
+    keywords: list[str],
+    source_hints: list[str],
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    if not keywords or not source_hints:
+        return False
+    body_first_tables = _iter_all_tables(doc, footers_first=False)
+    footer_first_tables = _iter_all_tables(doc, footers_first=True)
+    body_paras = _iter_body_paragraphs(doc)
+
+    for hint in source_hints:
+        tr = _parse_docx_table_row_hint(hint)
+        if tr:
+            tno, rno = tr
+            candidates: list[Table] = []
+            if 1 <= tno <= len(body_first_tables):
+                candidates.append(body_first_tables[tno - 1])
+            if 1 <= tno <= len(footer_first_tables):
+                candidates.append(footer_first_tables[tno - 1])
+            seen_tables: set[int] = set()
+            uniq: list[Table] = []
+            for tb in candidates:
+                ident = id(tb)
+                if ident in seen_tables:
+                    continue
+                seen_tables.add(ident)
+                uniq.append(tb)
+            for kw in keywords:
+                for tb in uniq:
+                    if _try_table_role_at_row(tb, kw, sig_png, date_png, rno):
+                        return True
+        pno = _parse_docx_paragraph_hint(hint)
+        if pno is not None and 1 <= pno <= len(body_paras):
+            p = body_paras[pno - 1]
+            for kw in keywords:
+                if _find_keyword_in_paragraph(p, kw) < 0:
+                    continue
+                if _try_paragraph_inline(p, kw, sig_png, date_png):
+                    return True
+    return False
+
+
 def sign_docx(
     path: str,
     role_to_signature_png: dict,
     role_to_date_png: dict,
     out_path: Optional[str] = None,
+    placement_plan: dict | None = None,
+    placement_result: dict | None = None,
 ) -> str:
     path = os.path.abspath(path)
     if out_path is None:
@@ -787,50 +963,113 @@ def sign_docx(
     for role_id in ROLE_ID_TO_KEYWORD:
         sig = sig_map.get(role_id)
         dt = date_map.get(role_id)
+        role_result = None
+        if isinstance(placement_result, dict):
+            role_result = placement_result.setdefault(
+                str(role_id),
+                {
+                    "applied_sig": bool(sig),
+                    "applied_date": bool(dt),
+                    "placed": False,
+                    "placed_by": "",
+                    "keywords": [],
+                },
+            )
         if not sig and not dt:
+            if isinstance(role_result, dict):
+                role_result["placed"] = False
+                role_result["placed_by"] = "skip_no_material"
             continue
         done = False
-        kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
+        fallback_kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
+        planned_kws = _planned_keywords_for_role(role_id, placement_plan)
+        planned_hints = _planned_source_hints_for_role(role_id, placement_plan)
+        planned_layout_types = _planned_layout_types_for_role(role_id, placement_plan)
+        kws = []
+        seen_kw: set[str] = set()
+        for kw in planned_kws + fallback_kws:
+            if kw in seen_kw:
+                continue
+            seen_kw.add(kw)
+            kws.append(kw)
+        if isinstance(role_result, dict):
+            role_result["keywords"] = kws[:]
+            role_result["source_hints"] = planned_hints[:]
+            role_result["layout_types"] = planned_layout_types[:]
+        placed_by = ""
         tables = _iter_all_tables(doc, footers_first=True)
-        for kw in kws:
-            if done:
-                break
-            for table in tables:
-                if _try_table_role(table, kw, sig, dt, role_id=role_id):
-                    done = True
+        if ("two_row_signoff_table" in planned_layout_types) and kws:
+            for kw in kws:
+                if done:
                     break
+                for table in tables:
+                    if _try_table_role(table, kw, sig, dt, role_id=role_id):
+                        done = True
+                        placed_by = "planned_layout_type"
+                        break
+        if (not done) and planned_hints and kws:
+            done = _try_docx_plan_placement(doc, kws, planned_hints, sig, dt)
             if done:
-                break
-            for p in _iter_body_paragraphs(doc):
-                if _find_keyword_in_paragraph(p, kw) < 0:
-                    continue
-                if _try_paragraph_inline(p, kw, sig, dt):
-                    done = True
+                placed_by = "planned_source_hint"
+        if not done:
+            for kw in kws:
+                if done:
                     break
-            if done:
-                break
-            for table in tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        ct = _cell_text(cell)
-                        if not cell_has_role_keyword(ct, kw):
-                            continue
-                        if cell_is_bare_role_column_header(ct, kw):
-                            continue
-                        if not cell_has_label_inline_reservation(ct, kw):
-                            continue
-                        for p in cell.paragraphs:
-                            if _find_keyword_in_paragraph(p, kw) < 0:
+                for table in tables:
+                    if _try_table_role(table, kw, sig, dt, role_id=role_id):
+                        done = True
+                        if not placed_by:
+                            placed_by = (
+                                "planned_keywords" if planned_kws else "fallback_keywords"
+                            )
+                        break
+                if done:
+                    break
+                for p in _iter_body_paragraphs(doc):
+                    if _find_keyword_in_paragraph(p, kw) < 0:
+                        continue
+                    if _try_paragraph_inline(p, kw, sig, dt):
+                        done = True
+                        if not placed_by:
+                            placed_by = (
+                                "planned_keywords" if planned_kws else "fallback_keywords"
+                            )
+                        break
+                if done:
+                    break
+                for table in tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            ct = _cell_text(cell)
+                            if not cell_has_role_keyword(ct, kw):
                                 continue
-                            if _try_paragraph_inline(p, kw, sig, dt):
-                                done = True
+                            if cell_is_bare_role_column_header(ct, kw):
+                                continue
+                            if not cell_has_label_inline_reservation(ct, kw):
+                                continue
+                            for p in cell.paragraphs:
+                                if _find_keyword_in_paragraph(p, kw) < 0:
+                                    continue
+                                if _try_paragraph_inline(p, kw, sig, dt):
+                                    done = True
+                                    if not placed_by:
+                                        placed_by = (
+                                            "planned_keywords" if planned_kws else "fallback_keywords"
+                                        )
+                                    break
+                            if done:
                                 break
                         if done:
                             break
                     if done:
                         break
-                if done:
-                    break
+
+        if isinstance(role_result, dict):
+            role_result["placed"] = bool(done)
+            if done:
+                role_result["placed_by"] = placed_by or "fallback_keywords"
+            else:
+                role_result["placed_by"] = "not_found"
 
     doc.save(out_path)
     return out_path

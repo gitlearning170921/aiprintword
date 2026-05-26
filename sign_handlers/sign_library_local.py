@@ -707,6 +707,26 @@ def set_file_workbench_state(inbox_root: str, sid: str, file_id: str, state: dic
     _save_file_session_cache(inbox_root, sid, cache)
 
 
+def set_file_detect_correction(inbox_root: str, sid: str, file_id: str, correction: dict) -> None:
+    from sign_handlers.file_session_cache import trim_detect_correction
+
+    cache = _load_file_session_cache(inbox_root, sid)
+    ent = cache.get(file_id) if isinstance(cache.get(file_id), dict) else {}
+    ent["detect_correction"] = trim_detect_correction(correction)
+    cache[file_id] = ent
+    _save_file_session_cache(inbox_root, sid, cache)
+
+
+def get_file_detect_correction(inbox_root: str, sid: str, file_id: str) -> Optional[dict]:
+    from sign_handlers.file_session_cache import trim_detect_correction
+
+    ent = _load_file_session_cache(inbox_root, sid).get(file_id)
+    if not isinstance(ent, dict):
+        return None
+    data = trim_detect_correction(ent.get("detect_correction"))
+    return data if data else None
+
+
 def get_file_workbench_state(inbox_root: str, sid: str, file_id: str) -> Optional[dict]:
     from sign_handlers.file_session_cache import trim_workbench_state
 
@@ -730,6 +750,9 @@ def list_file_session_caches(inbox_root: str, sid: str) -> Dict[str, dict]:
         wb = ent.get("workbench")
         if isinstance(wb, dict) and wb:
             entry["workbench"] = wb
+        corr = ent.get("detect_correction")
+        if isinstance(corr, dict) and corr:
+            entry["detect_correction"] = corr
         m = get_file_role_map(inbox_root, sid, str(fid))
         if m:
             entry["map"] = m

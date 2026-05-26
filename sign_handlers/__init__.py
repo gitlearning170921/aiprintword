@@ -16,6 +16,8 @@ def sign_document(
     role_to_signature_png: dict,
     role_to_date_png: dict,
     out_path: str | None = None,
+    placement_plan: dict | None = None,
+    placement_result: dict | None = None,
 ) -> str:
     """
     根据扩展名写入签名与日期图片。
@@ -24,7 +26,21 @@ def sign_document(
     """
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".docx":
-        return sign_docx(file_path, role_to_signature_png, role_to_date_png, out_path)
+        return sign_docx(
+            file_path,
+            role_to_signature_png,
+            role_to_date_png,
+            out_path,
+            placement_plan=placement_plan,
+            placement_result=placement_result,
+        )
     if ext == ".xlsx":
-        return sign_xlsx(file_path, role_to_signature_png, role_to_date_png, out_path)
+        return sign_xlsx(
+            file_path,
+            role_to_signature_png,
+            role_to_date_png,
+            out_path,
+            placement_plan=placement_plan,
+            placement_result=placement_result,
+        )
     raise ValueError(f"不支持的格式: {ext}")
