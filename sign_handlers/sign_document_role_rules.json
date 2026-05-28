@@ -443,13 +443,12 @@
       "roles": [
         "author",
         "reviewer",
-        "approver",
-        "executor"
+        "approver"
       ],
       "source_example": "QR-SMP7.5.6-01-03 现成软件确认报告-MySQL（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、审核/复核、批准、执行/测试",
-      "note": "人工标误同步：漏识别执行人员",
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员",
       "learned_from_correction": true
     },
     {
@@ -458,13 +457,12 @@
       "roles": [
         "author",
         "reviewer",
-        "approver",
-        "executor"
+        "approver"
       ],
       "source_example": "QR-SMP7.5.6-01-03 现成软件确认报告-阿里云（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、审核/复核、批准、执行/测试",
-      "note": "人工标误同步：漏识别执行人员",
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员",
       "learned_from_correction": true
     },
     {
@@ -612,16 +610,18 @@
       "label": "编写/编制、审核/复核、批准"
     },
     {
-      "pattern": "成品检验作业指导书",
+      "pattern": "ECGAP-SOP003  成品检验作业指导书",
       "match": "contains",
       "roles": [
         "author",
         "reviewer",
         "approver"
       ],
-      "source_example": "T2 设计开发输出/ECGAP-SOP003  成品检验作业指导书/ECGAP-SOP003  成品检验作业指导书（A0）.docx",
+      "source_example": "ECGAP-SOP003  成品检验作业指导书（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：签字位落位时多识别了审核人员（文末）",
+      "learned_from_correction": true
     },
     {
       "pattern": "软件发布作业指导书",
@@ -708,16 +708,18 @@
       "label": "编写/编制、审核/复核、批准"
     },
     {
-      "pattern": "传统算法测试报告",
+      "pattern": "ECGAP-TAT-001 传统算法测试报告",
       "match": "contains",
       "roles": [
         "author",
         "reviewer",
         "approver"
       ],
-      "source_example": "T3 设计开发验证/ECGAP-TAT-001 传统算法测试报告/ECGAP-TAT-001 传统算法测试报告（A0）.docx",
+      "source_example": "ECGAP-TAT-001 传统算法测试报告（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员签字角色",
+      "learned_from_correction": true
     },
     {
       "pattern": "单元测试报告",
@@ -937,69 +939,74 @@
       "label": "编写/编制、审核/复核、批准"
     },
     {
-      "pattern": "现成软件确认报告-Docker",
+      "pattern": "QR-SMP7.5.6-01-03 现成软件确认报告-Docker",
       "match": "contains",
       "roles": [
         "author",
-        "executor",
         "reviewer",
         "approver"
       ],
-      "source_example": "T0 设计开发策划/现成软件/QR-SMP7.5.6-01-03 现成软件确认报告-Docker/QR-SMP7.5.6-01-03 现成软件确认报告-Docker（A0）.docx",
+      "source_example": "QR-SMP7.5.6-01-03 现成软件确认报告-Docker（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、执行/测试、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员",
+      "learned_from_correction": true
     },
     {
-      "pattern": "现成软件确认报告-Nginx",
+      "pattern": "QR-SMP7.5.6-01-03 现成软件确认报告-Nginx",
       "match": "contains",
       "roles": [
         "author",
-        "executor",
         "reviewer",
         "approver"
       ],
-      "source_example": "T0 设计开发策划/现成软件/QR-SMP7.5.6-01-03 现成软件确认报告-Nginx/QR-SMP7.5.6-01-03 现成软件确认报告-Nginx（A0）.docx",
+      "source_example": "QR-SMP7.5.6-01-03 现成软件确认报告-Nginx（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、执行/测试、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员",
+      "learned_from_correction": true
     },
     {
-      "pattern": "现成软件确认报告-RabbitMQ",
+      "pattern": "QR-SMP7.5.6-01-03 现成软件确认报告-RabbitMQ",
       "match": "contains",
       "roles": [
         "author",
-        "executor",
         "reviewer",
         "approver"
       ],
-      "source_example": "T0 设计开发策划/现成软件/QR-SMP7.5.6-01-03 现成软件确认报告-RabbitMQ/QR-SMP7.5.6-01-03 现成软件确认报告-RabbitMQ（A0）.docx",
+      "source_example": "QR-SMP7.5.6-01-03 现成软件确认报告-RabbitMQ（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、执行/测试、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员",
+      "learned_from_correction": true
     },
     {
-      "pattern": "现成软件确认报告-Redis",
+      "pattern": "QR-SMP7.5.6-01-03 现成软件确认报告-Redis",
       "match": "contains",
       "roles": [
         "author",
-        "executor",
         "reviewer",
         "approver"
       ],
-      "source_example": "T0 设计开发策划/现成软件/QR-SMP7.5.6-01-03 现成软件确认报告-Redis/QR-SMP7.5.6-01-03 现成软件确认报告-Redis（A0）.docx",
+      "source_example": "QR-SMP7.5.6-01-03 现成软件确认报告-Redis（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、执行/测试、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员",
+      "learned_from_correction": true
     },
     {
-      "pattern": "现成软件确认报告-鱼跃健康",
+      "pattern": "QR-SMP7.5.6-01-03 现成软件确认报告-鱼跃健康",
       "match": "contains",
       "roles": [
         "author",
-        "executor",
         "reviewer",
         "approver"
       ],
-      "source_example": "T0 设计开发策划/现成软件/QR-SMP7.5.6-01-03 现成软件确认报告-鱼跃健康/QR-SMP7.5.6-01-03 现成软件确认报告-鱼跃健康（A0）.docx",
+      "source_example": "QR-SMP7.5.6-01-03 现成软件确认报告-鱼跃健康（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、执行/测试、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "note": "人工标误同步：多识别了执行人员",
+      "learned_from_correction": true
     },
     {
       "pattern": "现成软件确认报告-鱼跃健康",
@@ -1015,17 +1022,18 @@
       "label": "编写/编制、执行/测试、审核/复核、批准"
     },
     {
-      "pattern": "兼容性测试方案",
+      "pattern": "ECGAP-SCS-001 兼容性测试方案",
       "match": "contains",
       "roles": [
         "author",
         "reviewer",
         "approver"
       ],
-      "source_example": "T3 设计开发验证/ECGAP-SCS-001 兼容性测试方案/ECGAP-SCS-001 兼容性测试方案（A0）.docx",
-      "note": "人工修正：兼容性测试方案仅编写/审核/批准，去除误识别执行人员；版本号不参与匹配。",
+      "source_example": "ECGAP-SCS-001 兼容性测试方案（A0）.docx",
+      "note": "人工标误同步：多识别了执行人员签字角色",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "learned_from_correction": true
     },
     {
       "pattern": "兼容性测试方案",
@@ -1041,17 +1049,18 @@
       "label": "编写/编制、审核/复核、批准"
     },
     {
-      "pattern": "系统测试报告",
+      "pattern": "ECGAP-STR-001  系统测试报告",
       "match": "contains",
       "roles": [
         "author",
         "reviewer",
         "approver"
       ],
-      "note": "人工修正：仅编写/审核/批准，去除误识别执行人员。",
-      "source_example": "T3 设计开发验证/ECGAP-STR-001  系统测试报告/ECGAP-STR-001  系统测试报告（A0）.docx",
+      "note": "人工标误同步：多识别了执行人员签字角色",
+      "source_example": "ECGAP-STR-001  系统测试报告（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "learned_from_correction": true
     },
     {
       "pattern": "ECGAP-RTS-001 用户测试方案",
@@ -1064,7 +1073,7 @@
       "source_example": "ECGAP-RTS-001 用户测试方案（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、审核/复核、批准",
-      "note": "人工标误同步：多识别了一个执行人员",
+      "note": "人工标误同步：多识别了执行人员签字角色",
       "learned_from_correction": true
     },
     {
@@ -1078,7 +1087,7 @@
       "source_example": "ECGAP-SUS-001 总结性可用性测试方案（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、审核/复核、批准",
-      "note": "人工标误同步：多识别了一个执行人员",
+      "note": "人工标误同步：多识别了执行人员签字角色",
       "learned_from_correction": true
     },
     {
@@ -1091,7 +1100,7 @@
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-Docker（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员",
+      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员；签字位：角色上下排、名日分格、日期在右",
       "learned_from_correction": true
     },
     {
@@ -1104,7 +1113,7 @@
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-MySQL（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员",
+      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员；签字位：角色上下排、名日分格、日期在右",
       "learned_from_correction": true
     },
     {
@@ -1117,7 +1126,7 @@
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-Nginx（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员",
+      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员；签字位：角色上下排、名日分格、日期在右",
       "learned_from_correction": true
     },
     {
@@ -1130,7 +1139,7 @@
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-RabbitMQ（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员",
+      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员；签字位：角色上下排、名日分格、日期在右",
       "learned_from_correction": true
     },
     {
@@ -1143,7 +1152,7 @@
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-Redis（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员",
+      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员；签字位：角色上下排、名日分格、日期在右",
       "learned_from_correction": true
     },
     {
@@ -1156,7 +1165,7 @@
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-阿里云（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员",
+      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员；签字位：角色上下排、名日分格、日期在右",
       "learned_from_correction": true
     },
     {
@@ -1169,7 +1178,7 @@
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-鱼跃健康（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员",
+      "note": "人工标误同步：存在申请人签字位，应该识别到编写人员；签字位：角色上下排、名日分格、日期在右",
       "learned_from_correction": true
     },
     {
@@ -1186,13 +1195,13 @@
       "pattern": "单元测试用例执行表",
       "match": "contains",
       "roles": [
-        "executor",
-        "reviewer"
+        "executor"
       ],
-      "source_example": "T3 设计开发验证/ECGAP-UTR-001 单元测试报告/附件 单元测试用例执行表（A0）.docx",
-      "note": "人工修正：用例执行表需要执行人员和审核人员签字。",
+      "source_example": "附件 单元测试用例执行表（A0）.docx",
+      "note": "人工标误同步：执行人员日期签字位识别不到；签字位：日期在下",
       "sign_policy": "detect_roles",
-      "label": "执行/测试、审核/复核"
+      "label": "执行/测试",
+      "learned_from_correction": true
     },
     {
       "pattern": "单元测试用例表",
@@ -1398,7 +1407,7 @@
       "source_example": "QR-SMP7.5.6-01-02 现成软件列表（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、批准",
-      "note": "人工标误同步：漏识别批准人，角色日期在同一个字段中、/分隔；签字位：角色左右排、分隔/",
+      "note": "人工标误同步：存在批准签字位，但未识别出来；签字位：角色左右排、分隔/",
       "learned_from_correction": true
     },
     {
@@ -1444,7 +1453,7 @@
       "source_example": "ECGAP-NTR-001 网络安全测试报告（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、审核/复核、批准",
-      "note": "人工标误同步：漏识别审核、批准人员，角色与日期版本识别错误；签字位：角色上下排、名日分格、日期在右、分隔单元格",
+      "note": "人工标误同步：识别签字位时不应该落位到更改记录中，应该落位到封面、正文或者末尾，漏识别了审核、批准角色，签字位落位失败；签字位：角色上下排、名日分格、日期在右、分隔单元格",
       "learned_from_correction": true
     },
     {
@@ -1458,21 +1467,22 @@
       "source_example": "ECGAP-NTS-001 网络安全测试方案（A0）.docx",
       "sign_policy": "detect_roles",
       "label": "编写/编制、审核/复核、批准",
-      "note": "人工标误同步：漏识别审核、批准人员，角色与日期版本识别错误；签字位：角色上下排、名日分格、日期在右、分隔单元格",
+      "note": "人工标误同步：识别签字位时不应该落位到更改记录中，应该落位到封面、正文或者末尾，漏识别了审核、批准角色，签字位落位失败；签字位：角色上下排、名日分格、日期在右、分隔单元格",
       "learned_from_correction": true
     },
     {
-      "pattern": "网络安全风险管理报告",
+      "pattern": "ECGAP-NSR-001 网络安全风险管理报告",
       "match": "contains",
       "roles": [
         "author",
         "reviewer",
         "approver"
       ],
-      "note": "人工修正：.doc 转换后应为编写/审核/批准。",
-      "source_example": "T5 设计开发确认/ECGAP-NSR-001 网络安全风险管理报告/ECGAP-NSR-001 网络安全风险管理报告（A0）.doc",
+      "note": "人工标误同步：识别签字位时不应该落位到更改记录中，应该落位到封面、正文或者末尾，漏识别了审核、批准角色，签字位落位失败；签字位：角色上下排、名日分格、日期在右、分隔单元格",
+      "source_example": "ECGAP-NSR-001 网络安全风险管理报告（A0）.docx",
       "sign_policy": "detect_roles",
-      "label": "编写/编制、审核/复核、批准"
+      "label": "编写/编制、审核/复核、批准",
+      "learned_from_correction": true
     },
     {
       "pattern": "设计和开发评审报告-策划",
@@ -1665,7 +1675,7 @@
       "note": "本类附件无签批栏，不进签字流程；仍会轻量解析文档（非用例表快速跳过）。"
     }
   ],
-  "updated": "2026-05-26",
+  "updated": "2026-05-22",
   "runtime_policy": {
     "match": "文件名 contains 主题片段（pattern），不含项目编号/版本号/扩展名",
     "detect_roles": "sign_policy=detect_roles：正常识别签字角色并进入匹配/签字流程",

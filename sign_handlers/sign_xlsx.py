@@ -379,13 +379,120 @@ def _add_sig_and_date_after_label_in_cell(
     ws.add_image(date_img)
 
 
+def _is_xlsx_label_blank_date_blank_row(
+    ws, r: int, label_c: int, kw: str, max_c: int
+) -> bool:
+    """Excel 四列：角色 | 姓名空白 | 日期 | 日期空白。"""
+    if label_c + 3 > max_c:
+        return False
+    lv = ws.cell(row=r, column=label_c).value
+    if not cell_has_role_keyword(str(lv or ""), kw):
+        return False
+    if not _is_slot_target(ws.cell(row=r, column=label_c + 1).value):
+        return False
+    dv = ws.cell(row=r, column=label_c + 2).value
+    if not (
+        cell_text_matches_keyword(dv, "日期")
+        or cell_text_matches_keyword(dv, "Date")
+        or cell_looks_like_signoff_date_label(dv)
+    ):
+        return False
+    return _is_slot_target(ws.cell(row=r, column=label_c + 3).value)
+
+
+def _try_xlsx_four_column_row(
+    ws, r: int, label_c: int, kw: str, sig, dt, max_r: int
+) -> bool:
+    max_c = min(int(ws.max_column or 1), 128)
+    if not _is_xlsx_label_blank_date_blank_row(ws, r, label_c, kw, max_c):
+        return False
+    placed = False
+    sig_cell = ws.cell(row=r, column=label_c + 1)
+    date_hdr = ws.cell(row=r, column=label_c + 2)
+    date_cell = ws.cell(row=r, column=label_c + 3)
+    if sig and _is_slot_target(sig_cell.value):
+        sig_cell.value = None
+        _add_png(ws, sig, _merged_top_left_coordinate(ws, sig_cell), sig_cell)
+        placed = True
+    if dt:
+        if _is_slot_target(date_cell.value):
+            date_cell.value = None
+            _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
+            placed = True
+        else:
+            d_inline = cell_inline_insert_offset_px(date_hdr.value, "Date")
+            if d_inline is None:
+                d_inline = cell_inline_insert_offset_px(date_hdr.value, "日期")
+            if d_inline is not None:
+                _add_png_after_label_in_cell(ws, dt, date_hdr, d_inline)
+                placed = True
+            elif _is_slot_target(ws.cell(row=r, column=label_c + 4).value):
+                dc2 = ws.cell(row=r, column=label_c + 4)
+                dc2.value = None
+                _add_png(ws, dt, _merged_top_left_coordinate(ws, dc2), dc2)
+                placed = True
+    if sig and not dt:
+        return placed
+    if dt:
+        return placed
+    return placed
+
+
+def _try_xlsx_role_layout_cells(
+    wb,
+    role_id: str,
+    placement_plan: dict | None,
+    keywords: list,
+    sig,
+    dt,
+) -> bool:
+    if not isinstance(placement_plan, dict):
+        return False
+    rp = placement_plan.get(str(role_id))
+    if not isinstance(rp, dict):
+        return False
+    name_cell = rp.get("xlsx_name_cell") or rp.get("name_cell")
+    if not isinstance(name_cell, dict):
+        return False
+    want_date = bool(rp.get("date_slot", True))
+    dt_use = dt if want_date else None
+    sno = int(name_cell.get("sheet") or name_cell.get("table") or 0)
+    rno = int(name_cell.get("row") or 0)
+    cno = int(name_cell.get("col") or 0)
+    if rno < 1 or cno < 1:
+        return False
+    if sno < 1 or sno > len(wb.worksheets):
+        ws_list = list(wb.worksheets)
+    else:
+        ws_list = [wb.worksheets[sno - 1]]
+    max_r = 0
+    for ws in ws_list:
+        max_r = int(ws.max_row or 1)
+        for kw in keywords:
+            for c in range(max(1, cno - 1), min(int(ws.max_column or 1), 128) + 1):
+                if _try_xlsx_four_column_row(ws, rno, c, kw, sig, dt_use, max_r):
+                    return True
+                if _try_place_at_keyword_cell(ws, rno, c, kw, sig, dt_use, max_r):
+                    return True
+            for c in range(1, min(int(ws.max_column or 1), 128) + 1):
+                if _try_xlsx_four_column_row(ws, rno, c, kw, sig, dt_use, max_r):
+                    return True
+    return False
+
+
 def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int) -> bool:
+    max_c = min(int(ws.max_column or 1), 128)
+    for label_c in range(max(1, c - 1), min(c + 2, max_c + 1)):
+        if _try_xlsx_four_column_row(ws, r, label_c, kw, sig, dt, max_r):
+            return True
     cell = ws.cell(row=r, column=c)
     val = cell.value
     ct = str(val).strip() if val is not None else ""
     if not (cell_text_matches_keyword(val, kw) or xlsx_cell_has_leading_role_keyword(val, kw)):
         return False
     if cell_is_bare_role_column_header(val, kw):
+        if _try_xlsx_four_column_row(ws, r, c, kw, sig, dt, max_r):
+            return True
         return False
     has_blank_right = c + 1 <= int(ws.max_column or 1) and _is_emptyish(
         ws.cell(row=r, column=c + 1).value
@@ -559,7 +666,13 @@ def sign_xlsx(
                 sig = sb
             if dt is None and db:
                 dt = db
-        if not sig and not dt:
+        want_date = True
+        if isinstance(placement_plan, dict):
+            rp0 = placement_plan.get(str(role_id))
+            if isinstance(rp0, dict) and "date_slot" in rp0:
+                want_date = bool(rp0.get("date_slot"))
+        dt_use = dt if want_date else None
+        if not sig and not dt_use:
             if isinstance(placement_result, dict):
                 placement_result[str(role_id)] = {
                     "applied_sig": False,
@@ -592,6 +705,12 @@ def sign_xlsx(
                 "source_hints": planned_hints[:],
                 "layout_types": planned_layout_types[:],
             }
+        if (not placed) and placement_plan:
+            placed = _try_xlsx_role_layout_cells(
+                wb, role_id, placement_plan, kws, sig, dt_use
+            )
+            if placed:
+                placed_by = "layout_cells"
         if planned_hints and kws:
             for hint in planned_hints:
                 parsed = _parse_xlsx_row_hint(hint)
@@ -638,7 +757,7 @@ def sign_xlsx(
                         if placed:
                             break
                         for c in range(1, min(int(ws.max_column or 1), 128) + 1):
-                            if _try_place_at_keyword_cell(ws, r, c, kw, sig, dt, max_r):
+                            if _try_place_at_keyword_cell(ws, r, c, kw, sig, dt_use, max_r):
                                 placed = True
                                 if not placed_by:
                                     placed_by = (

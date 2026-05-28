@@ -2,7 +2,9 @@
 """人工识别纠正登记：重新识别时带入期望角色与标签提示。"""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import io
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from sign_handlers.config import ROLE_ID_TO_KEYWORD
 
@@ -193,16 +195,187 @@ def _filter_blocks_by_roles(blocks: Any, allowed_roles: List[str]) -> List[Dict[
     return out
 
 
+def _get_setting_bool(key: str, default: bool) -> bool:
+    try:
+        from runtime_settings.resolve import get_setting
+
+        return bool(get_setting(key))
+    except Exception:
+        return bool(default)
+
+
+def _get_setting_int(key: str, default: int, low: int, high: int) -> int:
+    try:
+        from runtime_settings.resolve import get_setting
+
+        v = int(get_setting(key))
+    except Exception:
+        v = int(default)
+    if v < low:
+        v = low
+    if v > high:
+        v = high
+    return v
+
+
+def _ocr_text_from_image_bytes(data: bytes) -> str:
+    """轻量 OCR：优先 pytesseract（可选依赖），失败时返回空串。"""
+    if not data:
+        return ""
+    try:
+        from PIL import Image
+    except Exception:
+        return ""
+    try:
+        import pytesseract
+    except Exception:
+        return ""
+    try:
+        im = Image.open(io.BytesIO(data)).convert("L")
+    except Exception:
+        return ""
+    txt = ""
+    for lang in ("chi_sim+eng", "eng"):
+        try:
+            t = pytesseract.image_to_string(im, lang=lang)
+            if t and len(t.strip()) >= len(txt.strip()):
+                txt = t
+        except Exception:
+            continue
+    return str(txt or "").strip()
+
+
+def _extract_role_keywords_from_ocr_text(text: str) -> List[str]:
+    t = str(text or "")
+    if not t:
+        return []
+    t_norm = re.sub(r"\s+", "", t).lower()
+    out: List[str] = []
+    seen = set()
+    try:
+        from sign_handlers.config import role_keywords
+
+        for rid in ROLE_ID_TO_KEYWORD:
+            for kw in role_keywords(rid):
+                ks = str(kw or "").strip()
+                if not ks:
+                    continue
+                if re.sub(r"\s+", "", ks).lower() in t_norm:
+                    if ks not in seen:
+                        seen.add(ks)
+                        out.append(ks[:64])
+                    break
+    except Exception:
+        for rid, kw in (ROLE_ID_TO_KEYWORD or {}).items():
+            ks = str(kw or "").strip()
+            if not ks:
+                continue
+            if re.sub(r"\s+", "", ks).lower() in t_norm and ks not in seen:
+                seen.add(ks)
+                out.append(ks[:64])
+    return out[:24]
+
+
+def _ocr_keywords_from_reference_images(
+    corr: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    """从参考图 OCR 提取角色词；返回 (关键词列表, 统计信息供前端展示)。"""
+    stats: Dict[str, Any] = {
+        "enabled": _get_setting_bool("SIGN_DETECT_HINT_OCR_REF_IMAGES", True),
+        "images_configured": 0,
+        "images_tried": 0,
+        "images_read_ok": 0,
+        "keywords_found": [],
+        "skipped_reason": "",
+    }
+    if not stats["enabled"]:
+        stats["skipped_reason"] = "ocr_disabled"
+        return [], stats
+    imgs = list(corr.get("reference_images") or [])
+    stats["images_configured"] = len(imgs)
+    if not imgs:
+        stats["skipped_reason"] = "no_reference_images"
+        return [], stats
+    max_imgs = _get_setting_int("SIGN_DETECT_HINT_OCR_MAX_IMAGES", 2, 0, 6)
+    if max_imgs <= 0:
+        stats["skipped_reason"] = "ocr_max_images_zero"
+        return [], stats
+    merged: List[str] = []
+    seen = set()
+    try:
+        from sign_handlers.detect_correction_storage import download_reference_image
+    except Exception:
+        stats["skipped_reason"] = "storage_unavailable"
+        return [], stats
+    for meta in imgs[:max_imgs]:
+        if not isinstance(meta, dict):
+            continue
+        stats["images_tried"] += 1
+        try:
+            blob, _ = download_reference_image(meta)
+        except Exception:
+            continue
+        stats["images_read_ok"] += 1
+        txt = _ocr_text_from_image_bytes(blob)
+        kws = _extract_role_keywords_from_ocr_text(txt)
+        for kw in kws:
+            if kw in seen:
+                continue
+            seen.add(kw)
+            merged.append(kw)
+            if len(merged) >= 24:
+                stats["keywords_found"] = merged[:24]
+                return merged, stats
+    stats["keywords_found"] = merged
+    if stats["images_read_ok"] and not merged:
+        stats["skipped_reason"] = "ocr_no_role_keywords"
+    elif not stats["images_read_ok"]:
+        stats["skipped_reason"] = "ftp_read_failed"
+    return merged, stats
+
+
+def build_detect_hint(correction: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """把人工纠正整理为识别 hint（供 detect_file 软引导）。"""
+    corr = trim_detect_correction(correction)
+    if not corr:
+        return {}
+    manual_kws: List[str] = []
+    seen = set()
+    for kw in list(corr.get("label_keywords") or []):
+        s = str(kw or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        manual_kws.append(s[:64])
+    ocr_kws, ocr_stats = _ocr_keywords_from_reference_images(corr)
+    kws = list(manual_kws)
+    for kw in ocr_kws:
+        s = str(kw or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        kws.append(s[:64])
+        if len(kws) >= 24:
+            break
+    return {
+        "expected_roles": [r for r in (corr.get("expected_roles") or []) if r in ROLE_ID_TO_KEYWORD],
+        "label_keywords": kws,
+        "manual_keywords": manual_kws,
+        "ocr_keywords": ocr_kws,
+        "ocr_hint_stats": ocr_stats,
+        "wrong_description": str(corr.get("wrong_description") or "").strip(),
+        "expected_note": str(corr.get("expected_note") or "").strip(),
+        "expected_slot_layout": _trim_expected_slot_layout(corr.get("expected_slot_layout")),
+    }
+
+
 def apply_detect_correction(
     result: Dict[str, Any],
     correction: Optional[Dict[str, Any]],
     *,
     source_name: str = "",
 ) -> Dict[str, Any]:
-    """
-    将人工登记纠正作为“识别提示”应用到结果（在文件名规则之后调用）。
-    重要：不强行覆盖文档实识别结果，避免出现“看起来改对了，但实际不可签”的假阳性。
-    """
+    """将人工登记作为“提示证据”挂载到识别结果（不直接覆盖识别输出）。"""
     if not isinstance(result, dict):
         return result
     corr = trim_detect_correction(correction)
@@ -217,7 +390,6 @@ def apply_detect_correction(
     expected_note = str(corr.get("expected_note") or "").strip()
 
     if expected:
-        # 仅补充提示证据，不覆盖 roles/blocks，保证“展示=文档真实识别”。
         role_evidence = result.get("role_evidence")
         if not isinstance(role_evidence, dict):
             role_evidence = {}
@@ -275,7 +447,7 @@ def apply_detect_correction(
         ds["correction_keywords_added"] = label_kws
         result["debug_summary"] = ds
 
-    # 保留标误版式作为 hint，不覆盖 signature_layout（由真实文档分析产生）。
+    # 版式纠正仅挂在 debug_summary 作为 hint，不直接替换 signature_layout。
     esl = _trim_expected_slot_layout(corr.get("expected_slot_layout"))
     if esl:
         ds = dict(result.get("debug_summary") or {})

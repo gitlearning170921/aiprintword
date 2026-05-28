@@ -27,7 +27,7 @@ import re
 import threading
 import uuid
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -311,6 +311,21 @@ def init_schema() -> None:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS sign_project_cache (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    name VARCHAR(512) NOT NULL,
+                    project_key VARCHAR(768) NULL,
+                    registered_country VARCHAR(128) NULL,
+                    priority INT NOT NULL DEFAULT 2,
+                    status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    KEY idx_proj_name (name),
+                    KEY idx_proj_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS sign_file_role_signer (
                     file_id VARCHAR(32) NOT NULL,
                     role_id VARCHAR(64) NOT NULL,
@@ -390,6 +405,9 @@ def _ensure_sign_file_columns(conn) -> None:
                 "ALTER TABLE sign_uploaded_file ADD COLUMN detect_snapshot_json MEDIUMTEXT NULL",
                 "ALTER TABLE sign_uploaded_file ADD COLUMN workbench_state_json TEXT NULL",
                 "ALTER TABLE sign_uploaded_file ADD COLUMN detect_correction_json TEXT NULL",
+                "ALTER TABLE sign_uploaded_file ADD COLUMN project_id VARCHAR(36) NULL",
+                "ALTER TABLE sign_uploaded_file ADD COLUMN project_name VARCHAR(512) NULL",
+                "ALTER TABLE sign_uploaded_file ADD COLUMN project_key VARCHAR(768) NULL",
             ):
                 try:
                     cur.execute(sql)
@@ -446,6 +464,7 @@ def list_files() -> List[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, original_name AS name, ext, created_at, ftp_path, ftp_last_error, "
+                " project_id, project_name, project_key, "
                 " (file_data IS NOT NULL) AS has_blob "
                 "FROM sign_uploaded_file ORDER BY created_at DESC LIMIT %s",
                 (limit,),
@@ -457,15 +476,24 @@ def list_files() -> List[dict]:
         ftp_path = (r.get("ftp_path") or "").strip()
         fe = (r.get("ftp_last_error") or "").strip()
         has_blob = bool(r.get("has_blob")) or bool(ftp_path)
+        pid = (r.get("project_id") or "").strip() or None
+        pname = (r.get("project_name") or "").strip() or None
+        pkey = (r.get("project_key") or "").strip() or None
+        ts_s = ts.isoformat(sep=" ") if ts is not None else None
         out.append(
             {
                 "id": r["id"],
                 "name": r["name"],
                 "ext": r["ext"],
-                "created_at": ts.isoformat(sep=" ") if ts is not None else None,
+                "created_at": ts_s,
+                "saved_at": ts_s,
                 "ftp_uploaded": bool(ftp_path),
                 "blob_stored": has_blob,
                 "ftp_last_error": fe or None,
+                "project_id": pid,
+                "project_name": pname,
+                "project_key": pkey,
+                "project_label": _project_display_label(pname, pkey),
             }
         )
     return out
@@ -480,7 +508,24 @@ def count_files() -> int:
             return int(row["c"]) if row else 0
 
 
-def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) -> None:
+def _project_display_label(project_name: Optional[str], project_key: Optional[str] = None) -> Optional[str]:
+    name = (project_name or "").strip()
+    if name:
+        return name
+    key = (project_key or "").strip()
+    return key or None
+
+
+def insert_file(
+    file_id: str,
+    original_name: str,
+    ext: str,
+    file_data: bytes,
+    *,
+    project_id: Optional[str] = None,
+    project_name: Optional[str] = None,
+    project_key: Optional[str] = None,
+) -> None:
     from sign_handlers.filename_util import normalize_display_filename
 
     original_name = normalize_display_filename(original_name or "")
@@ -503,8 +548,10 @@ def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) ->
         _ensure_sign_file_columns(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO sign_uploaded_file (id, original_name, ext, ftp_path, file_size, sha256, file_data, ftp_last_error) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                "INSERT INTO sign_uploaded_file "
+                "(id, original_name, ext, ftp_path, file_size, sha256, file_data, ftp_last_error, "
+                "project_id, project_name, project_key) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     file_id,
                     original_name,
@@ -514,6 +561,9 @@ def insert_file(file_id: str, original_name: str, ext: str, file_data: bytes) ->
                     sha,
                     None if ftp_path else file_data,
                     None if ftp_path else err_s,
+                    (project_id or "").strip() or None,
+                    (project_name or "").strip() or None,
+                    (project_key or "").strip() or None,
                 ),
             )
 
@@ -555,6 +605,224 @@ def insert_file_from_external_ftp(file_id: str, original_name: str, ext: str, ex
             )
 
 
+def find_duplicate_basenames_in_project(
+    project_id: Optional[str],
+    display_names: Iterable[str],
+) -> List[str]:
+    """返回在指定项目下已存在的展示名基名（与待上传列表交集）。"""
+    from sign_handlers.filename_util import normalize_display_filename
+
+    want_bases: set = set()
+    base_to_disp: Dict[str, str] = {}
+    for raw in display_names or []:
+        disp = str(raw or "").strip()
+        if not disp:
+            continue
+        base = normalize_display_filename(disp)
+        if not base:
+            continue
+        want_bases.add(base)
+        if base not in base_to_disp:
+            base_to_disp[base] = os.path.basename(disp.replace("\\", "/")) or disp
+    if not want_bases:
+        return []
+    pid = (project_id or "").strip() or None
+    existing: set = set()
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            if pid:
+                cur.execute(
+                    "SELECT original_name FROM sign_uploaded_file WHERE project_id=%s",
+                    (pid,),
+                )
+            else:
+                cur.execute(
+                    "SELECT original_name FROM sign_uploaded_file "
+                    "WHERE project_id IS NULL OR project_id=''"
+                )
+            for row in cur.fetchall() or []:
+                existing.add(
+                    normalize_display_filename(str((row or {}).get("original_name") or ""))
+                )
+    hits = sorted(want_bases & existing)
+    return [base_to_disp.get(b, b) for b in hits]
+
+
+def delete_inbox_by_basenames_in_project_except(
+    project_id: Optional[str],
+    display_names: Iterable[str],
+    keep_file_ids: Iterable[str],
+) -> List[str]:
+    """删除同项目同名旧文件，保留 keep_file_ids 中的新上传 id。"""
+    from sign_handlers.filename_util import normalize_display_filename
+
+    bases = {
+        normalize_display_filename(str(n or ""))
+        for n in (display_names or [])
+        if str(n or "").strip()
+    }
+    bases.discard("")
+    keep = {str(x or "").strip() for x in (keep_file_ids or []) if str(x or "").strip()}
+    if not bases:
+        return []
+    pid = (project_id or "").strip() or None
+    deleted: List[str] = []
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            if pid:
+                cur.execute(
+                    "SELECT id, original_name FROM sign_uploaded_file WHERE project_id=%s",
+                    (pid,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, original_name FROM sign_uploaded_file "
+                    "WHERE project_id IS NULL OR project_id=''"
+                )
+            rows = cur.fetchall() or []
+    for row in rows:
+        oid = str((row or {}).get("id") or "").strip()
+        if not oid or oid in keep:
+            continue
+        oname = normalize_display_filename(str((row or {}).get("original_name") or ""))
+        if oname not in bases:
+            continue
+        try:
+            delete_file(oid, skip_ftp_cleanup=True)
+            deleted.append(oid)
+        except Exception:
+            pass
+    return deleted
+
+
+def delete_inbox_by_basenames_in_project(
+    project_id: Optional[str],
+    display_names: Iterable[str],
+) -> List[str]:
+    """
+    同一项目内按展示名基名删除待签文件（用于覆盖上传）。
+    original_name 入库前会 normalize 为 basename，此处同样按 basename 匹配。
+    """
+    from sign_handlers.filename_util import normalize_display_filename
+
+    bases = {
+        normalize_display_filename(str(n or ""))
+        for n in display_names
+        if str(n or "").strip()
+    }
+    bases.discard("")
+    if not bases:
+        return []
+    pid = (project_id or "").strip() or None
+    deleted: List[str] = []
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            if pid:
+                cur.execute(
+                    "SELECT id, original_name FROM sign_uploaded_file WHERE project_id=%s",
+                    (pid,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, original_name FROM sign_uploaded_file "
+                    "WHERE project_id IS NULL OR project_id=''"
+                )
+            rows = cur.fetchall() or []
+    for row in rows:
+        oid = str((row or {}).get("id") or "").strip()
+        if not oid:
+            continue
+        oname = normalize_display_filename(str((row or {}).get("original_name") or ""))
+        if oname not in bases:
+            continue
+        try:
+            delete_file(oid)
+            deleted.append(oid)
+        except Exception:
+            pass
+    return deleted
+
+
+def delete_files_batch(
+    file_ids: List[str],
+    *,
+    skip_ftp_cleanup: bool = True,
+    chunk_size: int = 120,
+) -> Tuple[List[str], List[str], List[Dict[str, str]]]:
+    """
+    批量删除待签文件（单连接、按块 IN 删除，避免逐条 delete_file 导致远程库超时）。
+    返回 (deleted_ids, missing_ids, errors)。
+    """
+    want = [str(x or "").strip() for x in (file_ids or []) if str(x or "").strip()]
+    if not want:
+        return [], [], []
+    # 保持顺序去重
+    seen: set = set()
+    ids: List[str] = []
+    for fid in want:
+        if fid in seen:
+            continue
+        seen.add(fid)
+        ids.append(fid)
+    chunk_size = max(20, min(int(chunk_size or 120), 500))
+    deleted: List[str] = []
+    errors: List[Dict[str, str]] = []
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            for off in range(0, len(ids), chunk_size):
+                chunk = ids[off : off + chunk_size]
+                ph = ",".join(["%s"] * len(chunk))
+                try:
+                    cur.execute(
+                        f"SELECT id FROM sign_uploaded_file WHERE id IN ({ph})",
+                        tuple(chunk),
+                    )
+                    found = [
+                        str((r or {}).get("id") or "").strip()
+                        for r in (cur.fetchall() or [])
+                    ]
+                    found = [x for x in found if x]
+                    if not found:
+                        continue
+                    if not skip_ftp_cleanup:
+                        cur.execute(
+                            f"SELECT id, ftp_path, ftp_owned_by_sign FROM sign_uploaded_file "
+                            f"WHERE id IN ({ph})",
+                            tuple(found),
+                        )
+                        for row in cur.fetchall() or []:
+                            p = (row or {}).get("ftp_path")
+                            owned = (row or {}).get("ftp_owned_by_sign")
+                            if owned is None:
+                                owned = 1
+                            if p and int(owned) != 0:
+                                try:
+                                    from ftp_store import delete_path
+
+                                    delete_path(p)
+                                except Exception:
+                                    pass
+                    fph = ",".join(["%s"] * len(found))
+                    cur.execute(
+                        f"DELETE FROM sign_uploaded_file WHERE id IN ({fph})",
+                        tuple(found),
+                    )
+                    deleted.extend(found)
+                except Exception as e:
+                    for fid in chunk:
+                        errors.append({"id": fid, "error": str(e)})
+    deleted_set = set(deleted)
+    missing = [x for x in ids if x not in deleted_set]
+    return deleted, missing, errors
+
+
 def delete_file(file_id: str, skip_ftp_cleanup: bool = False) -> int:
     ensure_sign_mysql()
     with _conn_commit() as conn:
@@ -586,8 +854,41 @@ def delete_file(file_id: str, skip_ftp_cleanup: bool = False) -> int:
             return cur.rowcount
 
 
+def is_valid_uploaded_blob(data: Optional[bytes], ext: str) -> bool:
+    """Office 上传件须为 ZIP 容器（docx/xlsx 等）；避免把损坏 BLOB 或 FTP 错误页当文档解析。"""
+    if not data or len(data) < 16:
+        return False
+    ext_l = (ext or ".docx").lower()
+    if ext_l in (".docx", ".xlsx", ".docm", ".xlsm", ".pptx"):
+        return len(data) >= 32 and data[:2] == b"PK"
+    return len(data) > 0
+
+
+def _download_ftp_bytes_with_retry(remote_path: str, *, file_id: str = "") -> Optional[bytes]:
+    import time
+
+    from ftp_store import download_bytes
+
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            return download_bytes(remote_path)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.35 * (attempt + 1))
+    if last_err is not None:
+        try:
+            print(
+                f"[sign] get_file_row FTP retry exhausted id={file_id or '?'}: {last_err}"
+            )
+        except Exception:
+            pass
+    return None
+
+
 def get_file_row(file_id: str) -> Optional[dict]:
-    """返回 id, name, ext, file_data(bytes)；不存在则 None。优先从 FTP 取，兼容旧 BLOB。"""
+    """返回 id, name, ext, file_data(bytes)；不存在则 None。有 ftp_path 时优先校验通过的 FTP 内容，兼容旧 BLOB。"""
     ensure_sign_mysql()
     with _conn_commit() as conn:
         with conn.cursor() as cur:
@@ -599,29 +900,43 @@ def get_file_row(file_id: str) -> Optional[dict]:
             row = cur.fetchone()
     if not row:
         return None
-    if row.get("file_data"):
+    ext = (row.get("ext") or ".docx").lower()
+    ftp_path = (row.get("ftp_path") or "").strip()
+    blob = row.get("file_data")
+
+    ftp_bytes: Optional[bytes] = None
+    if ftp_path:
+        ftp_bytes = _download_ftp_bytes_with_retry(ftp_path, file_id=file_id)
+
+    if ftp_bytes is not None and is_valid_uploaded_blob(ftp_bytes, ext):
+        row["file_data"] = ftp_bytes
+        row.pop("file_load_error", None)
         return row
-    p = (row.get("ftp_path") or "").strip()
-    if p:
-        import time
 
-        from ftp_store import download_bytes
+    if blob and is_valid_uploaded_blob(blob, ext):
+        row["file_data"] = blob
+        row.pop("file_load_error", None)
+        return row
 
-        last_err: Optional[Exception] = None
-        for attempt in range(3):
-            try:
-                row["file_data"] = download_bytes(p)
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                if attempt < 2:
-                    time.sleep(0.35 * (attempt + 1))
-        if last_err is not None:
-            try:
-                print(f"[sign] get_file_row FTP retry exhausted id={file_id}: {last_err}")
-            except Exception:
-                pass
+    row["file_data"] = None
+    if ftp_path and ftp_bytes is None:
+        hint = (row.get("ftp_last_error") or "").strip()
+        row["file_load_error"] = (
+            "无法从 FTP 下载文件内容。请检查 FTP 配置与网络，或在列表中重新上传该文件。"
+            + (f"（{hint}）" if hint else "")
+        )
+    elif ftp_path and ftp_bytes is not None:
+        row["file_load_error"] = (
+            f"FTP 上的文件无效或已损坏（{len(ftp_bytes)} 字节，非有效 Office 压缩包）。"
+            "请在列表中删除后重新上传。"
+        )
+    elif blob:
+        row["file_load_error"] = (
+            "数据库中的文件缓存无效"
+            + ("，且 FTP 重新下载不可用。" if ftp_path else "，且未登记 FTP 路径。")
+        )
+    else:
+        row["file_load_error"] = "文件内容为空。"
     return row
 
 
@@ -2763,13 +3078,81 @@ def list_signers_compact() -> List[dict]:
     return list_signers(compact=True)
 
 
+def _load_signer_stroke_picks(conn) -> Dict[str, Dict[str, Dict[str, str]]]:
+    """签署人各语言下首个可用 sig/date 笔迹 id（供工作台 brief 模式匹配，避免拉全量 items）。"""
+    out: Dict[str, Dict[str, Dict[str, str]]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT signer_id, kind, locale, MIN(id) AS item_id
+            FROM sign_stroke_item
+            WHERE kind IN ('sig', 'date')
+              AND locale IN ('zh', 'en')
+              AND (
+                    (png IS NOT NULL)
+                    OR (ftp_path IS NOT NULL AND ftp_path <> '')
+                  )
+            GROUP BY signer_id, kind, locale
+            """
+        )
+        for r in cur.fetchall() or []:
+            sid = str(r.get("signer_id") or "")
+            kind = str(r.get("kind") or "").strip().lower()
+            loc = str(r.get("locale") or "zh").strip().lower()
+            iid = str(r.get("item_id") or "").strip()
+            if not sid or kind not in ("sig", "date") or not iid:
+                continue
+            if loc not in ("zh", "en"):
+                loc = "zh"
+            out.setdefault(sid, {}).setdefault(kind, {})[loc] = iid
+    return out
+
+
+def list_signer_stroke_options() -> List[dict]:
+    """签字素材下拉用：仅 id/签署人/种类/语言，单表查询，不拉 BLOB。"""
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT si.id, si.signer_id, s.display_name AS signer_name,
+                       si.kind, si.locale, si.updated_at
+                FROM sign_stroke_item si
+                INNER JOIN sign_signer s ON s.id = si.signer_id
+                WHERE si.kind IN ('sig', 'date')
+                  AND (
+                        (si.png IS NOT NULL)
+                        OR (si.ftp_path IS NOT NULL AND si.ftp_path <> '')
+                      )
+                ORDER BY s.display_name ASC, si.kind ASC, si.locale ASC, si.updated_at DESC
+                """
+            )
+            rows = cur.fetchall() or []
+    out: List[dict] = []
+    for r in rows:
+        ut = r.get("updated_at")
+        out.append(
+            {
+                "id": r["id"],
+                "signer_id": r["signer_id"],
+                "signer_name": (r.get("signer_name") or "").strip(),
+                "kind": (r.get("kind") or "sig").strip().lower(),
+                "locale": (r.get("locale") or "zh").strip().lower() or "zh",
+                "updated_at": ut.isoformat(sep=" ") if ut is not None else None,
+            }
+        )
+    return out
+
+
 def list_signers_brief() -> List[dict]:
-    """素材录入页：聚合 SQL 汇总 has_* / 元件槽位，不加载笔迹明细与 BLOB。"""
+    """素材录入页 / 签字工作台：聚合 SQL 汇总 has_* / 元件槽位，不加载笔迹明细与 BLOB。"""
     kinds_all = all_piece_kinds()
     empty_pie = {x: False for x in kinds_all}
     ensure_sign_mysql()
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
+        stroke_picks = _load_signer_stroke_picks(conn)
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -2835,6 +3218,7 @@ def list_signers_brief() -> List[dict]:
         has_sig = bool(r.get("has_sig_item")) or bool(r.get("has_set_sig")) or bool(r.get("leg_sig"))
         has_date = bool(r.get("has_date_item")) or bool(r.get("has_set_date")) or bool(r.get("leg_date"))
         pie = pieces_by_signer.get(signer_id) or dict(empty_pie)
+        picks = stroke_picks.get(signer_id) or {}
         out.append(
             {
                 "id": signer_id,
@@ -2846,6 +3230,7 @@ def list_signers_brief() -> List[dict]:
                 "sig_items": [],
                 "date_items": [],
                 "date_piece_en": pie,
+                "stroke_pick": picks,
                 "brief": True,
             }
         )
@@ -3262,6 +3647,50 @@ def set_file_workbench_state(file_id: str, state: dict) -> None:
             )
 
 
+def apply_files_session_cache_batch(items: Dict[str, dict]) -> int:
+    """批量写入 detect / workbench / detect_correction。返回成功更新文件数。"""
+    from sign_handlers.file_session_cache import (
+        trim_detect_correction,
+        trim_detect_snapshot,
+        trim_workbench_state,
+    )
+
+    if not items:
+        return 0
+    ensure_sign_mysql()
+    updated = 0
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            for fid, payload in items.items():
+                file_id = str(fid or "").strip()
+                if not file_id or not isinstance(payload, dict):
+                    continue
+                wb = payload.get("workbench")
+                det = payload.get("detect")
+                corr = payload.get("detect_correction")
+                if isinstance(wb, dict):
+                    blob = json.dumps(trim_workbench_state(wb), ensure_ascii=False)
+                    cur.execute(
+                        "UPDATE sign_uploaded_file SET workbench_state_json=%s WHERE id=%s",
+                        (blob, file_id),
+                    )
+                    if cur.rowcount:
+                        updated += 1
+                if isinstance(det, dict):
+                    blob = json.dumps(trim_detect_snapshot(det), ensure_ascii=False)
+                    cur.execute(
+                        "UPDATE sign_uploaded_file SET detect_snapshot_json=%s WHERE id=%s",
+                        (blob, file_id),
+                    )
+                if isinstance(corr, dict):
+                    blob = json.dumps(trim_detect_correction(corr), ensure_ascii=False)
+                    cur.execute(
+                        "UPDATE sign_uploaded_file SET detect_correction_json=%s WHERE id=%s",
+                        (blob, file_id),
+                    )
+    return updated
+
+
 def set_file_detect_correction(file_id: str, correction: dict) -> None:
     set_file_detect_correction_batch([(file_id, correction)])
 
@@ -3346,11 +3775,15 @@ def _role_map_light_from_rows(rows: List[dict]) -> Dict[str, Any]:
     return out
 
 
-def list_file_session_caches() -> Dict[str, dict]:
-    """返回各文件的 detect / workbench / role-map 缓存（用于页面恢复，批量 SQL）。"""
+def list_file_session_caches(*, lite: bool = False) -> Dict[str, dict]:
+    """返回各文件的 detect / workbench / role-map 缓存（用于页面恢复，批量 SQL）。
+
+    lite=True：detect 经 trim_detect_snapshot_lite 去掉 blocks 等大字段，兼顾首屏速度与三列展示。
+    """
     from sign_handlers.file_session_cache import (
         trim_detect_correction,
         trim_detect_snapshot,
+        trim_detect_snapshot_lite,
         trim_workbench_state,
         _json_load,
     )
@@ -3400,9 +3833,15 @@ def list_file_session_caches() -> Dict[str, dict]:
         if not fid:
             continue
         entry: dict = {}
-        det = trim_detect_snapshot(_json_load(row.get("detect_snapshot_json")))
-        if det:
-            entry["detect"] = det
+        det_raw = _json_load(row.get("detect_snapshot_json"))
+        if det_raw:
+            det = (
+                trim_detect_snapshot_lite(det_raw)
+                if lite
+                else trim_detect_snapshot(det_raw)
+            )
+            if det:
+                entry["detect"] = det
         wb = trim_workbench_state(_json_load(row.get("workbench_state_json")))
         if wb:
             entry["workbench"] = wb
@@ -3418,3 +3857,168 @@ def list_file_session_caches() -> Dict[str, dict]:
         if fid not in out:
             out[fid] = {"map": m}
     return out
+
+
+def upsert_project_cache(projects: List[dict]) -> tuple[int, int]:
+    """写入/更新 aiword 同步的项目缓存。返回 (新增数, 更新数)。"""
+    ensure_sign_mysql()
+    inserted = 0
+    updated = 0
+    rows_in = [r for r in (projects or []) if isinstance(r, dict)]
+    ids = [
+        str(r.get("id") or "").strip()
+        for r in rows_in
+        if str(r.get("id") or "").strip() and str(r.get("name") or "").strip()
+    ]
+    existing: set[str] = set()
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            if ids:
+                placeholders = ",".join(["%s"] * len(ids))
+                cur.execute(
+                    f"SELECT id FROM sign_project_cache WHERE id IN ({placeholders})",
+                    ids,
+                )
+                for row in cur.fetchall() or []:
+                    rid = str(row.get("id") or "").strip()
+                    if rid:
+                        existing.add(rid)
+            for raw in rows_in:
+                pid = str(raw.get("id") or "").strip()
+                name = str(raw.get("name") or "").strip()
+                if not pid or not name:
+                    continue
+                pkey = str(raw.get("project_key") or raw.get("projectKey") or name).strip()
+                country = str(
+                    raw.get("registered_country") or raw.get("registeredCountry") or ""
+                ).strip() or None
+                try:
+                    priority = int(raw.get("priority") or 2)
+                except Exception:
+                    priority = 2
+                status = str(raw.get("status") or "active").strip().lower() or "active"
+                is_new = pid not in existing
+                cur.execute(
+                    """
+                    INSERT INTO sign_project_cache
+                    (id, name, project_key, registered_country, priority, status)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                      name=VALUES(name),
+                      project_key=VALUES(project_key),
+                      registered_country=VALUES(registered_country),
+                      priority=VALUES(priority),
+                      status=VALUES(status),
+                      synced_at=CURRENT_TIMESTAMP
+                    """,
+                    (pid, name, pkey, country, priority, status),
+                )
+                if is_new:
+                    inserted += 1
+                    existing.add(pid)
+                else:
+                    updated += 1
+    return inserted, updated
+
+
+def list_projects_with_counts(*, include_file_counts: bool = True) -> List[dict]:
+    """项目列表；可选附带待签文件数（同步接口可跳过以加快响应）。"""
+    ensure_sign_mysql()
+    counts: Dict[str, int] = {}
+    with _conn_commit() as conn:
+        if include_file_counts:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT project_id, COUNT(*) AS c FROM sign_uploaded_file "
+                    "WHERE project_id IS NOT NULL AND project_id != '' "
+                    "GROUP BY project_id"
+                )
+                for row in cur.fetchall() or []:
+                    pid = str(row.get("project_id") or "").strip()
+                    if pid:
+                        counts[pid] = int(row.get("c") or 0)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, project_key, registered_country, priority, status, synced_at "
+                "FROM sign_project_cache ORDER BY priority DESC, name ASC"
+            )
+            rows = cur.fetchall() or []
+    out: List[dict] = []
+    for r in rows:
+        pid = str(r.get("id") or "").strip()
+        name = str(r.get("name") or "").strip()
+        pkey = str(r.get("project_key") or "").strip()
+        country = (r.get("registered_country") or "").strip() or None
+        label = name
+        if country:
+            label = f"{name}（{country}）"
+        ts = r.get("synced_at")
+        out.append(
+            {
+                "id": pid,
+                "name": name,
+                "project_key": pkey,
+                "registered_country": country,
+                "priority": int(r.get("priority") or 2),
+                "status": str(r.get("status") or "active"),
+                "file_count": counts.get(pid, 0),
+                "label": label,
+                "synced_at": ts.isoformat(sep=" ") if ts is not None else None,
+            }
+        )
+    return out
+
+
+def get_project_by_id(project_id: str) -> Optional[dict]:
+    pid = str(project_id or "").strip()
+    if not pid:
+        return None
+    for p in list_projects_with_counts():
+        if str(p.get("id") or "") == pid:
+            return p
+    return None
+
+
+def set_file_project(
+    file_id: str,
+    *,
+    project_id: Optional[str],
+    project_name: Optional[str] = None,
+    project_key: Optional[str] = None,
+) -> int:
+    ensure_sign_mysql()
+    pid = str(project_id or "").strip() or None
+    pname = str(project_name or "").strip() or None
+    pkey = str(project_key or "").strip() or None
+    if pid and not pname:
+        proj = get_project_by_id(pid)
+        if proj:
+            pname = str(proj.get("name") or "").strip() or None
+            pkey = str(proj.get("project_key") or "").strip() or pname
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sign_uploaded_file SET project_id=%s, project_name=%s, project_key=%s WHERE id=%s",
+                (pid, pname, pkey, file_id),
+            )
+            return int(cur.rowcount or 0)
+
+
+def set_files_project(file_ids: List[str], project_id: str) -> int:
+    proj = get_project_by_id(project_id)
+    if not proj:
+        raise ValueError("项目不存在，请先从 aiword 同步项目列表")
+    n = 0
+    for fid in file_ids or []:
+        fid_s = str(fid or "").strip()
+        if not fid_s:
+            continue
+        n += set_file_project(
+            fid_s,
+            project_id=project_id,
+            project_name=str(proj.get("name") or ""),
+            project_key=str(proj.get("project_key") or proj.get("name") or ""),
+        )
+    return n

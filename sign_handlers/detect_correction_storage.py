@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -87,6 +87,23 @@ def upload_reference_image_bytes(
     )
 
 
+def _mime_for_ext(ext: str) -> str:
+    e = (ext or "").lower()
+    if e in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if e == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
+def _is_safe_detect_corr_ftp_path(path: str) -> bool:
+    p = str(path or "").replace("\\", "/").strip()
+    if not p or ".." in p:
+        return False
+    low = p.lower()
+    return "detect_corrections/" in low or "/sign/detect_corrections/" in low
+
+
 def download_reference_image(meta: Dict[str, Any]) -> Tuple[bytes, str]:
     ftp_path = str((meta or {}).get("ftp_path") or "").strip()
     if not ftp_path:
@@ -94,12 +111,54 @@ def download_reference_image(meta: Dict[str, Any]) -> Tuple[bytes, str]:
     from ftp_store import download_bytes
 
     ext = os.path.splitext(ftp_path)[1].lower()
-    mime = "image/png"
-    if ext in {".jpg", ".jpeg"}:
-        mime = "image/jpeg"
-    elif ext == ".webp":
-        mime = "image/webp"
-    return download_bytes(ftp_path), mime
+    return download_bytes(ftp_path), _mime_for_ext(ext)
+
+
+def fetch_reference_image_bytes(
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+    file_id: str = "",
+    image_id: str = "",
+    ftp_path_override: str = "",
+) -> Tuple[bytes, str]:
+    """按 meta / 查询参数 / 约定路径依次尝试下载参考图。"""
+    from ftp_store import download_bytes
+
+    tried = set()
+    candidates: List[str] = []
+
+    def _add(path: str) -> None:
+        p = str(path or "").strip()
+        if not p or p in tried:
+            return
+        if not _is_safe_detect_corr_ftp_path(p):
+            return
+        tried.add(p)
+        candidates.append(p)
+
+    if meta and isinstance(meta, dict):
+        _add(str(meta.get("ftp_path") or ""))
+    _add(str(ftp_path_override or ""))
+    fid = str(file_id or "").strip()
+    iid = str(image_id or "").strip()
+    if fid and iid:
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            _add(f"sign/detect_corrections/files/{fid}/{iid}{ext}")
+    if iid:
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            _add(f"sign/detect_corrections/shared/{iid}{ext}")
+
+    last_err: Optional[Exception] = None
+    for path in candidates:
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            return download_bytes(path), _mime_for_ext(ext)
+        except Exception as exc:
+            last_err = exc
+            continue
+    if last_err:
+        raise FileNotFoundError(str(last_err)) from last_err
+    raise FileNotFoundError("未找到可下载的参考图路径")
 
 
 def delete_reference_image_on_ftp(meta: Dict[str, Any], *, file_id: str = "") -> bool:

@@ -211,6 +211,20 @@ _reg(
 )
 _reg(
     SettingMeta(
+        "SIGN_ARCHIVE_UPLOAD_TIMEOUT_MS",
+        1200000,
+        "int",
+        "sign",
+        "压缩包上传解压超时（毫秒）",
+        description=(
+            "上传 .zip/.7z/.rar 后服务端解压并逐文件写入 FTP/MySQL 的最大等待时间。"
+            "范围 300000–3600000；默认 1200000（20 分钟）。"
+            "包很大或 FTP 慢时可调大；改后刷新签字页生效，无需重启。"
+        ),
+    )
+)
+_reg(
+    SettingMeta(
         "SIGN_DETECT_RETRY_TIMES",
         1,
         "int",
@@ -220,6 +234,39 @@ _reg(
             "前端识别失败时的额外重试次数。超时/取消类错误不会再重试（无意义）。"
             "范围 0–3；默认 1。重试越多，单文件失败时占用越久，看起来「日志一直刷」。"
         ),
+    )
+)
+_reg(
+    SettingMeta(
+        "SIGN_DETECT_HINT_WEIGHT",
+        1.0,
+        "float",
+        "sign",
+        "签字识别 hint 权重",
+        description=(
+            "识别时对人工纠正 hint 的加权系数。范围 0.2–2.5；"
+            "数值越大，expected_roles/label_keywords 对结果影响越强。"
+        ),
+    )
+)
+_reg(
+    SettingMeta(
+        "SIGN_DETECT_HINT_OCR_REF_IMAGES",
+        True,
+        "bool",
+        "sign",
+        "标误参考图 OCR 提示",
+        description="1=识别时尝试从参考图 OCR 提取角色词并并入 label_keywords（轻量 best-effort）。",
+    )
+)
+_reg(
+    SettingMeta(
+        "SIGN_DETECT_HINT_OCR_MAX_IMAGES",
+        2,
+        "int",
+        "sign",
+        "参考图 OCR 最大张数",
+        description="每次识别最多读取多少张参考图做 OCR。范围 0–6；0=关闭参考图 OCR。",
     )
 )
 _reg(
@@ -347,6 +394,31 @@ _reg(
         "ftp",
         "FTP 被动模式（PASV）",
         description="建议开启（移动/局域网/NAT 环境更稳定）；关闭则用主动模式",
+    )
+)
+
+# ----------------
+# aiword 集成（项目同步）
+# ----------------
+_reg(
+    SettingMeta(
+        "AIWORD_BASE_URL",
+        "",
+        "str",
+        "integration",
+        "aiword 服务地址",
+        description="例如 http://127.0.0.1:5000；用于同步项目列表",
+    )
+)
+_reg(
+    SettingMeta(
+        "AIWORD_INTEGRATION_SECRET",
+        "",
+        "str",
+        "integration",
+        "aiword 集成密钥",
+        description="与 aiword 系统配置 INTEGRATION_SECRET 一致；未填时可回退 AIWORD_HANDOFF_SECRET",
+        is_secret=True,
     )
 )
 

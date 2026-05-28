@@ -11,7 +11,7 @@ from __future__ import annotations
 import io
 import os
 import re
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from docx import Document
 from docx.document import Document as DocumentObject
@@ -361,6 +361,137 @@ def _append_date_to_cell(cell, date_png: bytes) -> None:
     p.add_run().add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
 
 
+def _parse_docx_cell_loc(loc: str) -> Optional[Tuple[int, int, int]]:
+    """table#2.r10.c3 → (2, 10, 3) 1-based。"""
+    s = str(loc or "").strip()
+    m = re.match(r"^\s*table#?(\d+)\.r(\d+)\.c(\d+)\s*$", s, re.IGNORECASE)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _docx_detect_ordered_tables(doc: DocumentObject) -> List[Table]:
+    try:
+        from sign_handlers.detect_fields import _iter_docx_tables_for_detect
+
+        return list(
+            _iter_docx_tables_for_detect(doc, max_body_tables=32, max_total=64)
+        )
+    except Exception:
+        return []
+
+
+def _docx_row_cells(table: Table, row_1based: int) -> Tuple[int, List]:
+    """返回 (ri, cells) 或 (-1, [])。"""
+    ri = int(row_1based) - 1
+    rows_list = list(table.rows)
+    if ri < 0 or ri >= len(rows_list):
+        return -1, []
+    return ri, list(rows_list[ri].cells)
+
+
+def _place_four_column_row(
+    cells,
+    label_ci: int,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """角色 | 姓名空白 | 日期标签 | 日期空白。"""
+    if not _is_label_blank_date_blank_row(cells, label_ci, keyword):
+        return False
+    placed = False
+    sig_cell = cells[label_ci + 1]
+    date_hdr = cells[label_ci + 2]
+    date_val = cells[label_ci + 3]
+    if sig_png and _is_slot_target_text(_cell_text(sig_cell)):
+        _insert_sig_only_in_empty_cell(sig_cell, sig_png)
+        placed = True
+    if date_png:
+        if _is_slot_target_text(_cell_text(date_val)):
+            _insert_sig_and_date_in_empty_cell(date_val, None, date_png)
+            placed = True
+        elif _insert_date_only_in_date_cell(date_hdr, date_png):
+            placed = True
+        else:
+            dt_target = _next_distinct_cell(cells, label_ci + 2)
+            if dt_target is not None and _is_slot_target_text(_cell_text(dt_target)):
+                _insert_sig_and_date_in_empty_cell(dt_target, None, date_png)
+                placed = True
+    if sig_png and not date_png:
+        return placed
+    if date_png:
+        return placed
+    return placed
+
+
+def _try_docx_role_layout_cells(
+    doc: DocumentObject,
+    role_id: str,
+    placement_plan: Optional[dict],
+    keywords: List[str],
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """
+    按识别阶段 signature_layout 给出的单元格坐标直接落位（与 detect 表序号一致）。
+    仅在格可写时成功，不伪造结果。
+    """
+    if not isinstance(placement_plan, dict):
+        return False
+    rp = placement_plan.get(str(role_id))
+    if not isinstance(rp, dict):
+        return False
+    name_cell = rp.get("name_cell")
+    if not isinstance(name_cell, dict):
+        return False
+    want_date = bool(rp.get("date_slot", True))
+    dt = date_png if want_date else None
+    tno = int(name_cell.get("table") or 0)
+    rno = int(name_cell.get("row") or 0)
+    if tno < 1 or rno < 1:
+        return False
+    tables = _docx_detect_ordered_tables(doc)
+    if tno > len(tables):
+        return False
+    table = tables[tno - 1]
+    ri, cells = _docx_row_cells(table, rno)
+    if ri < 0 or not cells:
+        return False
+    rows_list = list(table.rows)
+    for kw in keywords:
+        for ci, cell in enumerate(cells):
+            ct = _cell_text(cell)
+            if not cell_has_role_keyword(ct, kw):
+                continue
+            if _place_four_column_row(cells, ci, sig_png, dt, kw):
+                return True
+            if _place_sig_date_at_signoff_anchor(
+                cell, kw, cells, ci, rows_list, ri, sig_png, dt
+            ):
+                return True
+    return False
+
+
+def _is_label_blank_date_blank_row(cells, label_ci: int, keyword: str) -> bool:
+    """
+    四列签批：角色标签 | 姓名空白 | 日期标签 | 日期空白。
+    软件发布说明、部分作业指导书常见；标签格仅为「作者/审核/批准」时仍应可落位。
+    """
+    if label_ci + 3 >= len(cells):
+        return False
+    lt = _cell_text(cells[label_ci])
+    if not cell_has_role_keyword(lt, keyword):
+        return False
+    if not _is_slot_target_text(_cell_text(cells[label_ci + 1])):
+        return False
+    if not _cell_looks_like_date_header_cell(_cell_text(cells[label_ci + 2])):
+        return False
+    if not _is_slot_target_text(_cell_text(cells[label_ci + 3])):
+        return False
+    return True
+
+
 def _next_distinct_cell(cells, idx: int):
     """返回同一行里 idx 之后第一个“不同的 cell”（按合并单元格去重）。"""
     try:
@@ -397,7 +528,8 @@ def _try_table_adjacent_date_column(
             if not xlsx_cell_has_leading_role_keyword(lt, keyword):
                 continue
             if cell_is_bare_role_column_header(lt, keyword):
-                continue
+                if not _is_label_blank_date_blank_row(cells, ci, keyword):
+                    continue
             date_idx = None
             if ci + 1 < len(cells) and _cell_looks_like_date_header_cell(_cell_text(cells[ci + 1])):
                 date_idx = ci + 1
@@ -584,7 +716,7 @@ def _cell_has_table_signoff_reservation(
     if not cell_has_role_keyword(cell_text, keyword):
         return False
     if cell_is_bare_role_column_header(cell_text, keyword):
-        return False
+        return _is_label_blank_date_blank_row(cells, label_ci, keyword)
     if cell_is_role_signoff_label_slot(cell_text, keyword):
         return True
     if cell_has_signoff_inline_reservation(cell_text, keyword):
@@ -624,6 +756,9 @@ def _place_sig_date_at_signoff_anchor(
     1) 签批栏「角色/日期」：同行第 1 个空白格签名、第 2 个空白格日期（与复核人一致）；
     2) 其它：同行/下方空白格；同格下划线留白；独立 Date/日期 列。
     """
+    if _place_four_column_row(cells, label_ci, keyword, sig_png, date_png):
+        return True
+
     placed_any = False
     ct = _cell_text(label_cell)
     date_cell = _find_date_label_cell_in_row(cells, label_ci, rows_list, ri)
@@ -712,6 +847,21 @@ def _place_sig_date_at_signoff_anchor(
     return placed_any
 
 
+def _try_table_four_column_scan(
+    table: Table,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    rows_list = list(table.rows)
+    for ri in _table_row_scan_order(table):
+        cells = rows_list[ri].cells
+        for ci in range(max(0, len(cells) - 3)):
+            if _place_four_column_row(cells, ci, keyword, sig_png, date_png):
+                return True
+    return False
+
+
 def _try_table_role(
     table: Table,
     keyword: str,
@@ -719,6 +869,8 @@ def _try_table_role(
     date_png: Optional[bytes],
     role_id: str = "",
 ) -> bool:
+    if _try_table_four_column_scan(table, keyword, sig_png, date_png):
+        return True
     if _try_table_adjacent_date_column(table, keyword, sig_png, date_png):
         return True
     rows_list = list(table.rows)
@@ -893,8 +1045,12 @@ def _try_docx_plan_placement(
 ) -> bool:
     if not keywords or not source_hints:
         return False
-    body_first_tables = _iter_all_tables(doc, footers_first=False)
-    footer_first_tables = _iter_all_tables(doc, footers_first=True)
+    try:
+        from sign_handlers.detect_fields import _iter_docx_tables_for_detect
+
+        detect_tables = _iter_docx_tables_for_detect(doc, max_body_tables=32, max_total=64)
+    except Exception:
+        detect_tables = []
     body_paras = _iter_body_paragraphs(doc)
 
     for hint in source_hints:
@@ -902,10 +1058,8 @@ def _try_docx_plan_placement(
         if tr:
             tno, rno = tr
             candidates: list[Table] = []
-            if 1 <= tno <= len(body_first_tables):
-                candidates.append(body_first_tables[tno - 1])
-            if 1 <= tno <= len(footer_first_tables):
-                candidates.append(footer_first_tables[tno - 1])
+            if detect_tables and 1 <= tno <= len(detect_tables):
+                candidates.append(detect_tables[tno - 1])
             seen_tables: set[int] = set()
             uniq: list[Table] = []
             for tb in candidates:
@@ -963,6 +1117,12 @@ def sign_docx(
     for role_id in ROLE_ID_TO_KEYWORD:
         sig = sig_map.get(role_id)
         dt = date_map.get(role_id)
+        want_date = True
+        if isinstance(placement_plan, dict):
+            rp0 = placement_plan.get(str(role_id))
+            if isinstance(rp0, dict) and "date_slot" in rp0:
+                want_date = bool(rp0.get("date_slot"))
+        dt_use = dt if want_date else None
         role_result = None
         if isinstance(placement_result, dict):
             role_result = placement_result.setdefault(
@@ -975,7 +1135,7 @@ def sign_docx(
                     "keywords": [],
                 },
             )
-        if not sig and not dt:
+        if not sig and not dt_use:
             if isinstance(role_result, dict):
                 role_result["placed"] = False
                 role_result["placed_by"] = "skip_no_material"
@@ -998,17 +1158,23 @@ def sign_docx(
             role_result["layout_types"] = planned_layout_types[:]
         placed_by = ""
         tables = _iter_all_tables(doc, footers_first=True)
+        if (not done) and placement_plan and isinstance(placement_plan, dict):
+            done = _try_docx_role_layout_cells(
+                doc, role_id, placement_plan, kws, sig, dt_use
+            )
+            if done:
+                placed_by = "layout_cells"
         if ("two_row_signoff_table" in planned_layout_types) and kws:
             for kw in kws:
                 if done:
                     break
                 for table in tables:
-                    if _try_table_role(table, kw, sig, dt, role_id=role_id):
+                    if _try_table_role(table, kw, sig, dt_use, role_id=role_id):
                         done = True
                         placed_by = "planned_layout_type"
                         break
         if (not done) and planned_hints and kws:
-            done = _try_docx_plan_placement(doc, kws, planned_hints, sig, dt)
+            done = _try_docx_plan_placement(doc, kws, planned_hints, sig, dt_use)
             if done:
                 placed_by = "planned_source_hint"
         if not done:
@@ -1016,7 +1182,7 @@ def sign_docx(
                 if done:
                     break
                 for table in tables:
-                    if _try_table_role(table, kw, sig, dt, role_id=role_id):
+                    if _try_table_role(table, kw, sig, dt_use, role_id=role_id):
                         done = True
                         if not placed_by:
                             placed_by = (
@@ -1028,7 +1194,7 @@ def sign_docx(
                 for p in _iter_body_paragraphs(doc):
                     if _find_keyword_in_paragraph(p, kw) < 0:
                         continue
-                    if _try_paragraph_inline(p, kw, sig, dt):
+                    if _try_paragraph_inline(p, kw, sig, dt_use):
                         done = True
                         if not placed_by:
                             placed_by = (
@@ -1039,18 +1205,23 @@ def sign_docx(
                     break
                 for table in tables:
                     for row in table.rows:
-                        for cell in row.cells:
+                        row_cells = list(row.cells)
+                        for ci, cell in enumerate(row_cells):
                             ct = _cell_text(cell)
                             if not cell_has_role_keyword(ct, kw):
                                 continue
                             if cell_is_bare_role_column_header(ct, kw):
+                                if _place_four_column_row(row_cells, ci, kw, sig, dt_use):
+                                    done = True
+                                    placed_by = "four_column_row"
+                                    break
                                 continue
                             if not cell_has_label_inline_reservation(ct, kw):
                                 continue
                             for p in cell.paragraphs:
                                 if _find_keyword_in_paragraph(p, kw) < 0:
                                     continue
-                                if _try_paragraph_inline(p, kw, sig, dt):
+                                if _try_paragraph_inline(p, kw, sig, dt_use):
                                     done = True
                                     if not placed_by:
                                         placed_by = (

@@ -10,6 +10,8 @@ PyPDF2>=3.0.0
 flask>=3.0.0
 # 在线签名：英文点分日期笔迹横向拼接（PIL）
 Pillow>=10.0.0
+# 标误参考图轻量 OCR（需系统安装 Tesseract 可执行程序）
+pytesseract>=0.3.13
 # 在线签名：可选 MySQL 共享上传列表（配置 MYSQL_HOST 后启用）
 PyMySQL>=1.1.0
 python-dotenv>=1.0.0

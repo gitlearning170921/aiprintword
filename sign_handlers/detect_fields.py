@@ -39,6 +39,51 @@ _EN_TRIAD_TOKENS = (
     "approved by",
 )
 _ZH_TRIAD_TOKENS = ("编制人", "编制", "审核人", "审核", "批准人", "批准", "编写", "作者")
+_SIGN_SLOT_PLACEHOLDER_RE = re.compile(
+    r"(?:_{3,}|\.{3,}|·{3,}|□|■|[（(]\s*[年Y]\s*[）)]\s*[（(]\s*[月M]\s*[）)]\s*[（(]\s*[日D]\s*[）)])"
+)
+_SIGN_SLOT_LABEL_RE = re.compile(r"(?:编制|编写|作者|审核|复核|批准|签字|签名|日期|Date|Signed)", re.I)
+_DOCX_EDGE_START_RATIO = 0.22
+_DOCX_EDGE_END_RATIO = 0.78
+_STRONG_SIGN_RULES = frozenset(
+    {
+        "strong_block_rule",
+        "triad_rule",
+        "triad_text_hint",
+        "triad_text_hint_en",
+        "role_date_rule",
+        "role_placeholder_rule",
+        "sign_slot_placeholder_rule",
+        "table_header_rule",
+        "docx_role_with_date_row",
+        "docx_multi_role_row",
+        "multi_role_rule",
+        "org_seal_rule",
+    }
+)
+
+
+def _get_detect_hint_weight() -> float:
+    """可配置的 hint 权重（系统设置 SIGN_DETECT_HINT_WEIGHT）。"""
+    v = 1.0
+    try:
+        from runtime_settings.resolve import get_setting
+
+        v = float(get_setting("SIGN_DETECT_HINT_WEIGHT"))
+    except Exception:
+        v = 1.0
+    if not (v == v):  # NaN
+        v = 1.0
+    return max(0.2, min(2.5, v))
+
+
+def _scale_hint_conf(base: float, weight: float, *, low: float = 0.0, high: float = 0.99) -> float:
+    x = float(base) * float(weight)
+    if x < low:
+        return low
+    if x > high:
+        return high
+    return x
 
 
 def _norm(s: str) -> str:
@@ -60,6 +105,165 @@ def _contains_any(text: str, tokens: Sequence[str]) -> bool:
             if x in t:
                 return True
     return False
+
+
+def _detect_placeholder_forms(text: str) -> List[str]:
+    """
+    识别"留白形态"：返回命中的形态标签列表（不止枚举几种符号）。
+    标签语义：
+      - underscore_run / dot_run / box_symbol / ymd_brackets：明确符号占位
+      - label_trailing_space：签批标签后留长空白
+      - label_dangling_colon：签批标签后只剩冒号（典型"待填写"）
+      - symbol_run：任意连续符号段（自适应）
+      - bracket_empty：括号内空 / 仅含空白或符号
+    """
+    t = str(text or "").strip()
+    if not t:
+        return []
+    forms: List[str] = []
+    seen = set()
+
+    def _add(tag: str) -> None:
+        if tag and tag not in seen:
+            seen.add(tag)
+            forms.append(tag)
+
+    if re.search(r"_{3,}", t):
+        _add("underscore_run")
+    if re.search(r"\.{3,}|·{3,}", t):
+        _add("dot_run")
+    if re.search(r"[□■]", t):
+        _add("box_symbol")
+    if re.search(
+        r"[（(]\s*[年Y]\s*[）)]\s*[（(]\s*[月M]\s*[）)]\s*[（(]\s*[日D]\s*[）)]",
+        t,
+    ):
+        _add("ymd_brackets")
+
+    has_label = bool(_SIGN_SLOT_LABEL_RE.search(t))
+    if has_label:
+        if re.search(
+            r"(编制|编写|作者|审核|复核|批准|签字|签名|日期)\s*[:：]?\s{3,}", t
+        ):
+            _add("label_trailing_space")
+        if re.search(
+            r"(?:编制|编写|作者|审核|复核|批准|签字|签名|日期|Date|Signed)\s*[:：]\s*$",
+            t,
+            re.I,
+        ):
+            _add("label_dangling_colon")
+        for seg in re.findall(r"[^\w\u4e00-\u9fff]{3,}", t):
+            if seg.strip():
+                _add("symbol_run")
+                break
+        if re.search(r"[（(]\s*[^\w\u4e00-\u9fff]?\s*[）)]", t):
+            _add("bracket_empty")
+    return forms
+
+
+def _has_sign_slot_placeholder(text: str) -> bool:
+    return bool(_detect_placeholder_forms(text))
+
+
+def _docx_block_position_score(
+    source_hint: str, total_tables: int, total_paragraphs: int
+) -> Optional[float]:
+    s = str(source_hint or "").strip()
+    m = re.match(r"^table(\d+)\.row\d+$", s, re.IGNORECASE)
+    if m:
+        idx = int(m.group(1))
+        if total_tables <= 1:
+            return 0.0
+        return max(0.0, min(1.0, float(idx - 1) / float(max(1, total_tables - 1))))
+    m = re.match(r"^paragraph(\d+)$", s, re.IGNORECASE)
+    if m:
+        idx = int(m.group(1))
+        if total_paragraphs <= 1:
+            return 0.0
+        return max(0.0, min(1.0, float(idx - 1) / float(max(1, total_paragraphs - 1))))
+    if s.lower() in ("header", "footer", "first_page_header", "first_page_footer"):
+        # 页眉页脚视为边缘区域
+        return 0.0 if "header" in s.lower() else 1.0
+    return None
+
+
+def _is_docx_edge_position(score: Optional[float]) -> bool:
+    if score is None:
+        return False
+    return score <= _DOCX_EDGE_START_RATIO or score >= _DOCX_EDGE_END_RATIO
+
+
+def _block_has_sign_context(block: Dict[str, Any]) -> bool:
+    if not isinstance(block, dict):
+        return False
+    fields = block.get("fields") if isinstance(block.get("fields"), list) else []
+    has_role = any(
+        isinstance(f, dict) and f.get("type") == "role_id" and str(f.get("name") or "").strip()
+        for f in fields
+    )
+    if not has_role:
+        return False
+    has_date = any(isinstance(f, dict) and f.get("type") == "date" for f in fields)
+    has_action = any(isinstance(f, dict) and f.get("type") == "action" for f in fields)
+    txt = (str(block.get("label_preview") or "") + " " + str(block.get("source_hint") or "")).strip()
+    has_placeholder = _has_sign_slot_placeholder(txt)
+    matched = {str(x or "").strip() for x in (block.get("matched_rules") or [])}
+    return bool(has_date or has_action or has_placeholder or (matched & _STRONG_SIGN_RULES))
+
+
+def _filter_docx_blocks_by_edge_priority(
+    blocks: List[Dict[str, Any]], total_tables: int, total_paragraphs: int
+) -> Tuple[List[Dict[str, Any]], bool]:
+    strong_blocks: List[Tuple[int, Dict[str, Any], bool]] = []
+    for b in blocks:
+        if not _block_has_sign_context(b):
+            continue
+        score = _docx_block_position_score(
+            str(b.get("source_hint") or ""), total_tables, total_paragraphs
+        )
+        strong_blocks.append((len(strong_blocks), b, _is_docx_edge_position(score)))
+    if not strong_blocks:
+        return blocks, False
+
+    edge_cnt = sum(1 for _, _, is_edge in strong_blocks if is_edge)
+    body_cnt = len(strong_blocks) - edge_cnt
+
+    # 自适应策略：仅当“边缘签批证据明显占优”才过滤正文，避免硬性写死。
+    edge_dominant = edge_cnt >= 2 and edge_cnt >= body_cnt + 1
+    if not edge_dominant:
+        return blocks, False
+
+    kept = []
+    for b in blocks:
+        score = _docx_block_position_score(
+            str(b.get("source_hint") or ""), total_tables, total_paragraphs
+        )
+        if _is_docx_edge_position(score) and _block_has_sign_context(b):
+            kept.append(b)
+    if kept:
+        return kept, True
+    return blocks, False
+
+
+def _filter_role_evidence_to_edge(
+    role_evidence: Dict[str, List[Dict[str, Any]]], total_tables: int, total_paragraphs: int
+) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for rid, arr in (role_evidence or {}).items():
+        if rid not in ROLE_ID_TO_KEYWORD or not isinstance(arr, list):
+            continue
+        kept = []
+        for ev in arr:
+            if not isinstance(ev, dict):
+                continue
+            score = _docx_block_position_score(
+                str(ev.get("source_hint") or ""), total_tables, total_paragraphs
+            )
+            if _is_docx_edge_position(score):
+                kept.append(ev)
+        if kept:
+            out[rid] = kept[:6]
+    return out
 
 
 def _match_role_in_short_line(line: str) -> List[str]:
@@ -122,6 +326,7 @@ class DetectedBlock:
     fields: List[Dict[str, str]]
     source_hint: str
     label_preview: str = ""
+    placeholder_forms: List[str] = None  # type: ignore[assignment]
 
     def to_dict(self) -> dict:
         d = {
@@ -133,6 +338,8 @@ class DetectedBlock:
         }
         if self.label_preview:
             d["label_preview"] = self.label_preview
+        if self.placeholder_forms:
+            d["placeholder_forms"] = list(self.placeholder_forms)
         return d
 
 
@@ -186,17 +393,19 @@ def _compact_role_evidence(role_evidence: Dict[str, List[Dict[str, Any]]], top_n
 
 
 def _score_block(
-    role_ids: List[str], joined_text: str, has_date: bool, has_action: bool
+    role_ids: List[str], joined_text: str, has_date: bool, has_action: bool, has_placeholder: bool = False
 ) -> Tuple[float, List[str]]:
     """role_ids 为英文 id（author/reviewer/…）；joined_text 为单元格拼接后的原文，用于中文关键词规则。"""
     matched: List[str] = []
     rset = set(role_ids)
     jt = joined_text or ""
     # 仅「执行+审核」且无日期/动作，通常是用例表列头，不应作为签字角色命中。
-    if rset and rset.issubset({"executor", "reviewer"}) and not has_date and not has_action:
+    if rset and rset.issubset({"executor", "reviewer"}) and not has_date and not has_action and not has_placeholder:
         return 0.0, ["weak_executor_reviewer_only"]
-    if rset and has_date:
+    if rset and (has_date or has_placeholder):
         matched.append("strong_block_rule")
+    if rset and has_placeholder:
+        matched.append("sign_slot_placeholder_rule")
     if {"author", "reviewer", "approver"}.issubset(rset):
         matched.append("triad_rule")
     elif _contains_any(jt, _ZH_TRIAD_TOKENS) and len(rset) >= 2:
@@ -217,6 +426,8 @@ def _score_block(
         matched.append("multi_role_action_rule")
     if len(rset) >= 1 and has_date and "strong_block_rule" not in matched:
         matched.append("role_date_rule")
+    if len(rset) >= 1 and has_placeholder and "strong_block_rule" not in matched:
+        matched.append("role_placeholder_rule")
 
     # 置信度：强规则优先
     if "triad_rule" in matched or "strong_block_rule" in matched:
@@ -235,7 +446,9 @@ def _score_block(
         return 0.78, matched
     if "role_date_rule" in matched:
         return 0.74, matched
-    if rset and (has_date or has_action):
+    if "role_placeholder_rule" in matched:
+        return 0.72, matched
+    if rset and (has_date or has_action or has_placeholder):
         return 0.72, matched or ["medium_block_rule"]
     if has_action and rset:
         return 0.55, matched or ["action_with_role"]
@@ -503,6 +716,7 @@ def _append_xlsx_block(
         fields=fields,
         source_hint=f"{sheet_title}!row{row_index}",
         label_preview=(joined or "")[:200],
+        placeholder_forms=_detect_placeholder_forms(joined),
     )
     blocks.append(b)
     for rid in set(role_ids):
@@ -551,10 +765,11 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
                 ws, r, eff_cols, eff_rows, _dtoks, _atoks
             )
             joined = " | ".join(cell_texts)
+            has_placeholder = _has_sign_slot_placeholder(joined)
             if not role_ids and not has_action:
                 continue
 
-            conf, matched = _score_block(role_ids, joined, has_date, has_action)
+            conf, matched = _score_block(role_ids, joined, has_date, has_action, has_placeholder)
             if conf <= 0:
                 continue
             if conf < 0.5:
@@ -586,10 +801,16 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
             if not role_ids:
                 continue
             joined = " | ".join(cell_texts)
-            conf, matched = _score_block(role_ids, joined, has_date, has_action)
+            has_placeholder = _has_sign_slot_placeholder(joined)
+            conf, matched = _score_block(role_ids, joined, has_date, has_action, has_placeholder)
             if conf < 0.5:
                 rset = set(role_ids)
-                if (len(rset) >= 2 and not rset.issubset({"executor", "reviewer"})) or has_date or has_action:
+                if (
+                    (len(rset) >= 2 and not rset.issubset({"executor", "reviewer"}))
+                    or has_date
+                    or has_action
+                    or has_placeholder
+                ):
                     conf = 0.56
                     matched = list(matched or []) + ["xlsx_multi_page_supplement"]
                 elif len(set(role_ids)) == 1 and has_date:
@@ -622,9 +843,18 @@ def detect_xlsx(path: str, max_scan_rows: int = 8000, max_scan_cols: int = 128) 
                 role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), float(b.confidence) * 0.95)
 
     role_ev = _compact_role_evidence(role_evidence)
+    placeholder_forms_seen = sorted({
+        f
+        for b in blocks
+        for f in (b.placeholder_forms or [])
+        if f
+    })
+    placeholder_blocks_count = sum(1 for b in blocks if b.placeholder_forms)
     debug_summary = {
         "kind": "xlsx",
         "total_blocks": len(blocks),
+        "placeholder_forms_seen": placeholder_forms_seen,
+        "placeholder_blocks_count": placeholder_blocks_count,
         "role_count": len(role_ids_found),
         "rules_matched": sorted(
             {
@@ -745,11 +975,12 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
                 role_ids.extend(_cell_role_ids_multiline(t))
             has_date = _contains_any(joined, _DATE_TOKENS)
             has_action = _contains_any(joined, _ACTION_TOKENS)
+            has_placeholder = _has_sign_slot_placeholder(joined)
 
-            conf, matched = _score_block(role_ids, joined, has_date, has_action)
+            conf, matched = _score_block(role_ids, joined, has_date, has_action, has_placeholder)
             if conf < 0.5:
                 rset = set(role_ids)
-                if len(rset) >= 1 and has_date:
+                if len(rset) >= 1 and (has_date or has_placeholder):
                     conf = 0.72
                     matched = list(matched or []) + ["docx_role_with_date_row"]
                 elif len(rset) >= 2 and not rset.issubset({"executor", "reviewer"}):
@@ -771,6 +1002,7 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
                 fields=fields,
                 source_hint=f"table{ti+1}.row{ri+1}",
                 label_preview=(joined or "")[:200],
+                placeholder_forms=_detect_placeholder_forms(joined),
             )
             blocks.append(b)
             bi += 1
@@ -807,7 +1039,8 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
         role_ids = _paragraph_role_ids(t)
         has_date = _contains_any(t, _DATE_TOKENS)
         has_action = _contains_any(t, _ACTION_TOKENS)
-        conf, matched = _score_block(role_ids, t, has_date, has_action)
+        has_placeholder = _has_sign_slot_placeholder(t)
+        conf, matched = _score_block(role_ids, t, has_date, has_action, has_placeholder)
         if conf < 0.68:
             continue
         fields: List[Dict[str, str]] = [{"name": rid, "type": "role_id"} for rid in sorted(set(role_ids))]
@@ -821,6 +1054,8 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
             matched_rules=matched,
             fields=fields,
             source_hint=f"paragraph{pi+1}",
+            label_preview=(t or "")[:200],
+            placeholder_forms=_detect_placeholder_forms(t),
         )
         blocks.append(b)
         bi += 1
@@ -835,26 +1070,56 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
             t,
         )
 
-    for b in blocks:
-        for f in b.fields:
+    edge_filter_applied = False
+    blocks_dict = [b.to_dict() for b in blocks]
+    blocks_dict, edge_filter_applied = _filter_docx_blocks_by_edge_priority(
+        blocks_dict,
+        total_tables=len(tables_for_detect),
+        total_paragraphs=len(doc.paragraphs),
+    )
+    if edge_filter_applied:
+        # 发现封面/文末已有强签批块时，按用户口径仅保留封面/文末签批，忽略正文（含正文表格）。
+        role_ids_found = {}
+        role_evidence = _filter_role_evidence_to_edge(
+            role_evidence,
+            total_tables=len(tables_for_detect),
+            total_paragraphs=len(doc.paragraphs),
+        )
+
+    for b in blocks_dict:
+        for f in (b.get("fields") or []):
             if f.get("type") == "role_id" and f.get("name") in ROLE_ID_TO_KEYWORD:
                 rid = f["name"]
-                role_ids_found[rid] = max(role_ids_found.get(rid, 0.0), float(b.confidence) * 0.95)
+                role_ids_found[rid] = max(
+                    role_ids_found.get(rid, 0.0), float(b.get("confidence") or 0.0) * 0.95
+                )
 
     role_ev = _compact_role_evidence(role_evidence)
+    placeholder_forms_seen = sorted({
+        f
+        for b in blocks_dict
+        for f in (b.get("placeholder_forms") or [])
+        if f
+    })
+    placeholder_blocks_count = sum(
+        1 for b in blocks_dict if b.get("placeholder_forms")
+    )
     debug_summary = {
         "kind": "docx",
         "track_changes_present": bool(has_rev),
         "text_mode": "revision_accepted_ooxml",
         "light_scan": bool(light),
         "tables_scanned": len(tables_for_detect),
-        "total_blocks": len(blocks),
+        "total_blocks": len(blocks_dict),
+        "edge_filter_applied": bool(edge_filter_applied),
+        "placeholder_forms_seen": placeholder_forms_seen,
+        "placeholder_blocks_count": placeholder_blocks_count,
         "role_count": len(role_ids_found),
         "rules_matched": sorted(
             {
                 str(m)
-                for b in blocks
-                for m in (b.matched_rules or [])
+                for b in blocks_dict
+                for m in (b.get("matched_rules") or [])
                 if str(m).strip()
             }
         ),
@@ -863,19 +1128,280 @@ def detect_docx(path: str, max_paragraphs: int = 1200, *, light: bool = False) -
         "ok": True,
         "kind": "docx",
         "roles": [{"id": rid, "confidence": role_ids_found[rid]} for rid in sorted(role_ids_found)],
-        "blocks": [b.to_dict() for b in blocks],
+        "blocks": blocks_dict,
         "role_evidence": role_ev,
         "debug_summary": debug_summary,
     }
 
 
-def detect_file(path: str, source_name: str = "", mode: str = "auto") -> dict:
+def _normalize_detect_hint(detect_hint: Any) -> Dict[str, Any]:
+    if not isinstance(detect_hint, dict):
+        return {}
+    expected = []
+    for rid in detect_hint.get("expected_roles") or []:
+        rs = str(rid or "").strip()
+        if rs in ROLE_ID_TO_KEYWORD and rs not in expected:
+            expected.append(rs)
+    kws = []
+    seen = set()
+    for kw in detect_hint.get("label_keywords") or []:
+        s = str(kw or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        kws.append(s[:64])
+        if len(kws) >= 24:
+            break
+    manual = []
+    ocr_kws = []
+    for kw in detect_hint.get("manual_keywords") or []:
+        s = str(kw or "").strip()
+        if s and s not in manual:
+            manual.append(s[:64])
+    for kw in detect_hint.get("ocr_keywords") or []:
+        s = str(kw or "").strip()
+        if s and s not in ocr_kws:
+            ocr_kws.append(s[:64])
+    ocr_stats = detect_hint.get("ocr_hint_stats")
+    if not isinstance(ocr_stats, dict):
+        ocr_stats = {}
+    return {
+        "expected_roles": expected,
+        "label_keywords": kws,
+        "manual_keywords": manual,
+        "ocr_keywords": ocr_kws,
+        "ocr_hint_stats": ocr_stats,
+    }
+
+
+def _apply_detect_hint_soft(result: dict, detect_hint: Any) -> dict:
+    if not isinstance(result, dict) or not result.get("ok"):
+        return result
+    hint = _normalize_detect_hint(detect_hint)
+    expected = hint.get("expected_roles") or []
+    kws = hint.get("label_keywords") or []
+    manual_kws = hint.get("manual_keywords") or []
+    ocr_kws = hint.get("ocr_keywords") or []
+    ocr_stats = hint.get("ocr_hint_stats") if isinstance(hint.get("ocr_hint_stats"), dict) else {}
+    if not expected and not kws:
+        return result
+    hint_weight = _get_detect_hint_weight()
+
+    result = dict(result)
+    roles = []
+    role_conf: Dict[str, float] = {}
+    for rr in result.get("roles") or []:
+        if not isinstance(rr, dict):
+            continue
+        rid = str(rr.get("id") or "").strip()
+        if rid not in ROLE_ID_TO_KEYWORD:
+            continue
+        cf = float(rr.get("confidence") or 0.0)
+        role_conf[rid] = max(role_conf.get(rid, 0.0), cf)
+    blocks = [b for b in (result.get("blocks") or []) if isinstance(b, dict)]
+    full_text = " ".join(
+        str(b.get("label_preview") or "") + " " + str(b.get("source_hint") or "")
+        for b in blocks
+    )
+    role_evidence = (
+        dict(result.get("role_evidence"))
+        if isinstance(result.get("role_evidence"), dict)
+        else {}
+    )
+    kw_hits = 0
+    for b in blocks:
+        txt = (str(b.get("label_preview") or "") + " " + str(b.get("source_hint") or "")).strip()
+        if not txt:
+            continue
+        if kws and any(kw in txt for kw in kws):
+            kw_hits += 1
+            for rid in expected:
+                arr = role_evidence.get(rid) if isinstance(role_evidence.get(rid), list) else []
+                arr.append(
+                    {
+                        "confidence": _scale_hint_conf(0.58, hint_weight),
+                        "source_hint": "detect_hint_keyword_context",
+                        "matched_rules": ["detect_hint_keyword"],
+                        "label_preview": txt[:120],
+                    }
+                )
+                role_evidence[rid] = arr[:6]
+
+    for rid in expected:
+        if rid in role_conf:
+            role_conf[rid] = max(role_conf[rid], _scale_hint_conf(0.82, hint_weight))
+            continue
+        if any(kw and kw in full_text for kw in role_keywords(rid)):
+            role_conf[rid] = _scale_hint_conf(0.56, hint_weight)
+            arr = role_evidence.get(rid) if isinstance(role_evidence.get(rid), list) else []
+            arr.append(
+                {
+                    "confidence": _scale_hint_conf(0.56, hint_weight),
+                    "source_hint": "detect_hint_role_recover",
+                    "matched_rules": ["detect_hint_expected_role"],
+                    "label_preview": (full_text or rid)[:120],
+                }
+            )
+            role_evidence[rid] = arr[:6]
+
+    roles = [{"id": rid, "confidence": role_conf[rid]} for rid in sorted(role_conf)]
+    result["roles"] = roles
+    result["role_evidence"] = role_evidence
+    ocr_doc_hits = [kw for kw in ocr_kws if kw and kw in full_text]
+    ds = dict(result.get("debug_summary") or {})
+    ds["detect_hint_used"] = True
+    ds["detect_hint_weight"] = hint_weight
+    ds["detect_hint_expected_roles"] = expected
+    if manual_kws:
+        ds["detect_hint_manual_keywords"] = manual_kws[:12]
+    if ocr_kws:
+        ds["detect_hint_ocr_keywords"] = ocr_kws[:12]
+    if ocr_doc_hits:
+        ds["detect_hint_ocr_keyword_hits"] = ocr_doc_hits[:12]
+    if ocr_stats:
+        ds["detect_hint_ocr_stats"] = {
+            "enabled": bool(ocr_stats.get("enabled")),
+            "images_configured": int(ocr_stats.get("images_configured") or 0),
+            "images_tried": int(ocr_stats.get("images_tried") or 0),
+            "images_read_ok": int(ocr_stats.get("images_read_ok") or 0),
+            "skipped_reason": str(ocr_stats.get("skipped_reason") or "")[:64],
+        }
+    if kws:
+        ds["detect_hint_keywords"] = kws[:12]
+        ds["detect_hint_keyword_hits"] = kw_hits
+    result["debug_summary"] = ds
+    return result
+
+
+_WORK_INSTRUCTION_NAME_RE = re.compile(
+    r"作业指导书|过程检验|成品检验|SOP\s*0*\d",
+    re.I,
+)
+_TAIL_INSPECTOR_LABEL_RE = re.compile(
+    r"检验人|检验员|检查人|质检员|质检负责人",
+    re.I,
+)
+_SIGNOFF_LABEL_RE = re.compile(r"编制|编写|作者|审核|复核|批准", re.I)
+
+
+def _block_is_tail_inspector_only(block: dict) -> bool:
+    """文末「检验人/检验员」等误匹配 reviewer_tail，非封面编审批签批栏。"""
+    if not isinstance(block, dict):
+        return False
+    fields = block.get("fields") if isinstance(block.get("fields"), list) else []
+    role_names = [
+        str(f.get("name") or "").strip()
+        for f in fields
+        if isinstance(f, dict) and f.get("type") == "role_id"
+    ]
+    if not role_names:
+        return False
+    preview = (str(block.get("label_preview") or "") + str(block.get("source_hint") or "")).strip()
+    if not _TAIL_INSPECTOR_LABEL_RE.search(preview):
+        return False
+    if _SIGNOFF_LABEL_RE.search(preview):
+        return False
+    canon = {canonical_sign_role_id(r) for r in role_names}
+    return canon <= {"reviewer", "reviewer_tail"}
+
+
+def _harmonize_role_evidence(role_evidence: Any) -> Dict[str, List[Dict[str, Any]]]:
+    if not isinstance(role_evidence, dict):
+        return {}
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for rid, arr in role_evidence.items():
+        rid2 = canonical_sign_role_id(str(rid))
+        if rid2 not in ROLE_ID_TO_KEYWORD:
+            continue
+        bucket = out.setdefault(rid2, [])
+        if not isinstance(arr, list):
+            continue
+        for ev in arr:
+            if isinstance(ev, dict) and ev not in bucket:
+                bucket.append(ev)
+        out[rid2] = bucket[:6]
+    return out
+
+
+def _harmonize_detect_result(result: dict, source_name: str = "") -> dict:
+    """
+    统一需签角色集：reviewer_tail 并入 reviewer；作业指导书等已有编审批三角色时，
+    去掉文末「检验人」误识别的 reviewer_tail 块，避免签字位与需签角色列不一致。
+    """
+    if not isinstance(result, dict) or not result.get("ok"):
+        return result
+    out = dict(result)
+    role_conf: Dict[str, float] = {}
+    for rr in out.get("roles") or []:
+        if not isinstance(rr, dict):
+            continue
+        rid = canonical_sign_role_id(str(rr.get("id") or "").strip())
+        if rid not in ROLE_ID_TO_KEYWORD:
+            continue
+        role_conf[rid] = max(role_conf.get(rid, 0.0), float(rr.get("confidence") or 0.0))
+
+    if "reviewer_tail" in role_conf:
+        rt = role_conf.pop("reviewer_tail")
+        role_conf["reviewer"] = max(role_conf.get("reviewer", 0.0), rt)
+
+    nm = str(source_name or "").strip()
+    is_work_instruction = bool(_WORK_INSTRUCTION_NAME_RE.search(nm))
+    has_triad = {"author", "reviewer", "approver"}.issubset(role_conf.keys())
+
+    blocks_in = [b for b in (out.get("blocks") or []) if isinstance(b, dict)]
+    blocks_out: List[dict] = []
+    for b in blocks_in:
+        if is_work_instruction and has_triad and _block_is_tail_inspector_only(b):
+            continue
+        b2 = dict(b)
+        fields = []
+        for f in b.get("fields") or []:
+            if not isinstance(f, dict):
+                continue
+            f2 = dict(f)
+            if f2.get("type") == "role_id" and f2.get("name"):
+                f2["name"] = canonical_sign_role_id(str(f2["name"]))
+            fields.append(f2)
+        b2["fields"] = fields
+        blocks_out.append(b2)
+
+    if is_work_instruction and has_triad:
+        role_conf.pop("reviewer_tail", None)
+
+    # 块内角色与顶层 roles 对齐
+    for b in blocks_out:
+        for f in b.get("fields") or []:
+            if not isinstance(f, dict) or f.get("type") != "role_id":
+                continue
+            rid = str(f.get("name") or "").strip()
+            if rid not in ROLE_ID_TO_KEYWORD:
+                continue
+            role_conf[rid] = max(role_conf.get(rid, 0.0), float(b.get("confidence") or 0.0) * 0.95)
+
+    out["roles"] = [
+        {"id": rid, "confidence": role_conf[rid]} for rid in sorted(role_conf)
+    ]
+    out["blocks"] = blocks_out
+    out["role_evidence"] = _harmonize_role_evidence(out.get("role_evidence"))
+    ds = dict(out.get("debug_summary") or {})
+    if is_work_instruction and has_triad:
+        ds["roles_harmonized"] = "work_instruction_triad"
+    out["debug_summary"] = ds
+    return out
+
+
+def detect_file(path: str, source_name: str = "", mode: str = "auto", detect_hint: Any = None) -> dict:
     ext = os.path.splitext(path)[1].lower()
     light = mode == "light"
     # 规则/标误只作为提示，不以其结论替代真实识别；auto 模式保持正常扫描深度。
+    src = source_name or os.path.basename(path)
     if ext == ".xlsx":
-        return detect_xlsx(path)
-    if ext == ".docx":
-        return detect_docx(path, light=light)
-    return {"ok": False, "error": f"不支持的格式: {ext}"}
+        result = _apply_detect_hint_soft(detect_xlsx(path), detect_hint)
+    elif ext == ".docx":
+        result = _apply_detect_hint_soft(detect_docx(path, light=light), detect_hint)
+    else:
+        return {"ok": False, "error": f"不支持的格式: {ext}"}
+    if isinstance(result, dict) and result.get("ok"):
+        result = _harmonize_detect_result(result, source_name=src)
+    return result
 

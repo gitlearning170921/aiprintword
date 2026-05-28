@@ -618,10 +618,21 @@ def _expand_7z_py7zr(tmp_dir: str, archive_path: str, archive_rel: str):
     except ImportError:
         return []
     extract_root = os.path.join(tmp_dir, "_p7z", uuid.uuid4().hex[:16])
-    try:
+
+    def _do_extract() -> None:
         os.makedirs(extract_root, exist_ok=True)
         with py7zr.SevenZipFile(archive_path, mode="r") as z:
             z.extractall(path=extract_root)
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_do_extract)
+            fut.result(timeout=600)
+    except FutTimeout:
+        logger.warning("py7zr extract timeout archive=%s", archive_rel)
+        return []
     except Exception as e:
         logger.warning("py7zr extract failed %s: %s", archive_rel, e)
         return []
@@ -2904,6 +2915,92 @@ def _sign_convert_source_item_to_signable(item: dict) -> tuple[Optional[dict], O
             pass
 
 
+def _sign_upload_base_name(name: str) -> str:
+    from sign_handlers.filename_util import normalize_display_filename
+
+    return normalize_display_filename(name or "")
+
+
+def _sign_record_same_project(rec: dict, proj: dict) -> bool:
+    want = str((proj or {}).get("id") or "").strip()
+    got = str((rec or {}).get("project_id") or "").strip()
+    if want:
+        return got == want
+    return not got
+
+
+def _sign_mysql_insert_parsed_items(
+    parsed: list, proj: dict, *, replace_duplicates: bool = False
+) -> tuple[list, Optional[dict], Optional[str]]:
+    """批量写入 MySQL（并行 FTP，缩短大压缩包解压后的落库时间）。"""
+    from sign_handlers import mysql_store
+
+    if not parsed:
+        return [], None, None
+    if replace_duplicates:
+        mysql_store.delete_inbox_by_basenames_in_project(
+            str((proj or {}).get("id") or "") or None,
+            [item.get("name") or "" for item in parsed],
+        )
+    added_ids: list = []
+    last_rec = None
+    errors: list = []
+
+    def _insert_one(item: dict) -> tuple[str, dict]:
+        file_id = uuid.uuid4().hex
+        display_name = item["name"]
+        ext = item["ext"]
+        raw = item["raw"]
+        if not raw:
+            raise ValueError(f"文件为空：{display_name}")
+        mysql_store.insert_file(
+            file_id,
+            display_name,
+            ext,
+            raw,
+            project_id=str(proj.get("id") or ""),
+            project_name=str(proj.get("name") or ""),
+            project_key=str(proj.get("project_key") or proj.get("name") or ""),
+        )
+        return file_id, {
+            "id": file_id,
+            "name": display_name,
+            "ext": ext,
+            "project_id": proj.get("id"),
+            "project_name": proj.get("name"),
+            "project_key": proj.get("project_key"),
+            "project_label": proj.get("label") or proj.get("name"),
+        }
+
+    workers = min(4, max(1, len(parsed)))
+    if len(parsed) <= 2:
+        for item in parsed:
+            try:
+                fid, rec = _insert_one(item)
+                added_ids.append(fid)
+                last_rec = rec
+            except Exception as e:
+                errors.append(str(e))
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_insert_one, item): item for item in parsed}
+            for fut in as_completed(futs):
+                item = futs[fut]
+                try:
+                    fid, rec = fut.result()
+                    added_ids.append(fid)
+                    last_rec = rec
+                except Exception as e:
+                    errors.append(f"{item.get('name')}: {e}")
+    if errors and not added_ids:
+        return [], None, errors[0]
+    if errors:
+        return added_ids, last_rec, "部分文件写入失败：" + errors[0][:200]
+    return added_ids, last_rec, None
+
+
 def _sign_collect_upload_items(uploads: list) -> tuple[list, list, bool, int]:
     """统一收集上传项（普通文档 + zip 内文档）。"""
     items = []
@@ -3023,16 +3120,43 @@ def _sign_saved_file_exists(sid: str, file_id: str, ext: Optional[str]) -> bool:
     return False
 
 
+def _sign_record_saved_at_iso(sid: str, rec: dict) -> Optional[str]:
+    """待签文件保存时间（列表展示/筛选）；优先记录字段，否则用磁盘 mtime。"""
+    for key in ("saved_at", "created_at"):
+        raw = str(rec.get(key) or "").strip()
+        if raw:
+            return raw
+    fid = str(rec.get("id") or "").strip()
+    if not fid:
+        return None
+    path = _sign_saved_disk_path(sid, fid, rec.get("ext"))
+    if path and os.path.isfile(path):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+        except OSError:
+            pass
+    return None
+
+
+def _sign_enrich_session_file_record(sid: str, rec: dict) -> dict:
+    out = dict(rec or {})
+    ts = _sign_record_saved_at_iso(sid, out)
+    if ts:
+        out["created_at"] = ts
+        out["saved_at"] = ts
+    return out
+
+
 def _sign_prune_session_files_to_disk(sid: str) -> list:
     """
     以磁盘为准修剪 session['sign_files']：已删文件但 Cookie 未写回时，刷新列表仍会从库里删掉条目。
     """
     records = list(session.get("sign_files") or [])
-    pruned = [
-        r
-        for r in records
-        if _sign_saved_file_exists(sid, str(r.get("id") or ""), r.get("ext"))
-    ]
+    pruned = []
+    for r in records:
+        if not _sign_saved_file_exists(sid, str(r.get("id") or ""), r.get("ext")):
+            continue
+        pruned.append(_sign_enrich_session_file_record(sid, r))
     if len(pruned) != len(records):
         session["sign_files"] = pruned
         session.modified = True
@@ -3093,6 +3217,31 @@ def _keywords_from_label_preview(text, max_items=6):
         if len(out) >= max_items:
             break
     return out
+
+
+def _parse_docx_table_cell_loc(loc_text: str):
+    """table#2.r10.c3 → {table, row, col}（1-based）。"""
+    s = str(loc_text or "").strip()
+    m = re.match(r"^\s*table#?(\d+)\.r(\d+)\.c(\d+)\s*$", s, re.IGNORECASE)
+    if not m:
+        return None
+    return {
+        "table": int(m.group(1)),
+        "row": int(m.group(2)),
+        "col": int(m.group(3)),
+    }
+
+
+def _parse_xlsx_table_cell_loc(loc_text: str):
+    s = str(loc_text or "").strip()
+    m = re.match(r"^\s*sheet(\d+)!\s*r(\d+)\.c(\d+)\s*$", s, re.IGNORECASE)
+    if not m:
+        return None
+    return {
+        "sheet": int(m.group(1)),
+        "row": int(m.group(2)),
+        "col": int(m.group(3)),
+    }
 
 
 def _layout_loc_to_source_hints(loc_text):
@@ -3247,13 +3396,288 @@ def _build_placement_plan_from_detect(det, role_ids):
             for lt in _layout_to_plan_types(li):
                 if lt not in p_lts:
                     p_lts.append(lt)
-            if p_kws or p_hints or p_lts:
-                plan[rid_s] = {
+            nc = _parse_docx_table_cell_loc(li.get("name_loc") or "")
+            dc = _parse_docx_table_cell_loc(li.get("date_loc") or "")
+            xnc = _parse_xlsx_table_cell_loc(li.get("name_loc") or "")
+            xdc = _parse_xlsx_table_cell_loc(li.get("date_loc") or "")
+            if p_kws or p_hints or p_lts or nc or dc or xnc or xdc:
+                entry = {
                     "keywords": p_kws[:8],
                     "source_hints": p_hints[:12],
                     "layout_types": p_lts[:6],
+                    "date_slot": bool(li.get("date_slot", True)),
                 }
+                if nc:
+                    entry["name_cell"] = nc
+                if dc:
+                    entry["date_cell"] = dc
+                if xnc:
+                    entry["xlsx_name_cell"] = xnc
+                if xdc:
+                    entry["xlsx_date_cell"] = xdc
+                plan[rid_s] = entry
     return plan
+
+
+_CORE_SIGNOFF_ROLES = ("author", "reviewer", "approver")
+_SIGN_SLOT_PLACEHOLDER_RE = re.compile(
+    r"(?:_{3,}|\.{3,}|·{3,}|□|■|[（(]\s*[年Y]\s*[）)]\s*[（(]\s*[月M]\s*[）)]\s*[（(]\s*[日D]\s*[）)])"
+)
+_SIGN_SLOT_LABEL_RE = re.compile(r"(?:编制|编写|作者|审核|复核|批准|签字|签名|日期|Date|Signed)", re.I)
+_SIGNOFF_ROW_HINT_RE = re.compile(
+    r"(?:table(\d+)\.row(\d+)|paragraph(\d+)|header|footer|sheet(\d+)\.row(\d+))",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_sign_slot_placeholder(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if _SIGN_SLOT_PLACEHOLDER_RE.search(t):
+        return True
+    # 角色/日期标签后跟长空白，通常是待签字位（Word/Excel 常见）
+    if re.search(r"(编制|编写|作者|审核|复核|批准|签字|签名|日期)\s*[:：]?\s{3,}", t):
+        return True
+    has_label = bool(_SIGN_SLOT_LABEL_RE.search(t))
+    if not has_label:
+        return False
+    # 自适应：不枚举具体符号，按“标签 + 待填写形态”判断
+    if re.search(r"(?:编制|编写|作者|审核|复核|批准|签字|签名|日期|Date|Signed)\s*[:：]\s*$", t, re.I):
+        return True
+    for seg in re.findall(r"[^\w\u4e00-\u9fff]{3,}", t):
+        if seg.strip():
+            return True
+    if re.search(r"[（(]\s*[^\w\u4e00-\u9fff]?\s*[）)]", t):
+        return True
+    return False
+
+
+def _signoff_row_bias(source_hint: str) -> int:
+    s = str(source_hint or "")
+    m = _SIGNOFF_ROW_HINT_RE.search(s)
+    if not m:
+        return 0
+    if m.group(0).lower() in ("header", "footer"):
+        return 2
+    table_no = int(m.group(1)) if m.group(1) else 0
+    row_no = int(m.group(2)) if m.group(2) else 0
+    para_no = int(m.group(3)) if m.group(3) else 0
+    sheet_row_no = int(m.group(5)) if m.group(5) else 0
+    if para_no and para_no <= 140:
+        return 1
+    if sheet_row_no and sheet_row_no <= 60:
+        return 1
+    if table_no and (table_no <= 6 or row_no <= 8):
+        return 1
+    return 0
+
+
+def _collect_block_role_stats(det: dict) -> dict:
+    stats = {}
+    blocks = det.get("blocks") if isinstance(det.get("blocks"), list) else []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        fields = b.get("fields") if isinstance(b.get("fields"), list) else []
+        role_ids = []
+        has_date = False
+        has_action = False
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            ftype = str(f.get("type") or "").strip()
+            if ftype == "date":
+                has_date = True
+            elif ftype == "action":
+                has_action = True
+            elif ftype == "role_id":
+                role_ids.append(str(f.get("name") or "").strip())
+        if not role_ids:
+            continue
+        txt = (str(b.get("label_preview") or "") + " " + str(b.get("source_hint") or "")).strip()
+        matched = [str(x or "").strip() for x in (b.get("matched_rules") or [])]
+        has_placeholder = _looks_like_sign_slot_placeholder(txt)
+        has_strong_rule = any(
+            x in (
+                "strong_block_rule",
+                "triad_rule",
+                "triad_text_hint",
+                "role_date_rule",
+                "table_header_rule",
+                "docx_role_with_date_row",
+                "multi_role_rule",
+                "org_seal_rule",
+            )
+            for x in matched
+        )
+        row_bias = _signoff_row_bias(b.get("source_hint") or "")
+        contextual = has_date or has_action or has_placeholder or has_strong_rule
+        is_strong = bool(contextual and row_bias >= 1) or bool(has_strong_rule and contextual)
+        for rid in role_ids:
+            if not rid:
+                continue
+            one = stats.setdefault(
+                rid,
+                {
+                    "total_blocks": 0,
+                    "strong_blocks": 0,
+                    "date_blocks": 0,
+                    "action_blocks": 0,
+                    "placeholder_blocks": 0,
+                },
+            )
+            one["total_blocks"] += 1
+            if is_strong:
+                one["strong_blocks"] += 1
+            if has_date:
+                one["date_blocks"] += 1
+            if has_action:
+                one["action_blocks"] += 1
+            if has_placeholder:
+                one["placeholder_blocks"] += 1
+    return stats
+
+
+def _collect_layout_candidate_roles(det: dict) -> list:
+    from sign_handlers import ROLE_ID_TO_KEYWORD
+    from sign_handlers.config import canonical_sign_role_id
+
+    out = []
+    seen = set()
+    for rr in det.get("roles") or []:
+        if not isinstance(rr, dict):
+            continue
+        rid = canonical_sign_role_id(str(rr.get("id") or "").strip())
+        if rid and rid not in seen and rid in ROLE_ID_TO_KEYWORD:
+            seen.add(rid)
+            out.append(rid)
+    stats = _collect_block_role_stats(det)
+    for rid_raw, st in stats.items():
+        rid = canonical_sign_role_id(rid_raw)
+        if not rid or rid in seen or rid not in ROLE_ID_TO_KEYWORD:
+            continue
+        if st.get("strong_blocks", 0) > 0:
+            seen.add(rid)
+            out.append(rid)
+    # 限制角色集合规模，避免把正文噪音角色全带入布局分析。
+    return out[:8]
+
+
+def _layout_role_is_strong(layout_item: dict) -> bool:
+    if not isinstance(layout_item, dict):
+        return False
+    if not bool(layout_item.get("name_slot")):
+        return False
+    if bool(layout_item.get("date_slot")):
+        return True
+    rel = str(layout_item.get("date_relation") or "").strip()
+    sep = str(layout_item.get("separator") or "").strip()
+    return rel in ("same_cell", "different_cell", "paragraph_inline") or sep in (
+        "slash",
+        "space",
+        "empty_cell",
+        "cell",
+        "newline",
+        "adjacent",
+    )
+
+
+def _looks_like_formal_signoff_case(
+    role_conf: dict, stats: dict, layout_roles: dict, debug_summary: dict
+) -> bool:
+    core_hit = 0
+    for rid in _CORE_SIGNOFF_ROLES:
+        st = stats.get(rid, {})
+        if (
+            role_conf.get(rid, 0.0) >= 0.56
+            or _layout_role_is_strong(layout_roles.get(rid) or {})
+            or int(st.get("strong_blocks", 0)) > 0
+        ):
+            core_hit += 1
+    edge_filtered = bool((debug_summary or {}).get("edge_filter_applied"))
+    if core_hit >= 3:
+        return True
+    if core_hit >= 2 and edge_filtered:
+        return True
+    return core_hit >= 2 and sum(int((stats.get(r) or {}).get("date_blocks", 0)) for r in _CORE_SIGNOFF_ROLES) >= 2
+
+
+def _reconcile_detect_roles_with_layout(det: dict, layout_info: dict, source_name: str = "") -> dict:
+    from sign_handlers import ROLE_ID_TO_KEYWORD
+    from sign_handlers.config import canonical_sign_role_id
+
+    if not isinstance(det, dict) or not det.get("ok"):
+        return det
+    out = dict(det)
+    role_conf = {}
+    for rr in out.get("roles") or []:
+        if not isinstance(rr, dict):
+            continue
+        rid = canonical_sign_role_id(str(rr.get("id") or "").strip())
+        if rid and rid in ROLE_ID_TO_KEYWORD:
+            role_conf[rid] = max(role_conf.get(rid, 0.0), float(rr.get("confidence") or 0.0))
+    stats = _collect_block_role_stats(out)
+    layout_roles_raw = (
+        layout_info.get("role_layouts")
+        if isinstance(layout_info, dict) and isinstance(layout_info.get("role_layouts"), dict)
+        else {}
+    )
+    layout_roles = {}
+    for rid_raw, item in layout_roles_raw.items():
+        rid = canonical_sign_role_id(str(rid_raw or "").strip())
+        if rid and rid in ROLE_ID_TO_KEYWORD and isinstance(item, dict):
+            layout_roles[rid] = item
+    ds_src = det.get("debug_summary") if isinstance(det.get("debug_summary"), dict) else {}
+    signoff_doc = _looks_like_formal_signoff_case(role_conf, stats, layout_roles, ds_src)
+
+    # 布局强证据可补齐/抬高角色置信度。
+    for rid, info in layout_roles.items():
+        if not _layout_role_is_strong(info):
+            continue
+        st = stats.get(rid, {})
+        boost = 0.84 if rid in _CORE_SIGNOFF_ROLES else 0.74
+        boost = max(boost, min(0.92, 0.68 + 0.05 * int(st.get("strong_blocks", 0))))
+        role_conf[rid] = max(role_conf.get(rid, 0.0), boost)
+
+    # 报告/方案等固定签批类：至少两核心角色成立时，对第三角色做弱补齐。
+    if signoff_doc:
+        core_present = [
+            rid
+            for rid in _CORE_SIGNOFF_ROLES
+            if role_conf.get(rid, 0.0) >= 0.56 or _layout_role_is_strong(layout_roles.get(rid) or {})
+        ]
+        if len(core_present) >= 2:
+            for rid in _CORE_SIGNOFF_ROLES:
+                st = stats.get(rid, {})
+                if rid not in role_conf and (
+                    st.get("strong_blocks", 0) > 0
+                    or st.get("date_blocks", 0) > 0
+                    or rid in layout_roles
+                ):
+                    role_conf[rid] = 0.66
+                elif role_conf.get(rid, 0.0) < 0.62 and (
+                    st.get("strong_blocks", 0) > 0 or rid in layout_roles
+                ):
+                    role_conf[rid] = 0.62
+
+    # 对噪音角色降噪：无布局证据且只有弱文本命中的角色（常见正文列头）剔除。
+    for rid in list(role_conf.keys()):
+        if rid in _CORE_SIGNOFF_ROLES:
+            continue
+        st = stats.get(rid, {})
+        weak_only = st.get("total_blocks", 0) > 0 and st.get("strong_blocks", 0) <= 0
+        has_layout = _layout_role_is_strong(layout_roles.get(rid) or {})
+        if weak_only and not has_layout and role_conf.get(rid, 0.0) < 0.7:
+            role_conf.pop(rid, None)
+
+    out["roles"] = [{"id": rid, "confidence": role_conf[rid]} for rid in sorted(role_conf.keys())]
+    ds = dict(out.get("debug_summary") or {})
+    ds["role_layout_reconciled"] = True
+    ds["layout_role_count"] = len(layout_roles)
+    ds["role_count_after_reconcile"] = len(out["roles"])
+    out["debug_summary"] = ds
+    return out
 
 
 _SLOT_PROBE_DUMMY_PNG_B64 = (
@@ -3508,8 +3932,32 @@ def _handoff_parse_aiword_context(raw_ctx: object) -> dict:
                 parsed_ctx = None
     out: dict = {}
     if isinstance(parsed_ctx, dict):
-        for k in ("editor", "writer", "reviewer", "approver", "doc_date", "country", "phase"):
-            v = parsed_ctx.get(k)
+        alias = {
+            "projectId": "project_id",
+            "projectName": "project_name",
+            "projectCode": "project_code",
+            "task_type": "phase",
+            "belonging_module": "phase",
+        }
+        norm_ctx = dict(parsed_ctx)
+        for ak, nk in alias.items():
+            if nk in norm_ctx:
+                continue
+            if ak in parsed_ctx:
+                norm_ctx[nk] = parsed_ctx.get(ak)
+        for k in (
+            "editor",
+            "writer",
+            "reviewer",
+            "approver",
+            "doc_date",
+            "country",
+            "phase",
+            "project_id",
+            "project_name",
+            "project_code",
+        ):
+            v = norm_ctx.get(k)
             if v is None:
                 continue
             sv = str(v).strip()
@@ -3841,6 +4289,7 @@ def _handoff_claim_sign_token(token: str, *, include_files_list: bool = True) ->
             else:
                 mysql_store.insert_file(file_id, fname, ext, raw or b"")
             last_rec = {"id": file_id, "name": fname, "ext": ext}
+            _sign_apply_ctx_project_to_file(file_id, ctx_out, last_rec)
             out = {
                 "ok": True,
                 "file": last_rec,
@@ -3865,6 +4314,7 @@ def _handoff_claim_sign_token(token: str, *, include_files_list: bool = True) ->
             if len(kept) >= SIGN_MAX_SAVED_FILES:
                 return {"ok": False, "error": f"文件数已达上限 {SIGN_MAX_SAVED_FILES}"}, 400
             last_rec = {"id": file_id, "name": fname, "ext": ext}
+            _sign_apply_ctx_project_to_file(file_id, ctx_out, last_rec)
             kept.append(last_rec)
             records = kept
             file_blob = raw
@@ -4065,18 +4515,19 @@ def sign_materials_page():
 @app.route("/api/sign/files/file-caches", methods=["GET"])
 def api_sign_file_caches_list():
     """各文件已保存的识别结果、工作台行状态、角色映射（页面打开时恢复）。"""
+    lite = (request.args.get("lite") or "").strip().lower() in ("1", "true", "yes")
     try:
         if _sign_using_mysql():
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            caches = mysql_store.list_file_session_caches()
-            return jsonify({"ok": True, "caches": caches})
+            caches = mysql_store.list_file_session_caches(lite=lite)
+            return jsonify({"ok": True, "lite": lite, "caches": caches})
         _sign_ensure_session_inbox()
         sid = session["sign_inbox_sid"]
         from sign_handlers.sign_library_local import list_file_session_caches as local_list
 
-        return jsonify({"ok": True, "caches": local_list(SIGN_INBOX_ROOT, sid)})
+        return jsonify({"ok": True, "lite": lite, "caches": local_list(SIGN_INBOX_ROOT, sid, lite=lite)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -4116,6 +4567,52 @@ def api_sign_file_cache_put(file_id):
             if isinstance(detect_correction, dict):
                 local_set_corr(SIGN_INBOX_ROOT, sid, file_id, detect_correction)
         return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sign/files/batch-file-cache", methods=["PUT"])
+def api_sign_files_batch_file_cache():
+    """批量保存工作台元数据（文档日期/版本/编审批等），避免逐文件 PUT。"""
+    data = request.get_json(silent=True) or {}
+    raw_items = data.get("items")
+    if not isinstance(raw_items, dict) or not raw_items:
+        return jsonify({"ok": False, "error": "缺少 items（file_id -> 缓存片段）"}), 400
+    items: dict = {}
+    for k, v in raw_items.items():
+        fid = str(k or "").strip()
+        if not fid or not _SIGN_FILE_ID_RE.match(fid):
+            continue
+        if isinstance(v, dict) and v:
+            items[fid] = v
+    if not items:
+        return jsonify({"ok": False, "error": "items 无有效 file_id"}), 400
+    try:
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            n = mysql_store.apply_files_session_cache_batch(items)
+            return jsonify({"ok": True, "updated": n, "count": len(items)})
+        _sign_ensure_session_inbox()
+        sid = session["sign_inbox_sid"]
+        from sign_handlers.sign_library_local import (
+            set_file_detect_correction as local_set_corr,
+            set_file_detect_snapshot as local_set_detect,
+            set_file_workbench_state as local_set_wb,
+        )
+
+        n = 0
+        for fid, payload in items.items():
+            if isinstance(payload.get("workbench"), dict):
+                local_set_wb(SIGN_INBOX_ROOT, sid, fid, payload["workbench"])
+                n += 1
+            if isinstance(payload.get("detect"), dict):
+                local_set_detect(SIGN_INBOX_ROOT, sid, fid, payload["detect"])
+            if isinstance(payload.get("detect_correction"), dict):
+                local_set_corr(SIGN_INBOX_ROOT, sid, fid, payload["detect_correction"])
+        session.modified = True
+        return jsonify({"ok": True, "updated": n, "count": len(items)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -4308,16 +4805,19 @@ def api_sign_file_detect_correction_image(file_id, image_id):
             return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-    if meta and str(meta.get("ftp_path") or "").strip():
-        try:
-            from sign_handlers.detect_correction_storage import (
-                download_reference_image,
-            )
+    ftp_path_q = (request.args.get("ftp_path") or "").strip()
+    try:
+        from sign_handlers.detect_correction_storage import fetch_reference_image_bytes
 
-            data, mime = download_reference_image(meta)
-            return Response(data, mimetype=mime)
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 404
+        data, mime = fetch_reference_image_bytes(
+            meta=meta,
+            file_id=file_id,
+            image_id=image_id,
+            ftp_path_override=ftp_path_q,
+        )
+        return Response(data, mimetype=mime)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
     from sign_handlers.detect_correction_storage import legacy_local_path
 
     legacy = legacy_local_path(SIGN_DETECT_CORRECTIONS_ROOT, file_id, image_id)
@@ -4331,6 +4831,228 @@ def api_sign_file_detect_correction_image(file_id, image_id):
             os.path.dirname(legacy), os.path.basename(legacy), mimetype=mime
         )
     return jsonify({"ok": False, "error": "图片不存在"}), 404
+
+
+def _sign_project_from_request() -> tuple[Optional[dict], Optional[tuple]]:
+    """解析上传/关联时选择的项目。返回 (project_dict, error_response)。"""
+    project_id = (request.form.get("project_id") or "").strip()
+    if not project_id and request.is_json:
+        data = request.get_json(silent=True) or {}
+        project_id = str(data.get("project_id") or "").strip()
+    if not project_id:
+        return None, (jsonify({"ok": False, "error": "请先选择关联项目"}), 400)
+    try:
+        from sign_handlers import mysql_store
+
+        if mysql_store.mysql_sign_enabled():
+            proj = mysql_store.get_project_by_id(project_id)
+            if not proj:
+                return None, (
+                    jsonify({"ok": False, "error": "项目不存在，请先从 aiword 同步项目列表"}),
+                    400,
+                )
+            return proj, None
+    except Exception:
+        pass
+    from sign_handlers import project_store_local
+
+    proj = project_store_local.get_project_by_id(project_id)
+    if not proj:
+        return None, (
+            jsonify({"ok": False, "error": "项目不存在，请先从 aiword 同步项目列表"}),
+            400,
+        )
+    return proj, None
+
+
+def _sign_attach_project_to_record(rec: dict, proj: dict) -> None:
+    if not rec or not proj:
+        return
+    rec["project_id"] = str(proj.get("id") or "").strip() or None
+    rec["project_name"] = str(proj.get("name") or "").strip() or None
+    rec["project_key"] = str(proj.get("project_key") or proj.get("name") or "").strip() or None
+    rec["project_label"] = str(proj.get("label") or proj.get("name") or "").strip() or None
+
+
+def _sign_apply_ctx_project_to_file(file_id: str, ctx: dict, rec: Optional[dict] = None) -> None:
+    pid = str((ctx or {}).get("project_id") or "").strip()
+    if not pid:
+        return
+    pname = str((ctx or {}).get("project_name") or "").strip() or None
+    pkey = str((ctx or {}).get("project_key") or pname or "").strip() or None
+    if _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            mysql_store.set_file_project(
+                file_id, project_id=pid, project_name=pname, project_key=pkey
+            )
+        except Exception:
+            pass
+        return
+    if rec is not None:
+        rec["project_id"] = pid
+        rec["project_name"] = pname
+        rec["project_key"] = pkey
+        rec["project_label"] = pname or pkey
+
+
+@app.route("/api/sign/projects", methods=["GET"])
+def api_sign_projects_list():
+    """本地缓存的项目列表（含待签文件数）。"""
+    try:
+        from sign_handlers import mysql_store
+
+        if mysql_store.mysql_sign_enabled():
+            mysql_store.ensure_sign_mysql()
+            items = mysql_store.list_projects_with_counts()
+            return jsonify({"ok": True, "projects": items})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    from sign_handlers import project_store_local
+
+    _sign_ensure_session_inbox()
+    pruned = _sign_prune_session_files_to_disk(session["sign_inbox_sid"])
+    items = project_store_local.list_projects_with_counts(pruned)
+    return jsonify({"ok": True, "projects": items})
+
+
+@app.route("/api/sign/projects/sync", methods=["POST"])
+def api_sign_projects_sync():
+    """从 aiword 拉取并刷新项目缓存。"""
+    from sign_handlers.aiword_projects import sync_projects_to_store
+
+    st = sync_projects_to_store()
+    if not st.get("ok"):
+        return jsonify(st), 400
+    items = st.get("projects")
+    if not isinstance(items, list):
+        try:
+            from sign_handlers import mysql_store
+
+            if mysql_store.mysql_sign_enabled():
+                items = mysql_store.list_projects_with_counts(include_file_counts=False)
+            else:
+                from sign_handlers import project_store_local
+
+                _sign_ensure_session_inbox()
+                pruned = _sign_prune_session_files_to_disk(session["sign_inbox_sid"])
+                items = project_store_local.list_projects_with_counts(pruned)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify(
+        {
+            "ok": True,
+            "count": st.get("count", 0),
+            "inserted": st.get("inserted", 0),
+            "updated": st.get("updated", 0),
+            "storage": st.get("storage"),
+            "projects": items,
+        }
+    )
+
+
+@app.route("/api/sign/files/<file_id>/project", methods=["PUT"])
+def api_sign_file_set_project(file_id):
+    if not _SIGN_FILE_ID_RE.match(file_id or ""):
+        return jsonify({"ok": False, "error": "无效 file_id"}), 400
+    data = request.get_json(silent=True) or {}
+    project_id = str(data.get("project_id") or "").strip()
+    if _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            if not project_id:
+                n = mysql_store.set_file_project(file_id, project_id=None)
+                if not n:
+                    return jsonify({"ok": False, "error": "文件不存在"}), 404
+                files = mysql_store.list_files()
+                return jsonify({"ok": True, "files": files})
+            n = mysql_store.set_file_project(file_id, project_id=project_id)
+            if not n:
+                return jsonify({"ok": False, "error": "文件不存在"}), 404
+            files = mysql_store.list_files()
+            return jsonify({"ok": True, "files": files})
+        except ValueError as ve:
+            return jsonify({"ok": False, "error": str(ve)}), 400
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    _sign_ensure_session_inbox()
+    rec = _sign_find_record(file_id)
+    if not rec:
+        return jsonify({"ok": False, "error": "文件不存在"}), 404
+    if not project_id:
+        rec["project_id"] = None
+        rec["project_name"] = None
+        rec["project_key"] = None
+        rec["project_label"] = None
+        session.modified = True
+        sid = session["sign_inbox_sid"]
+        pruned = _sign_prune_session_files_to_disk(sid)
+        return jsonify({"ok": True, "files": pruned})
+
+    from sign_handlers import project_store_local
+
+    proj = project_store_local.get_project_by_id(project_id)
+    if not proj:
+        return jsonify({"ok": False, "error": "项目不存在"}), 400
+    _sign_attach_project_to_record(rec, proj)
+    session.modified = True
+    sid = session["sign_inbox_sid"]
+    pruned = _sign_prune_session_files_to_disk(sid)
+    return jsonify({"ok": True, "files": pruned})
+
+
+@app.route("/api/sign/files/batch-project", methods=["PUT"])
+def api_sign_files_batch_project():
+    data = request.get_json(silent=True) or {}
+    arr = data.get("file_ids")
+    project_id = str(data.get("project_id") or "").strip()
+    if not isinstance(arr, list) or not arr:
+        return jsonify({"ok": False, "error": "缺少 file_ids"}), 400
+    if not project_id:
+        return jsonify({"ok": False, "error": "缺少 project_id"}), 400
+    ids = []
+    seen = set()
+    for x in arr:
+        fid = str(x or "").strip()
+        if not fid or fid in seen or not _SIGN_FILE_ID_RE.match(fid):
+            continue
+        seen.add(fid)
+        ids.append(fid)
+    if not ids:
+        return jsonify({"ok": False, "error": "file_ids 无效"}), 400
+    if _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            n = mysql_store.set_files_project(ids, project_id)
+            return jsonify({"ok": True, "updated": n, "files": mysql_store.list_files()})
+        except ValueError as ve:
+            return jsonify({"ok": False, "error": str(ve)}), 400
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    from sign_handlers import project_store_local
+
+    proj = project_store_local.get_project_by_id(project_id)
+    if not proj:
+        return jsonify({"ok": False, "error": "项目不存在"}), 400
+    _sign_ensure_session_inbox()
+    updated = 0
+    for fid in ids:
+        rec = _sign_find_record(fid)
+        if not rec:
+            continue
+        _sign_attach_project_to_record(rec, proj)
+        updated += 1
+    session.modified = True
+    pruned = _sign_prune_session_files_to_disk(session["sign_inbox_sid"])
+    return jsonify({"ok": True, "updated": updated, "files": pruned})
 
 
 @app.route("/api/sign/files", methods=["GET"])
@@ -4350,13 +5072,132 @@ def api_sign_files_list():
     pruned = _sign_prune_session_files_to_disk(sid)
     files = []
     for rec in pruned:
-        files.append({"id": rec.get("id"), "name": rec.get("name"), "ext": rec.get("ext")})
+        rec = _sign_enrich_session_file_record(sid, rec)
+        files.append(
+            {
+                "id": rec.get("id"),
+                "name": rec.get("name"),
+                "ext": rec.get("ext"),
+                "created_at": rec.get("created_at"),
+                "saved_at": rec.get("saved_at") or rec.get("created_at"),
+                "project_id": rec.get("project_id"),
+                "project_name": rec.get("project_name"),
+                "project_key": rec.get("project_key"),
+                "project_label": rec.get("project_label") or rec.get("project_name"),
+            }
+        )
     return jsonify({"ok": True, "files": files})
+
+
+def _sign_check_upload_duplicates(project_id: str, names: list, has_archive: bool) -> dict:
+    """检查待上传文件名在当前项目下是否已存在（按 basename）。"""
+    from sign_handlers.filename_util import normalize_display_filename
+
+    clean_names = [str(n or "").strip() for n in (names or []) if str(n or "").strip()]
+    if has_archive and not clean_names:
+        return {"duplicates": [], "archive_deferred": True}
+    if _sign_using_mysql():
+        from sign_handlers import mysql_store
+
+        mysql_store.ensure_sign_mysql()
+        dups = mysql_store.find_duplicate_basenames_in_project(project_id or None, clean_names)
+        return {"duplicates": dups, "archive_deferred": bool(has_archive)}
+    _sign_ensure_session_inbox()
+    sid = session["sign_inbox_sid"]
+    pruned = _sign_prune_session_files_to_disk(sid)
+    want_bases = {normalize_display_filename(n) for n in clean_names}
+    hits = []
+    seen = set()
+    for rec in pruned:
+        if not _sign_record_same_project(rec, {"id": project_id}):
+            continue
+        base = normalize_display_filename(str(rec.get("name") or ""))
+        if base in want_bases and base not in seen:
+            seen.add(base)
+            hits.append(os.path.basename(str(rec.get("name") or "").replace("\\", "/")) or base)
+    return {"duplicates": sorted(hits), "archive_deferred": bool(has_archive)}
+
+
+@app.route("/api/sign/upload/resolve-duplicates", methods=["POST"])
+def api_sign_upload_resolve_duplicates():
+    """覆盖上传：删除同项目同名旧文件，保留 keep_file_ids（新上传）。"""
+    data = request.get_json(silent=True) or {}
+    project_id = str(data.get("project_id") or "").strip()
+    if not project_id:
+        return jsonify({"ok": False, "error": "缺少 project_id"}), 400
+    names = data.get("duplicate_names") or data.get("names") or []
+    if not isinstance(names, list) or not names:
+        return jsonify({"ok": False, "error": "缺少 duplicate_names"}), 400
+    keep_ids = data.get("keep_file_ids") or []
+    if not isinstance(keep_ids, list):
+        keep_ids = []
+    if _sign_using_mysql():
+        try:
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            deleted = mysql_store.delete_inbox_by_basenames_in_project_except(
+                project_id, names, keep_ids
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "deleted_ids": deleted,
+                    "files": mysql_store.list_files(),
+                }
+            )
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    _sign_ensure_session_inbox()
+    sid = session["sign_inbox_sid"]
+    from sign_handlers.filename_util import normalize_display_filename
+
+    bases = {normalize_display_filename(str(n or "")) for n in names}
+    keep = {str(x or "").strip() for x in keep_ids}
+    records = list(session.get("sign_files") or [])
+    deleted = []
+    kept_records = []
+    for rec in records:
+        fid = str(rec.get("id") or "")
+        base = normalize_display_filename(str(rec.get("name") or ""))
+        if (
+            base in bases
+            and _sign_record_same_project(rec, {"id": project_id})
+            and fid
+            and fid not in keep
+        ):
+            _sign_remove_disk_files_for_id(sid, fid, rec.get("ext"))
+            deleted.append(fid)
+        else:
+            kept_records.append(rec)
+    session["sign_files"] = kept_records
+    session.modified = True
+    pruned = _sign_prune_session_files_to_disk(sid)
+    return jsonify({"ok": True, "deleted_ids": deleted, "files": pruned})
+
+
+@app.route("/api/sign/upload/check-duplicates", methods=["POST"])
+def api_sign_upload_check_duplicates():
+    """上传前检查同项目重名（与入库 basename 规则一致）。"""
+    data = request.get_json(silent=True) or {}
+    project_id = str(data.get("project_id") or "").strip()
+    if not project_id:
+        return jsonify({"ok": False, "error": "请先选择关联项目"}), 400
+    names = data.get("names")
+    if not isinstance(names, list):
+        return jsonify({"ok": False, "error": "缺少 names 数组"}), 400
+    has_archive = bool(data.get("has_archive"))
+    try:
+        info = _sign_check_upload_duplicates(project_id, names, has_archive)
+        return jsonify({"ok": True, **info})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/sign/upload", methods=["POST"])
 def api_sign_upload():
     """Save one or multiple sign docs, supports zip expansion."""
+    t0 = time.time()
     uploads = request.files.getlist("files")
     if not uploads or not any(f.filename for f in uploads):
         one = request.files.get("file")
@@ -4366,6 +5207,13 @@ def api_sign_upload():
         return jsonify({"ok": False, "error": "?????"}), 400
 
     parsed, warnings, upload_has_archive, archive_expanded, archive_summary = _sign_collect_upload_items(uploads)
+    logger.info(
+        "sign upload collect done in %.1fs: items=%d archive=%s expanded=%d",
+        time.time() - t0,
+        len(parsed),
+        upload_has_archive,
+        archive_expanded,
+    )
     if not parsed:
         return jsonify(
             {
@@ -4375,6 +5223,24 @@ def api_sign_upload():
                 "archive_summary": archive_summary,
             }
         ), 400
+
+    proj, proj_err = _sign_project_from_request()
+    if proj_err:
+        return proj_err
+
+    replace_dup = (request.form.get("replace_duplicates") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    dup_before_local: list = []
+    if not replace_dup:
+        dup_before_local = _sign_check_upload_duplicates(
+            str(proj.get("id") or ""),
+            [item.get("name") or "" for item in parsed],
+            upload_has_archive,
+        ).get("duplicates") or []
 
     if _sign_using_mysql():
         try:
@@ -4395,18 +5261,25 @@ def api_sign_upload():
                         "archive_summary": archive_summary,
                     }
                 ), 400
-            last_rec = None
-            added_ids = []
-            for item in parsed:
-                file_id = uuid.uuid4().hex
-                display_name = item["name"]
-                ext = item["ext"]
-                raw = item["raw"]
-                if not raw:
-                    return jsonify({"ok": False, "error": f"文件为空：{display_name}"}), 400
-                mysql_store.insert_file(file_id, display_name, ext, raw)
-                last_rec = {"id": file_id, "name": display_name, "ext": ext}
-                added_ids.append(file_id)
+            dup_before: list = []
+            if not replace_dup:
+                dup_before = mysql_store.find_duplicate_basenames_in_project(
+                    str(proj.get("id") or "") or None,
+                    [item.get("name") or "" for item in parsed],
+                )
+            added_ids, last_rec, ins_err = _sign_mysql_insert_parsed_items(
+                parsed, proj, replace_duplicates=replace_dup
+            )
+            if ins_err and not added_ids:
+                return jsonify({"ok": False, "error": ins_err, "warnings": warnings}), 500
+            if ins_err:
+                warnings.append(ins_err)
+            logger.info(
+                "sign upload mysql insert done in %.1fs: added=%d replace_dup=%s",
+                time.time() - t0,
+                len(added_ids),
+                replace_dup,
+            )
             return jsonify(
                 {
                     "ok": True,
@@ -4414,6 +5287,8 @@ def api_sign_upload():
                     "files": mysql_store.list_files(),
                     "added": len(parsed),
                     "added_ids": added_ids,
+                    "replaced_duplicates": replace_dup,
+                    "duplicate_names": dup_before if not replace_dup else [],
                     "warnings": warnings,
                     "upload_has_archive": upload_has_archive,
                     "archive_expanded": archive_expanded,
@@ -4425,6 +5300,18 @@ def api_sign_upload():
 
     sid, inbox_dir = _sign_ensure_session_inbox()
     records = list(session.get("sign_files") or [])
+    if replace_dup:
+        bases = {_sign_upload_base_name(item.get("name") or "") for item in parsed}
+        bases.discard("")
+        if bases:
+            records = [
+                r
+                for r in records
+                if not (
+                    _sign_upload_base_name(r.get("name") or "") in bases
+                    and _sign_record_same_project(r, proj)
+                )
+            ]
     if len(records) + len(parsed) > SIGN_MAX_SAVED_FILES:
         return jsonify(
             {
@@ -4448,7 +5335,15 @@ def api_sign_upload():
         dest = os.path.join(inbox_dir, file_id + ext)
         with open(dest, "wb") as fp:
             fp.write(raw)
-        last_rec = {"id": file_id, "name": display_name, "ext": ext}
+        saved_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        last_rec = {
+            "id": file_id,
+            "name": display_name,
+            "ext": ext,
+            "created_at": saved_ts,
+            "saved_at": saved_ts,
+        }
+        _sign_attach_project_to_record(last_rec, proj)
         records.append(last_rec)
         added_ids.append(file_id)
     session["sign_files"] = records
@@ -4461,6 +5356,8 @@ def api_sign_upload():
             "files": records,
             "added": len(parsed),
             "added_ids": added_ids,
+            "replaced_duplicates": replace_dup,
+            "duplicate_names": dup_before_local if not replace_dup else [],
             "warnings": warnings,
             "upload_has_archive": upload_has_archive,
             "archive_expanded": archive_expanded,
@@ -4527,24 +5424,18 @@ def api_sign_files_batch_delete():
 
     deleted_ids = []
     missing_ids = []
+    refresh_files = data.get("refresh_files", True)
+    if isinstance(refresh_files, str):
+        refresh_files = refresh_files.strip().lower() not in ("0", "false", "no")
     if _sign_using_mysql():
         try:
             from sign_handlers import mysql_store
 
             mysql_store.ensure_sign_mysql()
-            delete_errors = []
-            for fid in dedup:
-                try:
-                    # 批量删除优先保证接口稳定返回：跳过 FTP 清理，避免远程连接抖动导致整批超时。
-                    # 清理失败不影响「待签列表」删除结果。
-                    n = mysql_store.delete_file(fid, skip_ftp_cleanup=True)
-                    if n:
-                        deleted_ids.append(fid)
-                    else:
-                        missing_ids.append(fid)
-                except Exception as de:
-                    delete_errors.append({"id": fid, "error": str(de)})
-                    missing_ids.append(fid)
+            deleted_ids, missing_ids, delete_errors = mysql_store.delete_files_batch(
+                dedup, skip_ftp_cleanup=True
+            )
+            files_out = mysql_store.list_files() if refresh_files else None
             return jsonify(
                 {
                     "ok": True,
@@ -4552,7 +5443,7 @@ def api_sign_files_batch_delete():
                     "missing_ids": missing_ids,
                     "invalid_ids": invalid_ids,
                     "delete_errors": delete_errors,
-                    "files": mysql_store.list_files(),
+                    "files": files_out,
                 }
             )
         except Exception as e:
@@ -4588,6 +5479,18 @@ def api_sign_files_batch_delete():
     )
 
 
+def _humanize_office_package_error(exc) -> str:
+    """将 python-docx/openpyxl 的 Package not found 转为可理解的业务提示。"""
+    msg = str(exc).strip()
+    if "Package not found" in msg:
+        return (
+            "解析失败：临时文件不是有效的 Word/Excel 文档（Package not found）。"
+            "启用 MySQL 时系统会先从 FTP 下载到本机临时目录再识别，并非读取您电脑上的源文件路径；"
+            "若持续出现，请检查 FTP 上该文件是否完整，或在列表中删除后重新上传。"
+        )
+    return msg or type(exc).__name__
+
+
 @app.route("/api/sign/detect", methods=["GET"])
 def api_sign_detect():
     """自动识别文档中的签名位/角色（用于前端自动勾选）。"""
@@ -4608,10 +5511,12 @@ def api_sign_detect():
             if not row:
                 return jsonify({"ok": False, "error": "未找到该文件"}), 404
             if not row.get("file_data"):
+                err = (row.get("file_load_error") or "").strip()
                 return jsonify(
                     {
                         "ok": False,
-                        "error": "无法读取文件内容（可能 FTP 暂不可用或素材仅存在 FTP 且下载失败）。请稍后重试「重新识别」或检查 FTP 配置。",
+                        "error": err
+                        or "无法读取文件内容（可能 FTP 暂不可用或下载失败）。请稍后重试「重新识别」或检查 FTP 配置。",
                     }
                 ), 502
             ext = (row.get("ext") or ".docx").lower()
@@ -4634,6 +5539,7 @@ def api_sign_detect():
             return jsonify({"ok": False, "error": "文件已不存在"}), 404
 
     tmp_dir = tempfile.mkdtemp(prefix="aiprintword_detect_")
+    detect_fut = None
     try:
         in_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex[:8]}_detect{ext}")
         if mysql_blob is not None:
@@ -4641,6 +5547,22 @@ def api_sign_detect():
                 fp.write(mysql_blob)
         else:
             shutil.copy2(source_path, in_path)
+
+        if _sign_using_mysql():
+            from sign_handlers.mysql_store import is_valid_uploaded_blob
+
+            with open(in_path, "rb") as _chk:
+                on_disk = _chk.read()
+            if not is_valid_uploaded_blob(on_disk, ext):
+                return jsonify(
+                    {
+                        "ok": False,
+                        "error": (
+                            "写入临时文件后校验失败：不是有效的 Office 文档。"
+                            "请检查 FTP 上文件是否完整，或在列表中重新上传。"
+                        ),
+                    }
+                ), 502
 
         from sign_handlers.detect_fields import detect_file
 
@@ -4655,17 +5577,25 @@ def api_sign_detect():
         except ValueError:
             op_timeout = 300
         op_timeout = max(60, min(op_timeout, 1800))
+        correction = _get_file_detect_correction(file_id)
+        detect_hint = {}
+        try:
+            from sign_handlers.detect_correction import build_detect_hint
+
+            detect_hint = build_detect_hint(correction)
+        except Exception:
+            detect_hint = {}
 
         def _run_detect():
-            return detect_file(in_path, source_name=src_name)
+            return detect_file(in_path, source_name=src_name, detect_hint=detect_hint)
 
         result = None
         try:
             from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
 
             with ThreadPoolExecutor(max_workers=1) as pool:
-                fut = pool.submit(_run_detect)
-                result = fut.result(timeout=op_timeout)
+                detect_fut = pool.submit(_run_detect)
+                result = detect_fut.result(timeout=op_timeout)
         except _FutTimeout:
             result = {
                 "ok": False,
@@ -4676,13 +5606,14 @@ def api_sign_detect():
                 "error_code": "detect_timeout",
             }
         except Exception as e:
-            result = {"ok": False, "error": str(e)}
+            result = {"ok": False, "error": _humanize_office_package_error(e)}
 
         if isinstance(result, dict):
             result = dict(result)
+            if not result.get("ok") and result.get("error"):
+                result["error"] = _humanize_office_package_error(result["error"])
             result["file_id"] = file_id
             result["source_name"] = src_name
-            correction = _get_file_detect_correction(file_id)
             _corr_wrong = str((correction or {}).get("wrong_description") or "").strip()
             _corr_slot = (correction or {}).get("expected_slot_layout")
             _corr_has_slot = isinstance(_corr_slot, dict) and bool(_corr_slot)
@@ -4716,37 +5647,28 @@ def api_sign_detect():
                 try:
                     from sign_handlers import ROLE_ID_TO_KEYWORD
 
-                    role_ids = []
-                    seen = set()
-                    for rr in (result.get("roles") or []):
-                        if not isinstance(rr, dict):
-                            continue
-                        rid = str(rr.get("id") or "").strip()
-                        if not rid or rid in seen or rid not in ROLE_ID_TO_KEYWORD:
-                            continue
-                        seen.add(rid)
-                        role_ids.append(rid)
-                    if role_ids:
-                        detect_ext = str(os.path.splitext(in_path)[1] or ext or "").lower()
-                        kind = str(result.get("kind") or "").lower()
-                        if kind == "docx":
-                            detect_ext = ".docx"
-                        elif kind == "xlsx":
-                            detect_ext = ".xlsx"
-                        if detect_ext not in (".docx", ".xlsx"):
-                            detect_ext = ".docx" if ext in (".doc", ".docx") else ".xlsx"
-                        probe_bytes = blob_for_hash
-                        if not isinstance(probe_bytes, (bytes, bytearray)):
-                            with open(in_path, "rb") as pf:
-                                probe_bytes = pf.read()
-                        probe_plan = _build_placement_plan_from_detect(result, role_ids)
-                        result["slot_probe"] = _probe_detect_slot_placement(
-                            bytes(probe_bytes),
-                            detect_ext,
-                            src_name or (file_id + detect_ext),
-                            role_ids,
-                            placement_plan=probe_plan,
-                        )
+                    from sign_handlers.config import canonical_sign_role_id
+
+                    detect_ext = str(os.path.splitext(in_path)[1] or ext or "").lower()
+                    kind = str(result.get("kind") or "").lower()
+                    if kind == "docx":
+                        detect_ext = ".docx"
+                    elif kind == "xlsx":
+                        detect_ext = ".xlsx"
+                    if detect_ext not in (".docx", ".xlsx"):
+                        detect_ext = ".docx" if ext in (".doc", ".docx") else ".xlsx"
+                    probe_bytes = blob_for_hash
+                    if not isinstance(probe_bytes, (bytes, bytearray)):
+                        with open(in_path, "rb") as pf:
+                            probe_bytes = pf.read()
+
+                    role_ids_for_layout = _collect_layout_candidate_roles(result)
+                    role_ids_for_layout = [
+                        rid
+                        for rid in role_ids_for_layout
+                        if rid in ROLE_ID_TO_KEYWORD
+                    ]
+                    if role_ids_for_layout:
                         try:
                             from sign_handlers.signature_layout import (
                                 analyze_signature_layout,
@@ -4755,16 +5677,38 @@ def api_sign_detect():
                             layout_info = analyze_signature_layout(
                                 in_path,
                                 detect_ext,
-                                role_ids,
+                                role_ids_for_layout,
                                 source_name=src_name or "",
                             )
                             result["signature_layout"] = layout_info
+                            result = _reconcile_detect_roles_with_layout(
+                                result, layout_info, source_name=src_name or ""
+                            )
                         except Exception as _layout_exc:
                             result["signature_layout"] = {
                                 "ok": False,
                                 "error": str(_layout_exc),
                                 "role_layouts": {},
                             }
+                    role_ids = []
+                    seen = set()
+                    for rr in (result.get("roles") or []):
+                        if not isinstance(rr, dict):
+                            continue
+                        rid = canonical_sign_role_id(str(rr.get("id") or "").strip())
+                        if not rid or rid in seen or rid not in ROLE_ID_TO_KEYWORD:
+                            continue
+                        seen.add(rid)
+                        role_ids.append(rid)
+                    if role_ids:
+                        probe_plan = _build_placement_plan_from_detect(result, role_ids)
+                        result["slot_probe"] = _probe_detect_slot_placement(
+                            bytes(probe_bytes),
+                            detect_ext,
+                            src_name or (file_id + detect_ext),
+                            role_ids,
+                            placement_plan=probe_plan,
+                        )
                 except Exception:
                     pass
             if result.get("ok"):
@@ -4788,7 +5732,8 @@ def api_sign_detect():
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
         try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if detect_fut is None or detect_fut.done():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -4839,6 +5784,9 @@ def api_sign_runtime_config():
                 "sign_detect_retry_times": _clamp_int(
                     "SIGN_DETECT_RETRY_TIMES", 0, 3, 1
                 ),
+                "sign_archive_upload_timeout_ms": _clamp_int(
+                    "SIGN_ARCHIVE_UPLOAD_TIMEOUT_MS", 300000, 3600000, 1200000
+                ),
             }
         )
     except Exception as e:
@@ -4876,7 +5824,10 @@ def api_sign():
                 mysql_store.ensure_sign_mysql()
                 row = mysql_store.get_file_row(file_id)
                 if not row or not row.get("file_data"):
-                    return jsonify({"ok": False, "error": "??????????????"}), 404
+                    err = (row.get("file_load_error") or "").strip() if row else ""
+                    return jsonify(
+                        {"ok": False, "error": err or "未找到该文件或无法读取内容"}
+                    ), 404
                 ext = (row.get("ext") or ".docx").lower()
                 if ext not in SIGN_ALLOWED_EXT:
                     return jsonify({"ok": False, "error": "????????"}), 400
@@ -5259,6 +6210,28 @@ def api_sign_signers_list():
 
         return jsonify(
             {"ok": True, "db_share": False, "signers": local_list_signers(SIGN_INBOX_ROOT, sid)}
+        )
+    except Exception as e:
+        err = _mysql_api_error_message(e) if _sign_using_mysql() else str(e)
+        return jsonify({"ok": False, "error": err}), 500
+
+
+@app.route("/api/sign/signers/stroke-options", methods=["GET"])
+def api_sign_signer_stroke_options():
+    """签署人签名/日期笔迹 id 列表（供工作台素材下拉，与 brief 签署人列表配合）。"""
+    try:
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            items = mysql_store.list_signer_stroke_options()
+            return jsonify({"ok": True, "db_share": True, "items": items})
+        _sign_ensure_session_inbox()
+        sid = session["sign_inbox_sid"]
+        from sign_handlers.sign_library_local import list_signer_stroke_options as local_opts
+
+        return jsonify(
+            {"ok": True, "db_share": False, "items": local_opts(SIGN_INBOX_ROOT, sid)}
         )
     except Exception as e:
         err = _mysql_api_error_message(e) if _sign_using_mysql() else str(e)

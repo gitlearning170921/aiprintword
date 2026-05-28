@@ -418,6 +418,36 @@ def list_signers(inbox_root: str, sid: str) -> List[dict]:
     return out
 
 
+def list_signer_stroke_options(inbox_root: str, sid: str) -> List[dict]:
+    """会话目录：笔迹 id 列表供工作台素材下拉。"""
+    _migrate_sets_to_items(inbox_root, sid)
+    rows = _load_json(_signers_json_path(inbox_root, sid), [])
+    name_by_id = {
+        str(r.get("id")): (r.get("name") or "").strip()
+        for r in (rows or [])
+        if isinstance(r, dict) and r.get("id")
+    }
+    out: List[dict] = []
+    for it in _load_stroke_items(inbox_root, sid):
+        kind = (it.get("kind") or "").strip().lower()
+        if kind not in ("sig", "date"):
+            continue
+        sid_signer = str(it.get("signer_id") or "")
+        if not sid_signer:
+            continue
+        out.append(
+            {
+                "id": it["id"],
+                "signer_id": sid_signer,
+                "signer_name": name_by_id.get(sid_signer) or "",
+                "kind": kind,
+                "locale": (it.get("locale") or "zh").strip().lower() or "zh",
+                "updated_at": it.get("updated_at"),
+            }
+        )
+    return out
+
+
 def insert_signer(inbox_root: str, sid: str, display_name: str) -> str:
     name = (display_name or "").strip()[:_MAX_NAME_LEN] or "未命名"
     signer_id = uuid.uuid4().hex
@@ -737,7 +767,7 @@ def get_file_workbench_state(inbox_root: str, sid: str, file_id: str) -> Optiona
     return wb if wb else None
 
 
-def list_file_session_caches(inbox_root: str, sid: str) -> Dict[str, dict]:
+def list_file_session_caches(inbox_root: str, sid: str, *, lite: bool = False) -> Dict[str, dict]:
     cache = _load_file_session_cache(inbox_root, sid)
     out: Dict[str, dict] = {}
     for fid, ent in cache.items():
@@ -746,7 +776,12 @@ def list_file_session_caches(inbox_root: str, sid: str) -> Dict[str, dict]:
         entry: Dict[str, Any] = {}
         det = ent.get("detect")
         if isinstance(det, dict) and det:
-            entry["detect"] = det
+            if lite:
+                from sign_handlers.file_session_cache import trim_detect_snapshot_lite
+
+                entry["detect"] = trim_detect_snapshot_lite(det)
+            else:
+                entry["detect"] = det
         wb = ent.get("workbench")
         if isinstance(wb, dict) and wb:
             entry["workbench"] = wb

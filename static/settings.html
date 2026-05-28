@@ -161,13 +161,24 @@
         if (!groups[it.group]) groups[it.group] = [];
         groups[it.group].push(it);
       }
-      const order = ['word', 'office', 'app', 'mysql', 'ftp', 'sign'];
-      for (const g of order) {
-        if (!groups[g]) continue;
+      const groupLabels = {
+        word: 'Word 文档',
+        office: 'Office',
+        app: '应用',
+        mysql: 'MySQL',
+        ftp: 'FTP',
+        sign: '签字',
+        integration: 'aiword 集成（项目同步）',
+      };
+      const order = ['word', 'office', 'app', 'mysql', 'ftp', 'sign', 'integration'];
+      const rendered = {};
+      function appendGroupCard(g) {
+        if (!groups[g] || rendered[g]) return;
+        rendered[g] = true;
         const card = document.createElement('div');
         card.className = 'card';
         const h = document.createElement('h2');
-        h.textContent = g;
+        h.textContent = groupLabels[g] || g;
         card.appendChild(h);
         for (const it of groups[g]) {
           const wrap = document.createElement('div');
@@ -218,6 +229,14 @@
         }
         root.appendChild(card);
       }
+      for (const g of order) {
+        appendGroupCard(g);
+      }
+      Object.keys(groups)
+        .sort()
+        .forEach(function (g) {
+          appendGroupCard(g);
+        });
     }
 
     document.getElementById('btnLoad').addEventListener('click', async () => {
