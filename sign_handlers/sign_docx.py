@@ -45,6 +45,19 @@ from sign_handlers.png_word_compat import (
 _PLACEHOLDER_CHARS = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·]+$")
 # 右侧「日期」列表头（整格以 Date/日期 开头）
 _DATE_HEADER_CELL = re.compile(r"^\s*(日期|Date)\s*[:：]?\s*", re.IGNORECASE)
+_REVISION_ROW_NOISE_TERMS = (
+    "更改历史",
+    "修订记录",
+    "变更记录",
+    "版本",
+    "更改日期",
+    "变更日期",
+    "修订日期",
+    "变更内容",
+    "更改内容",
+    "修订内容",
+    "变更号",
+)
 
 _PIC_WIDTH = Cm(2.8)
 # 日期与签名使用同一显示宽度，避免缩放后笔画变细、观感不一致
@@ -701,6 +714,28 @@ def _first_reserved_blank_cell_below(rows_list, ri: int, label_ci: int):
     return None
 
 
+def _cells_joined_text(cells) -> str:
+    parts = []
+    for c in cells or []:
+        t = _cell_text(c)
+        if t:
+            parts.append(t)
+    return " | ".join(parts)
+
+
+def _is_revision_history_row(cells) -> bool:
+    txt = _cells_joined_text(cells)
+    if not txt:
+        return False
+    hit = 0
+    for term in _REVISION_ROW_NOISE_TERMS:
+        if term in txt:
+            hit += 1
+            if hit >= 2:
+                return True
+    return False
+
+
 def _cell_has_table_signoff_reservation(
     cell_text: str,
     keyword: str,
@@ -714,6 +749,9 @@ def _cell_has_table_signoff_reservation(
     作者/审核/批准/测试人等统一规则。
     """
     if not cell_has_role_keyword(cell_text, keyword):
+        return False
+    # 变更历史/修订记录中的「作者」不是签批栏，不应落签。
+    if _is_revision_history_row(cells):
         return False
     if cell_is_bare_role_column_header(cell_text, keyword):
         return _is_label_blank_date_blank_row(cells, label_ci, keyword)
@@ -763,6 +801,16 @@ def _place_sig_date_at_signoff_anchor(
     ct = _cell_text(label_cell)
     date_cell = _find_date_label_cell_in_row(cells, label_ci, rows_list, ri)
     signoff_slot = cell_is_role_signoff_label_slot(ct, keyword)
+    # 同格「角色/日期：____」优先一次性写入签名+日期，避免先落日期导致签名失败。
+    if (
+        signoff_slot
+        and sig_png
+        and date_png
+        and cell_has_signoff_inline_reservation(ct, keyword)
+    ):
+        for p0 in label_cell.paragraphs:
+            if _try_paragraph_inline(p0, keyword, sig_png, date_png):
+                return True
     row_blanks = (
         list(_iter_reserved_blank_cells_same_row(cells, label_ci, keyword))
         if signoff_slot
@@ -814,7 +862,19 @@ def _place_sig_date_at_signoff_anchor(
             elif _insert_date_only_in_date_cell(date_cell, date_png):
                 date_placed = True
         elif signoff_slot and row_blanks:
-            if sig_png and len(row_blanks) > 1:
+            # 签批栏里若存在显式「日期」列，优先把日期落到其右侧/同格，避免错位到签名格。
+            dt_target = None
+            if date_cell is not None:
+                try:
+                    dt_target = _next_distinct_cell(cells, cells.index(date_cell))
+                except Exception:
+                    dt_target = None
+            if dt_target is not None and _is_slot_target_text(_cell_text(dt_target)):
+                _insert_sig_and_date_in_empty_cell(dt_target, None, date_png)
+                date_placed = True
+            elif date_cell is not None and _insert_date_only_in_date_cell(date_cell, date_png):
+                date_placed = True
+            elif sig_png and len(row_blanks) > 1:
                 _insert_sig_and_date_in_empty_cell(row_blanks[1], None, date_png)
                 date_placed = True
             elif sig_png and row_blanks:
@@ -1204,31 +1264,23 @@ def sign_docx(
                 if done:
                     break
                 for table in tables:
-                    for row in table.rows:
+                    rows_list = list(table.rows)
+                    for ri, row in enumerate(rows_list):
                         row_cells = list(row.cells)
                         for ci, cell in enumerate(row_cells):
                             ct = _cell_text(cell)
-                            if not cell_has_role_keyword(ct, kw):
+                            if not _cell_has_table_signoff_reservation(
+                                ct, kw, row_cells, ci, rows_list, ri
+                            ):
                                 continue
-                            if cell_is_bare_role_column_header(ct, kw):
-                                if _place_four_column_row(row_cells, ci, kw, sig, dt_use):
-                                    done = True
-                                    placed_by = "four_column_row"
-                                    break
-                                continue
-                            if not cell_has_label_inline_reservation(ct, kw):
-                                continue
-                            for p in cell.paragraphs:
-                                if _find_keyword_in_paragraph(p, kw) < 0:
-                                    continue
-                                if _try_paragraph_inline(p, kw, sig, dt_use):
-                                    done = True
-                                    if not placed_by:
-                                        placed_by = (
-                                            "planned_keywords" if planned_kws else "fallback_keywords"
-                                        )
-                                    break
-                            if done:
+                            if _place_sig_date_at_signoff_anchor(
+                                cell, kw, row_cells, ci, rows_list, ri, sig, dt_use
+                            ):
+                                done = True
+                                if not placed_by:
+                                    placed_by = (
+                                        "planned_keywords" if planned_kws else "fallback_keywords"
+                                    )
                                 break
                         if done:
                             break

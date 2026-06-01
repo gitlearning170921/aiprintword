@@ -252,6 +252,8 @@ def upsert_stroke_item(
     kind: str,
     png_b: bytes,
     locale: str = "zh",
+    *,
+    is_temporary: bool = False,
 ) -> Dict[str, Any]:
     """保存签名/日期素材（分开存储，按内容去重覆盖）。"""
     _migrate_sets_to_items(inbox_root, sid)
@@ -281,6 +283,7 @@ def upsert_stroke_item(
             target_id = it["id"]
             overwrote = True
             it["updated_at"] = now
+            it["is_temporary"] = bool(is_temporary)
             break
     if not target_id:
         target_id = uuid.uuid4().hex
@@ -292,12 +295,19 @@ def upsert_stroke_item(
                 "kind": k,
                 "sha256": sha,
                 "updated_at": now,
+                "is_temporary": bool(is_temporary),
             }
         )
     with open(_item_png_path(inbox_root, sid, target_id), "wb") as fp:
         fp.write(png_b)
     _save_stroke_items(inbox_root, sid, items)
-    return {"stroke_item_id": target_id, "overwritten": overwrote, "kind": k, "locale": loc}
+    return {
+        "stroke_item_id": target_id,
+        "overwritten": overwrote,
+        "kind": k,
+        "locale": loc,
+        "is_temporary": bool(is_temporary),
+    }
 
 
 def _sets_for_signer(stroke_sets: List[dict], signer_id: str) -> List[dict]:

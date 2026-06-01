@@ -65,16 +65,16 @@ _STRONG_SIGN_RULES = frozenset(
 
 def _get_detect_hint_weight() -> float:
     """可配置的 hint 权重（系统设置 SIGN_DETECT_HINT_WEIGHT）。"""
-    v = 1.0
+    v = 1.35
     try:
         from runtime_settings.resolve import get_setting
 
         v = float(get_setting("SIGN_DETECT_HINT_WEIGHT"))
     except Exception:
-        v = 1.0
+        v = 1.35
     if not (v == v):  # NaN
         v = 1.0
-    return max(0.2, min(2.5, v))
+    return max(0.2, min(3.5, v))
 
 
 def _scale_hint_conf(base: float, weight: float, *, low: float = 0.0, high: float = 0.99) -> float:
@@ -1165,12 +1165,18 @@ def _normalize_detect_hint(detect_hint: Any) -> Dict[str, Any]:
     ocr_stats = detect_hint.get("ocr_hint_stats")
     if not isinstance(ocr_stats, dict):
         ocr_stats = {}
+    save_scope = detect_hint.get("correction_save")
+    if isinstance(save_scope, dict):
+        scope_roles = bool(save_scope.get("roles", True))
+    else:
+        scope_roles = True
     return {
         "expected_roles": expected,
         "label_keywords": kws,
         "manual_keywords": manual,
         "ocr_keywords": ocr_kws,
         "ocr_hint_stats": ocr_stats,
+        "scope_roles": scope_roles,
     }
 
 
@@ -1183,6 +1189,7 @@ def _apply_detect_hint_soft(result: dict, detect_hint: Any) -> dict:
     manual_kws = hint.get("manual_keywords") or []
     ocr_kws = hint.get("ocr_keywords") or []
     ocr_stats = hint.get("ocr_hint_stats") if isinstance(hint.get("ocr_hint_stats"), dict) else {}
+    scope_roles = bool(hint.get("scope_roles", True))
     if not expected and not kws:
         return result
     hint_weight = _get_detect_hint_weight()
@@ -1209,17 +1216,27 @@ def _apply_detect_hint_soft(result: dict, detect_hint: Any) -> dict:
         else {}
     )
     kw_hits = 0
+    kw_role_hits: Dict[str, int] = {}
     for b in blocks:
         txt = (str(b.get("label_preview") or "") + " " + str(b.get("source_hint") or "")).strip()
         if not txt:
             continue
         if kws and any(kw in txt for kw in kws):
             kw_hits += 1
-            for rid in expected:
+            target_roles = []
+            for kw in kws:
+                if kw and kw in txt:
+                    for rid2 in _role_ids_for_text_label(kw):
+                        if rid2 not in target_roles:
+                            target_roles.append(rid2)
+            if not target_roles:
+                target_roles = list(expected)
+            for rid in target_roles:
+                kw_role_hits[rid] = int(kw_role_hits.get(rid) or 0) + 1
                 arr = role_evidence.get(rid) if isinstance(role_evidence.get(rid), list) else []
                 arr.append(
                     {
-                        "confidence": _scale_hint_conf(0.58, hint_weight),
+                        "confidence": _scale_hint_conf(0.66, hint_weight),
                         "source_hint": "detect_hint_keyword_context",
                         "matched_rules": ["detect_hint_keyword"],
                         "label_preview": txt[:120],
@@ -1227,22 +1244,53 @@ def _apply_detect_hint_soft(result: dict, detect_hint: Any) -> dict:
                 )
                 role_evidence[rid] = arr[:6]
 
-    for rid in expected:
-        if rid in role_conf:
-            role_conf[rid] = max(role_conf[rid], _scale_hint_conf(0.82, hint_weight))
-            continue
-        if any(kw and kw in full_text for kw in role_keywords(rid)):
-            role_conf[rid] = _scale_hint_conf(0.56, hint_weight)
-            arr = role_evidence.get(rid) if isinstance(role_evidence.get(rid), list) else []
-            arr.append(
-                {
-                    "confidence": _scale_hint_conf(0.56, hint_weight),
-                    "source_hint": "detect_hint_role_recover",
-                    "matched_rules": ["detect_hint_expected_role"],
-                    "label_preview": (full_text or rid)[:120],
-                }
-            )
-            role_evidence[rid] = arr[:6]
+    if scope_roles:
+        for rid in expected:
+            hit_n = int(kw_role_hits.get(rid) or 0)
+            has_role_kw = any(kw and kw in full_text for kw in role_keywords(rid))
+            if rid in role_conf:
+                base_floor = 0.82 if hit_n > 0 else 0.76
+                role_conf[rid] = max(role_conf[rid], _scale_hint_conf(base_floor, hint_weight))
+                continue
+            if hit_n > 0:
+                role_conf[rid] = _scale_hint_conf(0.68, hint_weight)
+                arr = role_evidence.get(rid) if isinstance(role_evidence.get(rid), list) else []
+                arr.append(
+                    {
+                        "confidence": _scale_hint_conf(0.68, hint_weight),
+                        "source_hint": "detect_hint_role_recover",
+                        "matched_rules": ["detect_hint_expected_role"],
+                        "label_preview": (full_text or rid)[:120],
+                    }
+                )
+                role_evidence[rid] = arr[:6]
+                continue
+            if has_role_kw:
+                role_conf[rid] = _scale_hint_conf(0.56, hint_weight)
+                arr = role_evidence.get(rid) if isinstance(role_evidence.get(rid), list) else []
+                arr.append(
+                    {
+                        "confidence": _scale_hint_conf(0.56, hint_weight),
+                        "source_hint": "detect_hint_role_recover",
+                        "matched_rules": ["detect_hint_expected_role"],
+                        "label_preview": (full_text or rid)[:120],
+                    }
+                )
+                role_evidence[rid] = arr[:6]
+                continue
+            # 仅在识别结果很弱时给轻量兜底，不直接强制覆盖。
+            if len(role_conf) <= 1:
+                role_conf[rid] = _scale_hint_conf(0.44, hint_weight, high=0.72)
+                arr = role_evidence.get(rid) if isinstance(role_evidence.get(rid), list) else []
+                arr.append(
+                    {
+                        "confidence": _scale_hint_conf(0.44, hint_weight, high=0.72),
+                        "source_hint": "detect_hint_role_seed",
+                        "matched_rules": ["detect_hint_expected_role_seed"],
+                        "label_preview": (full_text or rid)[:120],
+                    }
+                )
+                role_evidence[rid] = arr[:6]
 
     roles = [{"id": rid, "confidence": role_conf[rid]} for rid in sorted(role_conf)]
     result["roles"] = roles
@@ -1252,6 +1300,7 @@ def _apply_detect_hint_soft(result: dict, detect_hint: Any) -> dict:
     ds["detect_hint_used"] = True
     ds["detect_hint_weight"] = hint_weight
     ds["detect_hint_expected_roles"] = expected
+    ds["detect_hint_scope_roles"] = scope_roles
     if manual_kws:
         ds["detect_hint_manual_keywords"] = manual_kws[:12]
     if ocr_kws:
@@ -1269,6 +1318,10 @@ def _apply_detect_hint_soft(result: dict, detect_hint: Any) -> dict:
     if kws:
         ds["detect_hint_keywords"] = kws[:12]
         ds["detect_hint_keyword_hits"] = kw_hits
+    if kw_role_hits:
+        ds["detect_hint_keyword_role_hits"] = {
+            rid: int(kw_role_hits[rid]) for rid in sorted(kw_role_hits.keys())
+        }
     result["debug_summary"] = ds
     return result
 

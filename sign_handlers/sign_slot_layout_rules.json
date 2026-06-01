@@ -4,23 +4,46 @@
     {
       "pattern": "ECGAP-NTS-001 网络安全测试方案",
       "match": "contains",
-      "note": "人工签字位标误：识别签字位时不应该落位到更改记录中，应该落位到封面、正文或者末尾，是不是因为这三份是.doc文件；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了审核、批准签字角色；角色从上到下排列",
       "source_example": "ECGAP-NTS-001 网络安全测试方案（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
-      "date_relation": "different_cell",
+      "date_relation": "same_cell",
       "date_position": "right",
       "separator": "cell",
-      "same_cell": false,
+      "same_cell": true,
       "arrangement_label": "角色从上到下排列",
-      "signature_slot_forms": [
-        "右侧空白单元格"
-      ],
+      "signature_slot_forms": [],
       "date_layout_forms": [
-        "日期在右相邻单元格"
+        "与角色同一单元格/字段标记"
       ],
       "layout_types": [
-        "adjacent_right_cell"
+        "same_cell_inline"
+      ]
+    },
+    {
+      "pattern": "配置审计报告",
+      "match": "contains",
+      "note": "审计人/复核人签批位优先同字段（角色/日期）或两行签批表，避免复核位重复和日期错位。",
+      "source_example": "T5 设计开发确认/QR-SMP7.3-03 -02 配置审计报告/QR-SMP7.3-03 -02 配置审计报告（A0）.doc",
+      "learned_from_correction": true,
+      "arrangement": "horizontal",
+      "date_relation": "same_cell",
+      "date_position": "inline",
+      "separator": "slash",
+      "same_cell": true,
+      "arrangement_label": "角色从左到右排列",
+      "signature_slot_forms": [
+        "同字段长空格占位",
+        "两行签批表：角色行右侧空白签名格，日期行右侧空白日期格"
+      ],
+      "date_layout_forms": [
+        "与角色同一单元格/字段标记",
+        "日期在下一行对应签名格右侧/同列空白格（两行签批表）"
+      ],
+      "layout_types": [
+        "same_cell_inline",
+        "two_row_signoff_table"
       ]
     },
     {
@@ -48,7 +71,7 @@
     {
       "pattern": "QR-SMP7.5.6-01-02 现成软件列表",
       "match": "contains",
-      "note": "人工签字位标误：漏识别批准人，角色日期在同一个字段中、/分隔；角色从左到右排列",
+      "note": "人工签字位标误：漏识别了批准签字角色；角色从左到右排列",
       "source_example": "QR-SMP7.5.6-01-02 现成软件列表（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "horizontal",
@@ -65,30 +88,48 @@
     {
       "pattern": "ECGAP-NTR-001 网络安全测试报告",
       "match": "contains",
-      "note": "人工签字位标误：识别签字位时不应该落位到更改记录中，应该落位到封面、正文或者末尾，是不是因为这三份是.doc文件；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了审核、批准签字角色；角色从上到下排列",
       "source_example": "ECGAP-NTR-001 网络安全测试报告（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
-      "date_relation": "different_cell",
+      "date_relation": "same_cell",
       "date_position": "right",
       "separator": "cell",
-      "same_cell": false,
+      "same_cell": true,
       "arrangement_label": "角色从上到下排列",
-      "signature_slot_forms": [
-        "右侧空白单元格"
-      ],
+      "signature_slot_forms": [],
       "date_layout_forms": [
-        "日期在右相邻单元格"
+        "与角色同一单元格/字段标记"
       ],
       "layout_types": [
-        "adjacent_right_cell"
+        "same_cell_inline"
       ]
     },
     {
       "pattern": "ECGAP-NSR-001 网络安全风险管理报告",
       "match": "contains",
-      "note": "人工签字位标误：识别签字位时不应该落位到更改记录中，应该落位到封面、正文或者末尾，是不是因为这三份是.doc文件；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了审核、批准签字角色；角色从上到下排列",
       "source_example": "ECGAP-NSR-001 网络安全风险管理报告（A0）.docx",
+      "learned_from_correction": true,
+      "arrangement": "vertical",
+      "date_relation": "same_cell",
+      "date_position": "right",
+      "separator": "cell",
+      "same_cell": true,
+      "arrangement_label": "角色从上到下排列",
+      "signature_slot_forms": [],
+      "date_layout_forms": [
+        "与角色同一单元格/字段标记"
+      ],
+      "layout_types": [
+        "same_cell_inline"
+      ]
+    },
+    {
+      "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-Nginx",
+      "match": "contains",
+      "note": "人工签字位标误：漏识别了编写签字角色；角色从上到下排列",
+      "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-Nginx（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
       "date_relation": "different_cell",
@@ -101,29 +142,6 @@
       ],
       "date_layout_forms": [
         "日期在右相邻单元格"
-      ],
-      "layout_types": [
-        "adjacent_right_cell"
-      ]
-    },
-    {
-      "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-Nginx",
-      "match": "contains",
-      "note": "人工签字位标误：存在申请人签字位，应该识别到编写人员；角色从上到下排列",
-      "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-Nginx（A0）.docx",
-      "learned_from_correction": true,
-      "arrangement": "vertical",
-      "date_relation": "different_cell",
-      "date_position": "right",
-      "separator": "empty_cell",
-      "same_cell": false,
-      "arrangement_label": "角色从上到下排列",
-      "signature_slot_forms": [
-        "右侧空白单元格"
-      ],
-      "date_layout_forms": [
-        "日期在右相邻单元格",
-        "日期在右侧隔列单元格"
       ],
       "layout_types": [
         "adjacent_right_cell"
@@ -132,21 +150,20 @@
     {
       "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-阿里云",
       "match": "contains",
-      "note": "人工签字位标误：存在申请人签字位，应该识别到编写人员；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了编写签字角色；角色从上到下排列",
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-阿里云（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
       "date_relation": "different_cell",
       "date_position": "right",
-      "separator": "empty_cell",
+      "separator": "cell",
       "same_cell": false,
       "arrangement_label": "角色从上到下排列",
       "signature_slot_forms": [
         "右侧空白单元格"
       ],
       "date_layout_forms": [
-        "日期在右相邻单元格",
-        "日期在右侧隔列单元格"
+        "日期在右相邻单元格"
       ],
       "layout_types": [
         "adjacent_right_cell"
@@ -155,21 +172,20 @@
     {
       "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-Docker",
       "match": "contains",
-      "note": "人工签字位标误：存在申请人签字位，应该识别到编写人员；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了编写签字角色；角色从上到下排列",
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-Docker（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
       "date_relation": "different_cell",
       "date_position": "right",
-      "separator": "empty_cell",
+      "separator": "cell",
       "same_cell": false,
       "arrangement_label": "角色从上到下排列",
       "signature_slot_forms": [
         "右侧空白单元格"
       ],
       "date_layout_forms": [
-        "日期在右相邻单元格",
-        "日期在右侧隔列单元格"
+        "日期在右相邻单元格"
       ],
       "layout_types": [
         "adjacent_right_cell"
@@ -178,21 +194,20 @@
     {
       "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-Redis",
       "match": "contains",
-      "note": "人工签字位标误：存在申请人签字位，应该识别到编写人员；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了编写签字角色；角色从上到下排列",
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-Redis（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
       "date_relation": "different_cell",
       "date_position": "right",
-      "separator": "empty_cell",
+      "separator": "cell",
       "same_cell": false,
       "arrangement_label": "角色从上到下排列",
       "signature_slot_forms": [
         "右侧空白单元格"
       ],
       "date_layout_forms": [
-        "日期在右相邻单元格",
-        "日期在右侧隔列单元格"
+        "日期在右相邻单元格"
       ],
       "layout_types": [
         "adjacent_right_cell"
@@ -201,21 +216,20 @@
     {
       "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-MySQL",
       "match": "contains",
-      "note": "人工签字位标误：存在申请人签字位，应该识别到编写人员；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了编写签字角色；角色从上到下排列",
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-MySQL（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
       "date_relation": "different_cell",
       "date_position": "right",
-      "separator": "empty_cell",
+      "separator": "cell",
       "same_cell": false,
       "arrangement_label": "角色从上到下排列",
       "signature_slot_forms": [
         "右侧空白单元格"
       ],
       "date_layout_forms": [
-        "日期在右相邻单元格",
-        "日期在右侧隔列单元格"
+        "日期在右相邻单元格"
       ],
       "layout_types": [
         "adjacent_right_cell"
@@ -224,21 +238,20 @@
     {
       "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-RabbitMQ",
       "match": "contains",
-      "note": "人工签字位标误：存在申请人签字位，应该识别到编写人员；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了编写签字角色；角色从上到下排列",
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-RabbitMQ（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
       "date_relation": "different_cell",
       "date_position": "right",
-      "separator": "empty_cell",
+      "separator": "cell",
       "same_cell": false,
       "arrangement_label": "角色从上到下排列",
       "signature_slot_forms": [
         "右侧空白单元格"
       ],
       "date_layout_forms": [
-        "日期在右相邻单元格",
-        "日期在右侧隔列单元格"
+        "日期在右相邻单元格"
       ],
       "layout_types": [
         "adjacent_right_cell"
@@ -247,21 +260,20 @@
     {
       "pattern": "QR-SMP7.5.6-01-01 现成软件评估表-鱼跃健康",
       "match": "contains",
-      "note": "人工签字位标误：存在申请人签字位，应该识别到编写人员；角色从上到下排列",
+      "note": "人工签字位标误：漏识别了编写签字角色；角色从上到下排列",
       "source_example": "QR-SMP7.5.6-01-01 现成软件评估表-鱼跃健康（A0）.docx",
       "learned_from_correction": true,
       "arrangement": "vertical",
       "date_relation": "different_cell",
       "date_position": "right",
-      "separator": "empty_cell",
+      "separator": "cell",
       "same_cell": false,
       "arrangement_label": "角色从上到下排列",
       "signature_slot_forms": [
         "右侧空白单元格"
       ],
       "date_layout_forms": [
-        "日期在右相邻单元格",
-        "日期在右侧隔列单元格"
+        "日期在右相邻单元格"
       ],
       "layout_types": [
         "adjacent_right_cell"
@@ -270,7 +282,7 @@
     {
       "pattern": "单元测试用例执行表",
       "match": "contains",
-      "note": "人工签字位标误：执行人员日期签字位识别不到；未指定",
+      "note": "人工签字位标误：日期位未识别出来；未指定",
       "source_example": "附件 单元测试用例执行表（A0）.docx",
       "learned_from_correction": true,
       "date_relation": "paragraph_inline",
@@ -350,5 +362,5 @@
       "[\\u4e00-\\u9fff]{2,4}\\s*[/｜|]\\s*\\d{4}[./-]\\d{1,2}"
     ]
   },
-  "updated": "2026-05-28"
+  "updated": "2026-05-29"
 }

@@ -174,7 +174,7 @@
 
         <div class="card" id="signerStrokeCard">
           <h2>为所选签署人录入 / 更新手写图</h2>
-          <p class="hint">选择签署人后在画布上手写。可用「仅保存签名 / 仅保存日期」只更新一侧；「保存非空项」提交当前两侧所有有内容的画布；「成套保存」要求两侧均有内容并写入成对素材套。</p>
+          <p class="hint">选择签署人后在画布上手写。可用「仅保存签名 / 仅保存日期」只更新一侧；「保存非空项」提交当前两侧所有有内容的画布；「成套保存」要求两侧均有内容并写入成对素材套。<strong>未勾选「标记为临时素材」时一律保存为正式素材</strong>（再次保存且不勾选时，会把原先的临时素材改回正式）；仅勾选时才标为临时，便于在下方列表筛选并批量删除。</p>
           <label for="libSignerSelect" style="margin-top:8px;">当前签署人</label>
           <div class="hint" id="currentSignerBanner" style="margin-top:6px;">当前选中：<strong id="currentSignerName">—</strong></div>
           <input type="search" id="libSignerFilter" placeholder="按签署人姓名或 ID 筛选…" maxlength="200" style="width:100%;max-width:100%;padding:8px 12px;margin-top:6px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
@@ -203,6 +203,11 @@
           <div class="btn-row" style="margin-top:12px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
             <button type="button" class="btn btn-secondary" id="libLoadStrokesBtn">从服务器载入该人笔迹</button>
           </div>
+          <div class="btn-row" style="margin-top:8px;align-items:center;flex-wrap:wrap;gap:8px;">
+            <label class="hint" style="margin:0;cursor:pointer;" title="临时素材可在下方列表筛选后批量删除；工作台匹配与素材下拉仍可使用">
+              <input type="checkbox" id="libMarkTemporaryCb"> 标记为临时素材
+            </label>
+          </div>
           <div class="btn-row" style="margin-top:8px;align-items:flex-start;flex-wrap:wrap;gap:8px;">
             <button type="button" class="btn btn-secondary" id="libSaveSigOnlyBtn" style="padding:8px 14px;">仅保存签名</button>
             <button type="button" class="btn btn-secondary" id="libSaveDateOnlyBtn" style="padding:8px 14px;">仅保存日期</button>
@@ -227,6 +232,9 @@
               <div style="font-size:0.88rem;font-weight:600;margin-bottom:6px;">月份简称（1–12）</div>
               <div id="pieceMonthChecks" style="display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;"></div>
             </div>
+            <label class="hint" style="margin:10px 0 0;cursor:pointer;display:block;" title="英文日期元件也可标为临时，便于日后批量清理">
+              <input type="checkbox" id="pieceMarkTemporaryCb"> 本批元件标记为临时素材
+            </label>
             <div class="btn-row" style="margin-top:10px;flex-wrap:wrap;align-items:flex-start;gap:8px;">
               <button type="button" class="btn btn-secondary" id="pieceBatchStartBtn">开始按序录入</button>
               <button type="button" class="btn btn-secondary" id="pieceBatchNextBtn" disabled>本项完成，下一项</button>
@@ -262,6 +270,13 @@
               <option value="en_date">英文日期（月份简称）</option>
               <option value="connector">连接符（句点 .）</option>
             </select>
+            <label for="strokeItemTemporarySelect" style="margin:0;font-size:0.88rem;">临时标记</label>
+            <select id="strokeItemTemporarySelect" style="min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:0.9rem;">
+              <option value="" selected>全部</option>
+              <option value="1">仅临时素材</option>
+              <option value="0">仅正式素材</option>
+            </select>
+            <button type="button" class="btn btn-secondary" id="btnPurgeTemporaryStrokeItems" style="padding:6px 12px;" title="删除当前筛选条件下的全部临时素材">删除筛选内临时素材</button>
           </div>
           <label for="strokeItemSearchInput">按签署人搜索（姓名或 ID）</label>
           <div class="btn-row" style="margin-top:6px;">
@@ -291,7 +306,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js?v=48';
+      s.src = (p || '') + '/js/sign-page.js?v=128';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +

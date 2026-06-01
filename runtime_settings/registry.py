@@ -212,14 +212,53 @@ _reg(
 _reg(
     SettingMeta(
         "SIGN_ARCHIVE_UPLOAD_TIMEOUT_MS",
-        1200000,
+        43200000,
         "int",
         "sign",
         "压缩包上传解压超时（毫秒）",
         description=(
             "上传 .zip/.7z/.rar 后服务端解压并逐文件写入 FTP/MySQL 的最大等待时间。"
-            "范围 300000–3600000；默认 1200000（20 分钟）。"
+            "范围 300000–43200000；默认 43200000（12 小时）。"
             "包很大或 FTP 慢时可调大；改后刷新签字页生效，无需重启。"
+        ),
+    )
+)
+_reg(
+    SettingMeta(
+        "SIGN_BATCH_FILE_TIMEOUT_MS",
+        3600000,
+        "int",
+        "sign",
+        "批量签字单文件超时（毫秒）",
+        description=(
+            "前端批量签字时每个文件调用 /api/sign/batch 的超时。"
+            "范围 60000–43200000；默认 3600000（1 小时）。"
+        ),
+    )
+)
+_reg(
+    SettingMeta(
+        "SIGN_DETECT_OP_TIMEOUT_SEC",
+        3600,
+        "int",
+        "sign",
+        "签字识别后端单次超时（秒）",
+        description=(
+            "后端 /api/sign/detect 单次识别（全量）执行上限。"
+            "范围 60–43200；默认 3600（1 小时）。"
+        ),
+    )
+)
+_reg(
+    SettingMeta(
+        "SIGN_DETECT_LIGHT_OP_TIMEOUT_SEC",
+        900,
+        "int",
+        "sign",
+        "签字识别轻量回退超时（秒）",
+        description=(
+            "全量识别超时后自动触发轻量识别（前后页优先扫描）的执行上限。"
+            "范围 30–7200；默认 900（15 分钟）。"
         ),
     )
 )

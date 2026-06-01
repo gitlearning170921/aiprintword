@@ -237,6 +237,17 @@ def init_schema() -> None:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS sign_batch_result (
+                    batch_id VARCHAR(32) NOT NULL PRIMARY KEY,
+                    result_json LONGTEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    KEY idx_sign_batch_result_updated (updated_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS app_batch_history (
                     id CHAR(32) NOT NULL PRIMARY KEY,
                     created_at VARCHAR(32) NOT NULL,
@@ -430,6 +441,7 @@ def ensure_sign_mysql() -> None:
             conn = _connect_db()
             try:
                 _ensure_signed_output_table(conn)
+                _ensure_sign_batch_result_table(conn)
                 _ensure_sign_file_columns(conn)
                 conn.commit()
             finally:
@@ -748,6 +760,200 @@ def delete_inbox_by_basenames_in_project(
     return deleted
 
 
+def capture_file_replace_caches_by_basenames_in_project(
+    project_id: Optional[str],
+    display_names: Iterable[str],
+) -> Dict[str, dict]:
+    """覆盖上传前：按 basename 抓取旧文件的工作台/识别/匹配缓存，供新 file_id 继承。"""
+    from sign_handlers.filename_util import normalize_display_filename
+    from sign_handlers.file_session_cache import (
+        trim_detect_correction,
+        trim_detect_snapshot,
+        trim_workbench_state,
+        _json_load,
+    )
+
+    want_bases: set = set()
+    for raw in display_names or []:
+        base = normalize_display_filename(str(raw or ""))
+        if base:
+            want_bases.add(base)
+    if not want_bases:
+        return {}
+
+    pid = (project_id or "").strip() or None
+    captured: Dict[str, dict] = {}
+    file_ids_by_base: Dict[str, str] = {}
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            if pid:
+                cur.execute(
+                    "SELECT id, original_name, detect_snapshot_json, workbench_state_json, "
+                    "detect_correction_json FROM sign_uploaded_file WHERE project_id=%s",
+                    (pid,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, original_name, detect_snapshot_json, workbench_state_json, "
+                    "detect_correction_json FROM sign_uploaded_file "
+                    "WHERE project_id IS NULL OR project_id=''"
+                )
+            rows = cur.fetchall() or []
+
+    fids: List[str] = []
+    for row in rows:
+        base = normalize_display_filename(str((row or {}).get("original_name") or ""))
+        if base not in want_bases:
+            continue
+        fid = str((row or {}).get("id") or "").strip()
+        if not fid:
+            continue
+        file_ids_by_base[base] = fid
+        payload: dict = {}
+        wb = trim_workbench_state(_json_load((row or {}).get("workbench_state_json")))
+        if wb:
+            payload["workbench"] = wb
+        det = trim_detect_snapshot(_json_load((row or {}).get("detect_snapshot_json")))
+        if det:
+            payload["detect"] = det
+        corr = trim_detect_correction(_json_load((row or {}).get("detect_correction_json")))
+        if corr:
+            payload["detect_correction"] = corr
+        captured[base] = payload
+        fids.append(fid)
+
+    if not fids:
+        return captured
+
+    by_fid: Dict[str, List[dict]] = {}
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(fids))
+            cur.execute(
+                "SELECT file_id, role_id, sig_item_id, date_item_id, date_mode, date_iso "
+                f"FROM sign_file_role_signer WHERE file_id IN ({placeholders})",
+                tuple(fids),
+            )
+            for r in cur.fetchall() or []:
+                fid = str((r or {}).get("file_id") or "").strip()
+                if fid:
+                    by_fid.setdefault(fid, []).append(r)
+
+    for base, fid in file_ids_by_base.items():
+        role_map = _role_map_light_from_rows(by_fid.get(fid, []))
+        if role_map:
+            ent = captured.setdefault(base, {})
+            ent["role_map"] = role_map
+    return captured
+
+
+def apply_file_replace_caches(file_id: str, payload: dict) -> None:
+    """将 capture_file_replace_caches_by_basenames_in_project 的结果写入新文件。"""
+    fid = str(file_id or "").strip()
+    if not fid or not isinstance(payload, dict) or not payload:
+        return
+    cache_payload: dict = {}
+    if isinstance(payload.get("workbench"), dict) and payload["workbench"]:
+        cache_payload["workbench"] = payload["workbench"]
+    if isinstance(payload.get("detect"), dict) and payload["detect"]:
+        cache_payload["detect"] = payload["detect"]
+    if isinstance(payload.get("detect_correction"), dict) and payload["detect_correction"]:
+        cache_payload["detect_correction"] = payload["detect_correction"]
+    if cache_payload:
+        apply_files_session_cache_batch({fid: cache_payload})
+    role_map = payload.get("role_map")
+    if isinstance(role_map, dict) and role_map:
+        set_file_role_signer_map(fid, role_map)
+
+
+def _file_replace_cache_payload(file_id: str) -> dict:
+    """读取单个待签文件的可继承缓存（工作台/识别/匹配）。"""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return {}
+    payload: dict = {}
+    wb = get_file_workbench_state(fid)
+    if wb:
+        payload["workbench"] = wb
+    det = get_file_detect_snapshot(fid)
+    if det:
+        payload["detect"] = det
+    corr = get_file_detect_correction(fid)
+    if corr:
+        payload["detect_correction"] = corr
+    role_map = get_file_role_signer_map(fid)
+    if role_map:
+        payload["role_map"] = role_map
+    return payload
+
+
+def migrate_file_replace_caches_to_keep_ids(
+    project_id: Optional[str],
+    display_names: Iterable[str],
+    keep_file_ids: Iterable[str],
+) -> List[str]:
+    """上传后确认覆盖：将同名旧文件的缓存迁移到 keep_file_ids 中的新文件，再删旧文件。"""
+    from sign_handlers.filename_util import normalize_display_filename
+
+    want_bases: set = set()
+    for raw in display_names or []:
+        base = normalize_display_filename(str(raw or ""))
+        if base:
+            want_bases.add(base)
+    keep = {str(x or "").strip() for x in (keep_file_ids or []) if str(x or "").strip()}
+    if not want_bases or not keep:
+        return []
+
+    pid = (project_id or "").strip() or None
+    old_by_base: Dict[str, str] = {}
+    new_by_base: Dict[str, str] = {}
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        _ensure_sign_file_columns(conn)
+        with conn.cursor() as cur:
+            if pid:
+                cur.execute(
+                    "SELECT id, original_name FROM sign_uploaded_file WHERE project_id=%s",
+                    (pid,),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, original_name FROM sign_uploaded_file "
+                    "WHERE project_id IS NULL OR project_id=''"
+                )
+            rows = cur.fetchall() or []
+    for row in rows:
+        fid = str((row or {}).get("id") or "").strip()
+        if not fid:
+            continue
+        base = normalize_display_filename(str((row or {}).get("original_name") or ""))
+        if base not in want_bases:
+            continue
+        if fid in keep:
+            new_by_base[base] = fid
+        else:
+            old_by_base[base] = fid
+
+    migrated: List[str] = []
+    for base in want_bases:
+        old_fid = old_by_base.get(base)
+        new_fid = new_by_base.get(base)
+        if not old_fid or not new_fid or old_fid == new_fid:
+            continue
+        payload = _file_replace_cache_payload(old_fid)
+        if not payload:
+            continue
+        try:
+            apply_file_replace_caches(new_fid, payload)
+            migrated.append(new_fid)
+        except Exception:
+            pass
+    return migrated
+
+
 def delete_files_batch(
     file_ids: List[str],
     *,
@@ -966,6 +1172,21 @@ def _ensure_signed_output_table(conn) -> None:
         )
 
 
+def _ensure_sign_batch_result_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sign_batch_result (
+                batch_id VARCHAR(32) NOT NULL PRIMARY KEY,
+                result_json LONGTEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                KEY idx_sign_batch_result_updated (updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+
+
 def count_signed_outputs() -> int:
     ensure_sign_mysql()
     with _conn_commit() as conn:
@@ -1046,6 +1267,15 @@ def list_signed_outputs() -> List[dict]:
     return items
 
 
+def _safe_ftp_output_filename(name: str) -> str:
+    """FTP 远端文件名：保留可读 ASCII，避免中文/特殊字符导致部分 FTP 不可写。"""
+    base = os.path.basename(name or "signed")
+    base = base.strip() or "signed"
+    base = re.sub(r"[^0-9A-Za-z._()\-\s]+", "_", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return (base or "signed")[:200]
+
+
 def insert_signed_output(
     signed_id: str,
     batch_id: Optional[str],
@@ -1059,15 +1289,7 @@ def insert_signed_output(
     ensure_sign_mysql()
     size = int(len(file_data or b""))
     sha = hashlib.sha256(file_data or b"").hexdigest()
-    # 记录里保留 output_name（可含中文）；FTP 路径使用安全文件名避免乱码/不支持字符
-    def _safe_ftp_filename(name: str) -> str:
-        base = os.path.basename(name or "signed")
-        base = base.strip() or "signed"
-        base = re.sub(r"[^0-9A-Za-z._()\-\s]+", "_", base)
-        base = re.sub(r"\s+", " ", base).strip()
-        return (base or "signed")[:200]
-
-    safe_name = _safe_ftp_filename(output_name or "signed")
+    safe_name = _safe_ftp_output_filename(output_name or "signed")
     remote_rel = f"sign/output/{signed_id}/{safe_name}"
     ftp_path, ftp_err = _ftp_upload_bytes_or_mysql(file_data or b"", remote_rel)
     err_s = (ftp_err or "")[:512] if ftp_err else None
@@ -1094,6 +1316,47 @@ def insert_signed_output(
                     None if ftp_path else err_s,
                 ),
             )
+
+
+def upsert_sign_batch_result(batch_id: str, result_payload: dict) -> None:
+    ensure_sign_mysql()
+    bid = (batch_id or "").strip().lower()
+    if not bid:
+        raise ValueError("batch_id 不能为空")
+    body = json.dumps(result_payload or {}, ensure_ascii=False)
+    with _conn_commit() as conn:
+        _ensure_sign_batch_result_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sign_batch_result (batch_id, result_json) VALUES (%s, %s) "
+                "ON DUPLICATE KEY UPDATE result_json=VALUES(result_json)",
+                (bid, body),
+            )
+
+
+def get_sign_batch_result(batch_id: str) -> Optional[dict]:
+    ensure_sign_mysql()
+    bid = (batch_id or "").strip().lower()
+    if not bid:
+        return None
+    with _conn_commit() as conn:
+        _ensure_sign_batch_result_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT result_json FROM sign_batch_result WHERE batch_id=%s",
+                (bid,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    raw = (row.get("result_json") or "").strip()
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
 
 def list_signed_batches_page(*, q: str = "", page: int = 1, page_size: int = 10):
@@ -1222,30 +1485,90 @@ def list_signed_legacy_page(*, q: str = "", page: int = 1, page_size: int = 50):
     return [_signed_output_row_to_item(dict(r)) for r in rows], total
 
 
+def _signed_output_ftp_path_candidates(
+    signed_id: str, output_name: str, ftp_path: str
+) -> List[str]:
+    """已签成品 FTP 路径候选（登记路径 + 历史迁移/命名差异的备选）。"""
+    from ftp_store import _join_base
+
+    seen: set[str] = set()
+    out: List[str] = []
+
+    def _add(p: str) -> None:
+        p = (p or "").strip()
+        if not p or p in seen:
+            return
+        seen.add(p)
+        out.append(p)
+
+    _add(ftp_path)
+    bases: List[str] = []
+    on = (output_name or "").strip()
+    if on:
+        bases.append(os.path.basename(on))
+    safe = _safe_ftp_output_filename(on or "signed")
+    if safe not in bases:
+        bases.append(safe)
+    for base in bases:
+        _add(_join_base(f"sign/output/{signed_id}/{base}"))
+    return out
+
+
 def get_signed_row(signed_id: str) -> Optional[dict]:
-    """返回含 file_data(bytes)；不存在则 None。优先从 FTP 取，兼容旧 BLOB。"""
+    """返回含 file_data(bytes)；不存在则 None。优先 FTP（含备选路径），兼容旧 BLOB。"""
     ensure_sign_mysql()
     with _conn_commit() as conn:
         _ensure_signed_output_table(conn)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, output_name AS name, ext, ftp_path, file_data "
+                "SELECT id, source_name, output_name, output_name AS name, ext, ftp_path, ftp_last_error, "
+                "file_data, roles_json, batch_id, source_file_id, created_at "
                 "FROM sign_signed_output WHERE id=%s",
                 (signed_id,),
             )
             row = cur.fetchone()
     if not row:
         return None
-    if row.get("file_data"):
-        return row
-    p = (row.get("ftp_path") or "").strip()
-    if p:
-        try:
-            from ftp_store import download_bytes
+    row = dict(row)
+    ext = (row.get("ext") or ".docx").lower()
+    ftp_path = (row.get("ftp_path") or "").strip()
+    output_name = row.get("output_name") or row.get("name") or ""
+    blob = row.get("file_data")
 
-            row["file_data"] = download_bytes(p)
-        except Exception:
-            pass
+    ftp_bytes: Optional[bytes] = None
+    last_ftp_err = ""
+    for cand in _signed_output_ftp_path_candidates(signed_id, output_name, ftp_path):
+        got = _download_ftp_bytes_with_retry(cand, file_id=signed_id)
+        if got is not None and is_valid_uploaded_blob(got, ext):
+            ftp_bytes = got
+            break
+        if got is not None:
+            last_ftp_err = f"FTP 文件无效（{len(got)} 字节，非有效 Office 压缩包）"
+        elif cand == ftp_path:
+            hint = (row.get("ftp_last_error") or "").strip()
+            last_ftp_err = hint or "无法从 FTP 下载"
+
+    if ftp_bytes is not None:
+        row["file_data"] = ftp_bytes
+        row.pop("file_load_error", None)
+        return row
+
+    if blob and is_valid_uploaded_blob(blob, ext):
+        row["file_data"] = blob
+        row.pop("file_load_error", None)
+        return row
+
+    row["file_data"] = None
+    if ftp_path or last_ftp_err:
+        row["file_load_error"] = (
+            "无法读取已签字文件内容。"
+            + (f"（{last_ftp_err}）" if last_ftp_err else "")
+            + " 请检查 FTP 配置，或在服务端运行 FTP 校验补传。"
+        )
+    elif blob:
+        row["file_load_error"] = "数据库中的文件缓存无效或已损坏。"
+    else:
+        row["file_load_error"] = "文件内容为空（可能未完成保存或已被清理）。"
     return row
 
 
@@ -1849,9 +2172,11 @@ def _ensure_signer_tables(conn) -> None:
                 png LONGBLOB NULL,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                is_temporary TINYINT(1) NOT NULL DEFAULT 0,
                 UNIQUE KEY uk_item (signer_id, locale, kind, sha256),
                 KEY idx_item_signer (signer_id),
-                KEY idx_item_kind (kind)
+                KEY idx_item_kind (kind),
+                KEY idx_item_temporary (is_temporary, updated_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
         )
@@ -1973,6 +2298,18 @@ def _ensure_signer_tables(conn) -> None:
                 cur.execute("ALTER TABLE sign_file_role_signer ADD COLUMN date_iso VARCHAR(32) NULL")
             except Exception:
                 pass
+            try:
+                cur.execute(
+                    "ALTER TABLE sign_stroke_item ADD COLUMN is_temporary TINYINT(1) NOT NULL DEFAULT 0"
+                )
+            except Exception:
+                pass
+            try:
+                cur.execute(
+                    "ALTER TABLE sign_stroke_item ADD KEY idx_item_temporary (is_temporary, updated_at)"
+                )
+            except Exception:
+                pass
     except Exception:
         pass
     try:
@@ -2017,6 +2354,31 @@ def _stroke_item_migrate_from_sets(conn) -> None:
             _upsert_stroke_item_core(conn, signer_id, loc, "date", date_b, prefer_ftp_path=row.get("date_ftp_path"))
 
 
+def _parse_is_temporary(val: Any) -> bool:
+    """未传或传 0/false 等均视为正式素材（is_temporary=0）。"""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    return s in ("1", "true", "yes", "on", "y")
+
+
+def _stroke_item_cat_where(cat: str) -> str:
+    cat = (cat or "").strip().lower()
+    if cat in ("sig", "signature"):
+        return " AND i.kind='sig' "
+    if cat in ("date", "sign_date", "hand_date"):
+        return " AND i.kind='date' "
+    if cat in ("digit", "digits"):
+        return " AND i.locale='en' AND i.kind REGEXP '^(pd[0-9])$' "
+    if cat in ("en_date", "en", "month", "months"):
+        return " AND i.locale='en' AND i.kind REGEXP '^(pma(0[1-9]|1[0-2])|pm(0[1-9]|1[0-2]))$' "
+    if cat in ("connector", "dot", "pdot"):
+        return " AND i.locale='en' AND i.kind='pdot' "
+    return ""
+
+
 def _upsert_stroke_item_core(
     conn,
     signer_id: str,
@@ -2028,6 +2390,7 @@ def _upsert_stroke_item_core(
     prepared_ftp_path: Optional[str] = None,
     prepared_ftp_err: Optional[str] = None,
     skip_ftp: bool = False,
+    is_temporary: bool = False,
 ) -> Dict[str, Any]:
     """
     笔迹素材 upsert 核心。
@@ -2089,18 +2452,19 @@ def _upsert_stroke_item_core(
             png_b, f"sign/strokeitem/{item_id}.png"
         )
     err_s = ((ftp_err_note or "")[:512]) if ftp_err_note else None
+    temp_i = 1 if is_temporary else 0
 
     png_store = None if ftp_path else png_b
     with conn.cursor() as cur:
         if not piece_mode and overwrote:
             cur.execute(
-                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s, png=%s, ftp_last_error=%s, sha256=%s WHERE id=%s",
-                (ftp_path, int(len(png_b)), png_store, None if ftp_path else err_s, sha, item_id),
+                "UPDATE sign_stroke_item SET ftp_path=%s, file_size=%s, png=%s, ftp_last_error=%s, sha256=%s, is_temporary=%s WHERE id=%s",
+                (ftp_path, int(len(png_b)), png_store, None if ftp_path else err_s, sha, temp_i, item_id),
             )
         else:
             cur.execute(
-                "INSERT INTO sign_stroke_item (id, signer_id, locale, kind, sha256, ftp_path, file_size, png, ftp_last_error) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO sign_stroke_item (id, signer_id, locale, kind, sha256, ftp_path, file_size, png, ftp_last_error, is_temporary) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     item_id,
                     signer_id,
@@ -2111,12 +2475,22 @@ def _upsert_stroke_item_core(
                     int(len(png_b)),
                     png_store,
                     None if ftp_path else err_s,
+                    temp_i,
                 ),
             )
-    return {"stroke_item_id": item_id, "overwritten": overwrote, "sha256": sha, "kind": k, "locale": loc}
+    return {
+        "stroke_item_id": item_id,
+        "overwritten": overwrote,
+        "sha256": sha,
+        "kind": k,
+        "locale": loc,
+        "is_temporary": bool(is_temporary),
+    }
 
 
-def upsert_signer_stroke_piece(signer_id: str, piece_kind: str, png_b: bytes) -> Dict[str, Any]:
+def upsert_signer_stroke_piece(
+    signer_id: str, piece_kind: str, png_b: bytes, *, is_temporary: bool = False
+) -> Dict[str, Any]:
     """录入英文点分日期笔迹元件（locale 固定为 en，同槽位覆盖）。
 
     注意：FTP 上传放在 DB 事务之外执行，避免 InnoDB 行锁在 FTP 慢/抖动期间被长时间持有
@@ -2150,6 +2524,7 @@ def upsert_signer_stroke_piece(signer_id: str, piece_kind: str, png_b: bytes) ->
             prepared_ftp_path=ftp_path,
             prepared_ftp_err=ftp_err,
             skip_ftp=True,
+            is_temporary=is_temporary,
         )
 
 
@@ -2157,6 +2532,8 @@ def batch_upsert_signer_stroke_pieces(
     signer_id: str,
     pieces: List[Tuple[str, bytes]],
     overwrite: bool = True,
+    *,
+    is_temporary: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     批量写入笔迹元件。
@@ -2238,6 +2615,7 @@ def batch_upsert_signer_stroke_pieces(
                     prepared_ftp_path=ftp_path,
                     prepared_ftp_err=ftp_err,
                     skip_ftp=True,
+                    is_temporary=is_temporary,
                 )
                 results.append({"piece_kind": pk_raw, "ok": True, **r})
         except ValueError as e:
@@ -2418,27 +2796,22 @@ def list_stroke_items_page(
     page: int = 1,
     page_size: int = 10,
     cat: str = "",
+    temporary: str = "",
 ) -> Tuple[List[dict], int]:
     """已入库的签字 PNG 素材（sign_stroke_item），按签署人显示名或 ID 模糊搜索，分页。"""
     ensure_sign_mysql()
     q = (q or "").strip()
     cat = (cat or "").strip().lower()
+    temporary = (temporary or "").strip().lower()
     page = max(1, int(page))
     page_size = max(1, min(int(page_size), 500))
     offset = (page - 1) * page_size
-    where_cat = ""
+    where_cat = _stroke_item_cat_where(cat)
     cat_args: List[Any] = []
-    if cat in ("sig", "signature"):
-        where_cat = " AND i.kind='sig' "
-    elif cat in ("date", "sign_date", "hand_date"):
-        where_cat = " AND i.kind='date' "
-    elif cat in ("digit", "digits"):
-        where_cat = " AND i.locale='en' AND i.kind REGEXP '^(pd[0-9])$' "
-    elif cat in ("en_date", "en", "month", "months"):
-        # 英文日期：月份简称元件（pma01..pma12）；兼容旧整词 pm01..pm12
-        where_cat = " AND i.locale='en' AND i.kind REGEXP '^(pma(0[1-9]|1[0-2])|pm(0[1-9]|1[0-2]))$' "
-    elif cat in ("connector", "dot", "pdot"):
-        where_cat = " AND i.locale='en' AND i.kind='pdot' "
+    if temporary in ("1", "true", "yes", "temp", "temporary"):
+        where_cat += " AND i.is_temporary=1 "
+    elif temporary in ("0", "false", "no", "perm", "permanent"):
+        where_cat += " AND i.is_temporary=0 "
     with _conn_commit() as conn:
         _ensure_signer_tables(conn)
         with conn.cursor() as cur:
@@ -2454,7 +2827,7 @@ def list_stroke_items_page(
                 total = int((cur.fetchone() or {}).get("c") or 0)
                 cur.execute(
                     "SELECT i.id, i.signer_id, i.locale, i.kind, i.sha256, i.ftp_path, i.ftp_last_error, i.file_size, "
-                    " (i.png IS NOT NULL AND LENGTH(i.png) > 0) AS has_blob, i.updated_at, "
+                    " (i.png IS NOT NULL AND LENGTH(i.png) > 0) AS has_blob, i.updated_at, i.is_temporary, "
                     " s.display_name AS signer_name "
                     "FROM sign_stroke_item i "
                     "INNER JOIN sign_signer s ON s.id = i.signer_id "
@@ -2473,7 +2846,7 @@ def list_stroke_items_page(
                 total = int((cur.fetchone() or {}).get("c") or 0)
                 cur.execute(
                     "SELECT i.id, i.signer_id, i.locale, i.kind, i.sha256, i.ftp_path, i.ftp_last_error, i.file_size, "
-                    " (i.png IS NOT NULL AND LENGTH(i.png) > 0) AS has_blob, i.updated_at, "
+                    " (i.png IS NOT NULL AND LENGTH(i.png) > 0) AS has_blob, i.updated_at, i.is_temporary, "
                     " s.display_name AS signer_name "
                     "FROM sign_stroke_item i "
                     "INNER JOIN sign_signer s ON s.id = i.signer_id "
@@ -2505,9 +2878,41 @@ def list_stroke_items_page(
                 "blob_stored": bool(r.get("has_blob")),
                 "ftp_last_error": fe or None,
                 "updated_at": ts.isoformat(sep=" ") if ts is not None else None,
+                "is_temporary": bool(int(r.get("is_temporary") or 0)),
             }
         )
     return out, total
+
+
+def delete_temporary_stroke_items(*, q: str = "", cat: str = "") -> int:
+    """删除符合筛选条件的全部临时素材（用于素材录入页批量清理）。"""
+    ensure_sign_mysql()
+    q = (q or "").strip()
+    where_cat = _stroke_item_cat_where((cat or "").strip().lower()) + " AND i.is_temporary=1 "
+    deleted = 0
+    with _conn_commit() as conn:
+        _ensure_signer_tables(conn)
+        with conn.cursor() as cur:
+            if q:
+                like = f"%{q}%"
+                cur.execute(
+                    "SELECT i.id FROM sign_stroke_item i "
+                    "INNER JOIN sign_signer s ON s.id = i.signer_id "
+                    "WHERE (s.display_name LIKE %s OR i.signer_id LIKE %s) "
+                    + where_cat,
+                    (like, like),
+                )
+            else:
+                cur.execute(
+                    "SELECT i.id FROM sign_stroke_item i "
+                    "INNER JOIN sign_signer s ON s.id = i.signer_id "
+                    "WHERE 1=1 " + where_cat
+                )
+            ids = [str((row or {}).get("id") or "") for row in (cur.fetchall() or [])]
+            ids = [x for x in ids if x]
+    for iid in ids:
+        deleted += delete_stroke_item(iid)
+    return deleted
 
 
 def delete_stroke_item(item_id: str) -> int:
@@ -2542,7 +2947,14 @@ def delete_stroke_item(item_id: str) -> int:
             return int(cur.rowcount or 0)
 
 
-def upsert_signer_stroke_item(signer_id: str, kind: str, png_b: bytes, locale: str = "zh") -> Dict[str, Any]:
+def upsert_signer_stroke_item(
+    signer_id: str,
+    kind: str,
+    png_b: bytes,
+    locale: str = "zh",
+    *,
+    is_temporary: bool = False,
+) -> Dict[str, Any]:
     """
     单条 sig/date 笔迹素材入库。
     FTP 上传放在事务外执行；事务内仅做 SELECT/INSERT/UPDATE，避免长事务持锁。
@@ -2586,6 +2998,7 @@ def upsert_signer_stroke_item(signer_id: str, kind: str, png_b: bytes, locale: s
             prepared_ftp_path=ftp_path,
             prepared_ftp_err=ftp_err,
             skip_ftp=True,
+            is_temporary=is_temporary,
         )
 
 
@@ -2946,7 +3359,8 @@ def list_signers(*, compact: bool = False) -> List[dict]:
                 """
                 SELECT id, signer_id, locale, kind, updated_at, sha256
                 , ftp_path, ftp_last_error, (png IS NOT NULL) AS has_blob
-                FROM sign_stroke_item ORDER BY signer_id ASC, locale ASC, kind ASC, updated_at DESC
+                FROM sign_stroke_item
+                ORDER BY signer_id ASC, locale ASC, kind ASC, updated_at DESC
                 """
             )
             item_rows = cur.fetchall() or []
@@ -3647,8 +4061,41 @@ def set_file_workbench_state(file_id: str, state: dict) -> None:
             )
 
 
-def apply_files_session_cache_batch(items: Dict[str, dict]) -> int:
+def apply_files_workbench_batch(items: Dict[str, dict]) -> int:
+    """仅批量写入 workbench_state_json（executemany，适合工作台编审批/日期保存）。"""
+    from sign_handlers.file_session_cache import trim_workbench_state
+
+    if not items:
+        return 0
+    wb_rows: List[Tuple[str, str]] = []
+    for fid, payload in items.items():
+        file_id = str(fid or "").strip()
+        if not file_id or not isinstance(payload, dict):
+            continue
+        wb = payload.get("workbench")
+        if not isinstance(wb, dict):
+            continue
+        wb_rows.append(
+            (json.dumps(trim_workbench_state(wb), ensure_ascii=False), file_id)
+        )
+    if not wb_rows:
+        return 0
+    ensure_sign_mysql()
+    with _conn_commit() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE sign_uploaded_file SET workbench_state_json=%s WHERE id=%s",
+                wb_rows,
+            )
+    return len(wb_rows)
+
+
+def apply_files_session_cache_batch(
+    items: Dict[str, dict], *, workbench_only: bool = False
+) -> int:
     """批量写入 detect / workbench / detect_correction。返回成功更新文件数。"""
+    if workbench_only:
+        return apply_files_workbench_batch(items)
     from sign_handlers.file_session_cache import (
         trim_detect_correction,
         trim_detect_snapshot,
@@ -3657,38 +4104,49 @@ def apply_files_session_cache_batch(items: Dict[str, dict]) -> int:
 
     if not items:
         return 0
+    wb_rows: List[Tuple[str, str]] = []
+    det_rows: List[Tuple[str, str]] = []
+    corr_rows: List[Tuple[str, str]] = []
+    for fid, payload in items.items():
+        file_id = str(fid or "").strip()
+        if not file_id or not isinstance(payload, dict):
+            continue
+        wb = payload.get("workbench")
+        det = payload.get("detect")
+        corr = payload.get("detect_correction")
+        if isinstance(wb, dict):
+            wb_rows.append(
+                (json.dumps(trim_workbench_state(wb), ensure_ascii=False), file_id)
+            )
+        if isinstance(det, dict):
+            det_rows.append(
+                (json.dumps(trim_detect_snapshot(det), ensure_ascii=False), file_id)
+            )
+        if isinstance(corr, dict):
+            corr_rows.append(
+                (json.dumps(trim_detect_correction(corr), ensure_ascii=False), file_id)
+            )
+    if not wb_rows and not det_rows and not corr_rows:
+        return 0
     ensure_sign_mysql()
-    updated = 0
     with _conn_commit() as conn:
         with conn.cursor() as cur:
-            for fid, payload in items.items():
-                file_id = str(fid or "").strip()
-                if not file_id or not isinstance(payload, dict):
-                    continue
-                wb = payload.get("workbench")
-                det = payload.get("detect")
-                corr = payload.get("detect_correction")
-                if isinstance(wb, dict):
-                    blob = json.dumps(trim_workbench_state(wb), ensure_ascii=False)
-                    cur.execute(
-                        "UPDATE sign_uploaded_file SET workbench_state_json=%s WHERE id=%s",
-                        (blob, file_id),
-                    )
-                    if cur.rowcount:
-                        updated += 1
-                if isinstance(det, dict):
-                    blob = json.dumps(trim_detect_snapshot(det), ensure_ascii=False)
-                    cur.execute(
-                        "UPDATE sign_uploaded_file SET detect_snapshot_json=%s WHERE id=%s",
-                        (blob, file_id),
-                    )
-                if isinstance(corr, dict):
-                    blob = json.dumps(trim_detect_correction(corr), ensure_ascii=False)
-                    cur.execute(
-                        "UPDATE sign_uploaded_file SET detect_correction_json=%s WHERE id=%s",
-                        (blob, file_id),
-                    )
-    return updated
+            if wb_rows:
+                cur.executemany(
+                    "UPDATE sign_uploaded_file SET workbench_state_json=%s WHERE id=%s",
+                    wb_rows,
+                )
+            if det_rows:
+                cur.executemany(
+                    "UPDATE sign_uploaded_file SET detect_snapshot_json=%s WHERE id=%s",
+                    det_rows,
+                )
+            if corr_rows:
+                cur.executemany(
+                    "UPDATE sign_uploaded_file SET detect_correction_json=%s WHERE id=%s",
+                    corr_rows,
+                )
+    return len(wb_rows) if wb_rows else max(len(det_rows), len(corr_rows), 0)
 
 
 def set_file_detect_correction(file_id: str, correction: dict) -> None:

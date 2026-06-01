@@ -103,6 +103,31 @@ def iter_role_label_lines(cell_text) -> List[str]:
 _SIGNOFF_DATE_IN_LABEL_RE = re.compile(r"[/／]\s*日期|日期\s*[:：]", re.IGNORECASE)
 
 
+def _signoff_role_date_label_end_offset(text: str, keyword: str) -> int:
+    """
+    识别「角色/日期[:：]」标签结束位置。
+    例如：测试人/日期：____、Reviewer/Date: ____。
+    """
+    s = str(text or "")
+    kw = str(keyword or "").strip()
+    if not s or not kw:
+        return -1
+    esc = re.escape(kw)
+    ascii_only = all(ord(c) < 128 for c in kw)
+    use_word_boundary = ascii_only and bool(re.match(r"^[A-Za-z0-9_]+$", kw))
+    if use_word_boundary:
+        m = re.search(
+            r"(?i)\b" + esc + r"\b\s*[/／]\s*(?:日期|date)\s*[:：]?",
+            s,
+        )
+    else:
+        m = re.search(
+            r"(?i)" + esc + r"\s*[/／]\s*(?:日期|date)\s*[:：]?",
+            s,
+        )
+    return m.end() if m else -1
+
+
 def cell_looks_like_signoff_date_label(cell_text) -> bool:
     """是否为「测试人/日期」「复核人/日期」类签批栏标签格（非独立 Date 列表头）。"""
     return bool(_SIGNOFF_DATE_IN_LABEL_RE.search(str(cell_text or "")))
@@ -182,6 +207,11 @@ def cell_has_signoff_inline_reservation(cell_text, keyword: str) -> bool:
     for line in iter_role_label_lines(cell_text):
         if not cell_has_role_keyword(line, keyword):
             continue
+        off = _signoff_role_date_label_end_offset(line, keyword)
+        if off >= 0:
+            tail = line[off:].lstrip(" \t")
+            if not tail or _rest_is_blank_or_placeholder(tail):
+                return True
         off = paragraph_text_keyword_end_offset(line, keyword)
         if off < 0:
             continue
@@ -189,6 +219,10 @@ def cell_has_signoff_inline_reservation(cell_text, keyword: str) -> bool:
         if not tail or _rest_is_blank_or_placeholder(tail):
             return True
     raw = str(cell_text or "")
+    off = _signoff_role_date_label_end_offset(raw, keyword)
+    if off >= 0:
+        tail = raw[off:].lstrip(" \t")
+        return (not tail) or _rest_is_blank_or_placeholder(tail)
     off = paragraph_text_keyword_end_offset(raw, keyword)
     if off < 0:
         return False
@@ -208,10 +242,18 @@ def cell_inline_insert_offset_px(cell_text, keyword: str, *, max_px: int = 300) 
         return None
     tail = txt[off:].lstrip(" ：:\t")
     if cell_is_role_signoff_label_slot(txt, keyword):
-        if not tail or not _rest_is_blank_or_placeholder(tail):
-            return None
+        signoff_off = _signoff_role_date_label_end_offset(txt, keyword)
+        if signoff_off >= 0:
+            signoff_tail = txt[signoff_off:].lstrip(" \t")
+            if signoff_tail and not _rest_is_blank_or_placeholder(signoff_tail):
+                return None
+            off = signoff_off
+        else:
+            if not tail or not _rest_is_blank_or_placeholder(tail):
+                return None
     elif tail and not _rest_is_blank_or_placeholder(tail):
         return None
+    tail = txt[off:].lstrip(" ：:\t")
     pre = txt[:off]
     px = 4
     for ch in pre:

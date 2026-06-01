@@ -301,6 +301,32 @@ def _merged_top_left_coordinate(ws, cell) -> str:
     return cell.coordinate
 
 
+def _writable_cell_in_merged(ws, cell):
+    """
+    openpyxl 的合并区域里，只有左上角单元格可写 value；
+    其余 MergedCell 直接赋值会抛 "read-only"。
+    """
+    try:
+        merged = getattr(ws, "merged_cells", None)
+        if merged is None:
+            return cell
+        for rng in merged.ranges:
+            if cell.coordinate in rng:
+                return ws.cell(row=int(rng.min_row), column=int(rng.min_col))
+    except Exception:
+        pass
+    return cell
+
+
+def _clear_slot_cell_and_anchor(ws, cell):
+    target = _writable_cell_in_merged(ws, cell)
+    try:
+        target.value = None
+    except Exception:
+        pass
+    return target, _merged_top_left_coordinate(ws, target)
+
+
 def _add_png_after_label_in_cell(
     ws, png_bytes: bytes, cell, offset_x_px: int, max_w: int = _EXCEL_ABS_MAX_IMG_WIDTH_PX
 ) -> None:
@@ -411,13 +437,13 @@ def _try_xlsx_four_column_row(
     date_hdr = ws.cell(row=r, column=label_c + 2)
     date_cell = ws.cell(row=r, column=label_c + 3)
     if sig and _is_slot_target(sig_cell.value):
-        sig_cell.value = None
-        _add_png(ws, sig, _merged_top_left_coordinate(ws, sig_cell), sig_cell)
+        sig_slot, sig_anchor = _clear_slot_cell_and_anchor(ws, sig_cell)
+        _add_png(ws, sig, sig_anchor, sig_slot)
         placed = True
     if dt:
         if _is_slot_target(date_cell.value):
-            date_cell.value = None
-            _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
+            date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
+            _add_png(ws, dt, date_anchor, date_slot)
             placed = True
         else:
             d_inline = cell_inline_insert_offset_px(date_hdr.value, "Date")
@@ -428,8 +454,8 @@ def _try_xlsx_four_column_row(
                 placed = True
             elif _is_slot_target(ws.cell(row=r, column=label_c + 4).value):
                 dc2 = ws.cell(row=r, column=label_c + 4)
-                dc2.value = None
-                _add_png(ws, dt, _merged_top_left_coordinate(ws, dc2), dc2)
+                dc2_slot, dc2_anchor = _clear_slot_cell_and_anchor(ws, dc2)
+                _add_png(ws, dt, dc2_anchor, dc2_slot)
                 placed = True
     if sig and not dt:
         return placed
@@ -504,7 +530,7 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
     if not (signoff_slot or inline_slot or ((has_blank_right or has_blank_below) and date_ctx)):
         return False
     sig_cell = ws.cell(row=r, column=c + 1)
-    inline_x = cell_inline_insert_offset_px(val, kw) if signoff_slot else None
+    inline_x = cell_inline_insert_offset_px(val, kw) if (signoff_slot or inline_slot) else None
     if sig and (not _is_slot_target(sig_cell.value)):
         if inline_x is None:
             return False
@@ -521,46 +547,49 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                 d0 = ws.cell(row=r + 1, column=c)
                 if _is_slot_target(d0.value):
                     date_cell = d0
-    placed_any = False
+    sig_placed = False
+    date_placed = False
     if inline_x is not None and sig and dt:
         _add_sig_and_date_after_label_in_cell(ws, sig, dt, cell, inline_x)
-        placed_any = True
+        sig_placed = True
+        date_placed = True
     elif inline_x is not None and sig:
         _add_png_after_label_in_cell(ws, sig, cell, inline_x)
-        placed_any = True
-    if sig and not placed_any:
+        sig_placed = True
+    if sig and not sig_placed:
         if _is_slot_target(sig_cell.value):
-            sig_cell.value = None
+            sig_slot, sig_anchor = _clear_slot_cell_and_anchor(ws, sig_cell)
             _add_png(
                 ws,
                 sig,
-                _merged_top_left_coordinate(ws, sig_cell),
-                sig_cell,
+                sig_anchor,
+                sig_slot,
             )
-            placed_any = True
-        if not placed_any and has_blank_below:
+            sig_placed = True
+        if not sig_placed and has_blank_below:
             below = ws.cell(row=r + 1, column=c)
-            below.value = None
+            below_slot, below_anchor = _clear_slot_cell_and_anchor(ws, below)
             _add_png(
                 ws,
                 sig,
-                _merged_top_left_coordinate(ws, below),
-                below,
+                below_anchor,
+                below_slot,
             )
-            placed_any = True
-        if not placed_any:
+            sig_placed = True
+        if not sig_placed:
             sig_inline_x = cell_inline_insert_offset_px(cell.value, kw)
             if sig_inline_x is not None:
                 if dt and cell_has_signoff_inline_reservation(val, kw):
                     _add_sig_and_date_after_label_in_cell(
                         ws, sig, dt, cell, sig_inline_x
                     )
+                    date_placed = True
                 else:
                     _add_png_after_label_in_cell(
                         ws, sig, cell, sig_inline_x
                     )
-                placed_any = True
-    if dt and not placed_any:
+                sig_placed = True
+    if dt and not date_placed:
         if signoff_slot:
             max_c = int(ws.max_column or 1)
             for dc in range(c + 2, min(c + 8, max_c + 1)):
@@ -572,41 +601,42 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                 ):
                     break
                 if _is_slot_target(dv):
-                    dcell.value = None
+                    dcell_slot, dcell_anchor = _clear_slot_cell_and_anchor(ws, dcell)
                     _add_png(
                         ws,
                         dt,
-                        _merged_top_left_coordinate(ws, dcell),
-                        dcell,
+                        dcell_anchor,
+                        dcell_slot,
                     )
-                    placed_any = True
+                    date_placed = True
                     break
         if (
-            not placed_any
+            not date_placed
             and signoff_slot
             and cell_has_signoff_inline_reservation(val, kw)
         ):
             inline_dt_x = cell_inline_insert_offset_px(val, kw)
             if inline_dt_x is not None:
-                if sig:
+                if sig and not sig_placed:
                     _add_sig_and_date_after_label_in_cell(
                         ws, sig, dt, cell, inline_dt_x
                     )
+                    sig_placed = True
                 else:
                     _add_png_after_label_in_cell(
                         ws, dt, cell, inline_dt_x
                     )
-                placed_any = True
+                date_placed = True
         if (
-            not placed_any
+            not date_placed
             and not signoff_slot
             and date_cell is not None
             and _is_slot_target(date_cell.value)
         ):
-            date_cell.value = None
-            _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
-            placed_any = True
-        elif not placed_any:
+            date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
+            _add_png(ws, dt, date_anchor, date_slot)
+            date_placed = True
+        elif not date_placed:
             date_inline_x = None
             if date_label_cell is not None:
                 date_inline_x = cell_inline_insert_offset_px(date_label_cell.value, "Date")
@@ -614,28 +644,28 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                     date_inline_x = cell_inline_insert_offset_px(date_label_cell.value, "日期")
             if date_label_cell is not None and date_inline_x is not None:
                 _add_png_after_label_in_cell(ws, dt, date_label_cell, date_inline_x)
-                placed_any = True
+                date_placed = True
             elif date_cell is not None:
-                date_cell.value = None
-                _add_png(ws, dt, _merged_top_left_coordinate(ws, date_cell), date_cell)
-                placed_any = True
+                date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
+                _add_png(ws, dt, date_anchor, date_slot)
+                date_placed = True
             elif (not _is_slot_target(sig_cell.value)) and sig:
                 dnext = ws.cell(row=r, column=c + 2)
                 if _is_slot_target(dnext.value):
-                    dnext.value = None
+                    dnext_slot, dnext_anchor = _clear_slot_cell_and_anchor(ws, dnext)
                     _add_png(
                         ws,
                         dt,
-                        _merged_top_left_coordinate(ws, dnext),
-                        dnext,
+                        dnext_anchor,
+                        dnext_slot,
                     )
-                    placed_any = True
-            if not placed_any:
+                    date_placed = True
+            if not date_placed:
                 below = f"{get_column_letter(c + 1)}{r + 1}"
                 below_cell = ws.cell(row=r + 1, column=c + 1)
                 _add_png(ws, dt, below, below_cell)
-                placed_any = True
-    return placed_any
+                date_placed = True
+    return bool(sig_placed or date_placed)
 
 
 def sign_xlsx(

@@ -17,6 +17,7 @@ from sign_handlers.detect_correction import trim_detect_correction
 _ROOT = Path(__file__).resolve().parents[1]
 _RULES_PATH = _ROOT / "sign_handlers" / "sign_document_role_rules.json"
 _MD_PATH = _ROOT / "signature_role_results_T2.md"
+_ROLE_KW_PATH = _ROOT / "sign_handlers" / "sign_role_keywords.json"
 
 _VERSION_SUFFIX_RE = re.compile(
     r"[\s_]*(?:[（(]\s*[Aa]?\d+(?:\.\d+)?\s*[）)]|[Vv]\d+(?:\.\d+)?)\s*$"
@@ -72,6 +73,145 @@ def _roles_label(roles: List[str]) -> str:
     if not roles:
         return "无需签字"
     return "、".join(labels.get(r, r) for r in roles)
+
+
+def _load_role_keywords_raw() -> Dict[str, Any]:
+    if _ROLE_KW_PATH.is_file():
+        with open(_ROLE_KW_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            if isinstance(raw, dict):
+                return raw
+    return {"schema_version": 1, "roles": {}}
+
+
+def _save_role_keywords_raw(raw: Dict[str, Any]) -> None:
+    if not isinstance(raw, dict):
+        raw = {"schema_version": 1, "roles": {}}
+    raw["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _ROLE_KW_PATH.write_text(
+        json.dumps(raw, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        from sign_handlers.sign_role_keywords import reload_role_keywords_from_disk
+
+        reload_role_keywords_from_disk()
+    except Exception:
+        pass
+
+
+def _sync_label_keywords_to_role_keywords(
+    correction: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    将标误中的 label_keywords 增量写入 sign_role_keywords.json。
+    策略：
+    - 仅在「保存需签角色」时生效；
+    - 若 expected_roles 只有一个角色，关键词全部归属该角色；
+    - 若 expected_roles 多个角色，仅将“与某角色现有同义词明显相关”的关键词落库，避免误扩散。
+    """
+    from sign_handlers.config import role_keywords
+
+    corr = trim_detect_correction(correction)
+    scopes = (
+        corr.get("correction_save")
+        if isinstance(corr.get("correction_save"), dict)
+        else {}
+    )
+    if scopes and not bool(scopes.get("roles", True)):
+        return {"ok": True, "skipped": True, "reason": "roles_scope_disabled"}
+    roles = [r for r in (corr.get("expected_roles") or []) if r in ROLE_ID_TO_KEYWORD]
+    kws = [str(x or "").strip() for x in (corr.get("label_keywords") or []) if str(x or "").strip()]
+    if not roles or not kws:
+        return {"ok": True, "skipped": True, "reason": "no_roles_or_keywords"}
+
+    assign: Dict[str, List[str]] = {}
+    unresolved: List[str] = []
+    if len(roles) == 1:
+        assign[roles[0]] = list(dict.fromkeys(kws))
+    else:
+        for kw in kws:
+            low_kw = re.sub(r"\s+", "", kw).lower()
+            hits: List[str] = []
+            for rid in roles:
+                for base_kw in role_keywords(rid):
+                    low_base = re.sub(r"\s+", "", str(base_kw or "")).lower()
+                    if not low_base:
+                        continue
+                    if low_kw == low_base or low_kw in low_base or low_base in low_kw:
+                        hits.append(rid)
+                        break
+            hits = list(dict.fromkeys(hits))
+            if len(hits) == 1:
+                assign.setdefault(hits[0], []).append(kw)
+            else:
+                unresolved.append(kw)
+    if not assign:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "ambiguous_keywords",
+            "unresolved_keywords": unresolved[:20],
+        }
+
+    raw = _load_role_keywords_raw()
+    roles_node = raw.get("roles")
+    if not isinstance(roles_node, dict):
+        roles_node = {}
+        raw["roles"] = roles_node
+
+    added = 0
+    updated_roles: List[str] = []
+    for rid, add_list in assign.items():
+        add_list = [str(x or "").strip() for x in add_list if str(x or "").strip()]
+        if not add_list:
+            continue
+        spec = roles_node.get(rid)
+        if isinstance(spec, dict):
+            base = spec.get("synonyms")
+            syn = list(base) if isinstance(base, list) else []
+            seen = {str(x).strip() for x in syn if str(x).strip()}
+            for kw in add_list:
+                if kw in seen:
+                    continue
+                syn.append(kw)
+                seen.add(kw)
+                added += 1
+            spec["synonyms"] = syn
+            roles_node[rid] = spec
+        elif isinstance(spec, list):
+            syn = [str(x).strip() for x in spec if str(x).strip()]
+            seen = set(syn)
+            for kw in add_list:
+                if kw in seen:
+                    continue
+                syn.append(kw)
+                seen.add(kw)
+                added += 1
+            roles_node[rid] = syn
+        elif isinstance(spec, str):
+            syn = [spec]
+            seen = {str(spec).strip()}
+            for kw in add_list:
+                if kw in seen:
+                    continue
+                syn.append(kw)
+                seen.add(kw)
+                added += 1
+            roles_node[rid] = syn
+        else:
+            roles_node[rid] = {"synonyms": add_list}
+            added += len(add_list)
+        updated_roles.append(rid)
+
+    if added > 0:
+        _save_role_keywords_raw(raw)
+    return {
+        "ok": True,
+        "added_keywords": added,
+        "updated_roles": sorted(set(updated_roles)),
+        "unresolved_keywords": unresolved[:20],
+    }
 
 
 def correction_to_rule_entry(
@@ -297,6 +437,7 @@ def sync_rules_from_correction(
         if not up.get("ok"):
             return up
         out.update(up)
+        out["role_keyword_sync"] = _sync_label_keywords_to_role_keywords(correction)
         if export_md:
             ex = export_rules_markdown()
             out["md_exported"] = bool(ex.get("ok"))
