@@ -43,6 +43,33 @@ _EXCEL_ABS_MAX_IMG_WIDTH_PX = 1600
 _EXCEL_MAX_UPSCALE = 2.5
 _DATE_LABEL_KEYWORDS = ("日期", "Date")
 _GAP_PX = 6
+_XLSX_HEADER_NOISE_TERMS = (
+    "用例",
+    "步骤",
+    "预期",
+    "结果",
+    "测试结果",
+    "测试人员",
+    "测试人",
+    "执行结果",
+    "执行人员",
+    "执行人",
+    "测试项",
+    "测试内容",
+    "traceability",
+    "requirement",
+)
+_XLSX_SIGNOFF_HINT_TERMS = (
+    "/日期",
+    "日期：",
+    "date:",
+    "编制",
+    "审核",
+    "批准",
+    "复核",
+    "签字",
+    "签名",
+)
 
 
 def _planned_keywords_for_role(
@@ -127,6 +154,27 @@ def _parse_xlsx_row_hint(source_hint: str) -> tuple[int | None, int] | None:
     if m:
         return None, int(m.group(1))
     return None
+
+
+def _xlsx_row_looks_like_header(ws, r: int, *, max_c: Optional[int] = None) -> bool:
+    max_c_use = int(max_c or min(int(ws.max_column or 1), 128))
+    vals = []
+    for c in range(1, max_c_use + 1):
+        v = ws.cell(row=r, column=c).value
+        s = str(v or "").strip()
+        if s:
+            vals.append(s)
+    if len(vals) < 5:
+        return False
+    txt = " | ".join(vals).lower()
+    for h in _XLSX_SIGNOFF_HINT_TERMS:
+        if h in txt:
+            return False
+    hit = 0
+    for t in _XLSX_HEADER_NOISE_TERMS:
+        if t in txt:
+            hit += 1
+    return hit >= 2
 
 
 def _col_width_px(ws, col_idx: int) -> int:

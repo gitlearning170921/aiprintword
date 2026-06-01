@@ -5531,7 +5531,9 @@
                     var okLbl = '已签字';
                     if (hasTail) okLbl += '（文末补签）';
                     if (it.applied_n) okLbl += '（' + it.applied_n + ' 项）';
-                    markRow(fid, '已签字', okLbl);
+                    var okRow = __batchWorkbenchRows[String(fid)];
+                    if (okRow) okRow.tailAppended = !!hasTail;
+                    markRow(fid, hasTail ? '已签字（文末补签）' : '已签字', okLbl);
                   } else {
                     markRow(fid, '签字失败', it.error || '签字失败');
                   }
@@ -5551,6 +5553,38 @@
       })
       .then(function () {
         var res = allResults;
+        // 兜底对账：逐文件回写最终状态，避免因 file_id 形态不一致导致行卡在「签字中…」。
+        if (fbWorkbench && isBatchWorkbenchMode()) {
+          try {
+            var resById = {};
+            var resByName = {};
+            res.forEach(function (it) {
+              if (!it) return;
+              if (it.file_id != null) resById[String(it.file_id)] = it;
+              if (it.name) resByName[String(it.name)] = it;
+            });
+            ids.forEach(function (fid) {
+              var row = __batchWorkbenchRows[String(fid)];
+              if (!row) return;
+              var rec = savedFiles.find(function (x) { return x && String(x.id) === String(fid); });
+              var nm = rec && (rec.name || rec.id) ? String(rec.name || rec.id) : String(fid);
+              var it = resById[String(fid)] || resByName[nm] || null;
+              if (it && it.ok) {
+                var hasTail = Array.isArray(it.tail_appended_roles) && it.tail_appended_roles.length;
+                var okLbl = '已签字';
+                if (hasTail) okLbl += '（文末补签）';
+                if (it.applied_n) okLbl += '（' + it.applied_n + ' 项）';
+                row.tailAppended = !!hasTail;
+                markRow(fid, hasTail ? '已签字（文末补签）' : '已签字', okLbl);
+              } else if (it && !it.ok) {
+                markRow(fid, '签字失败', it.error || '签字失败');
+              } else if (/^签字中/.test(String(row.status || ''))) {
+                // 该文件参与了本批但没有任何返回项，明确标记失败，不再悬挂「签字中」
+                markRow(fid, '签字失败', '未收到该文件的签字结果');
+              }
+            });
+          } catch (_) {}
+        }
         var okn = res.filter(function (x) { return x && x.ok; }).length;
         var failn = res.length - okn;
         var lines = [];
@@ -10743,7 +10777,12 @@
       var f = __wbFilterStatuses[i];
       if (f === '__detect_issues__') {
         if (_isWorkbenchDetectIssueStatus(shown)) return true;
-      } else if (f === bucket) return true;
+      } else if (f === bucket) {
+        return true;
+      } else if (f === '已签字' && bucket === '已签字-文末补签') {
+        // 父项「已签字」涵盖其子集「已签字（文末补签）」
+        return true;
+      }
     }
     return false;
   }

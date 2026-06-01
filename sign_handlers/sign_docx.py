@@ -57,6 +57,47 @@ _REVISION_ROW_NOISE_TERMS = (
     "更改内容",
     "修订内容",
     "变更号",
+    "修订号",
+    "版本号",
+    "版次",
+    "修订内容",
+    "修订说明",
+)
+_REVISION_VERSION_TOKEN_RE = re.compile(
+    r"(?:\b[A-Z]/\d+\b|\bV?\d+(?:\.\d+){1,4}\b|版本\s*[A-Z0-9./-]+)",
+    re.IGNORECASE,
+)
+_REVISION_DATE_TOKEN_RE = re.compile(
+    r"(?:20\d{2}[./-]\d{1,2}[./-]\d{1,2}|日期|Date)",
+    re.IGNORECASE,
+)
+_TABLE_HEADER_NOISE_TERMS = (
+    "用例",
+    "步骤",
+    "预期",
+    "结果",
+    "测试结果",
+    "测试人员",
+    "测试人",
+    "执行结果",
+    "执行人员",
+    "执行人",
+    "测试项",
+    "测试内容",
+    "traceability",
+    "requirement",
+)
+_TABLE_SIGNOFF_HINT_TERMS = (
+    "/日期",
+    "日期：",
+    "Date:",
+    "Date：",
+    "编制",
+    "审核",
+    "批准",
+    "复核",
+    "签字",
+    "签名",
 )
 
 _PIC_WIDTH = Cm(2.8)
@@ -727,13 +768,45 @@ def _is_revision_history_row(cells) -> bool:
     txt = _cells_joined_text(cells)
     if not txt:
         return False
+    txt_l = txt.lower()
     hit = 0
     for term in _REVISION_ROW_NOISE_TERMS:
         if term in txt:
             hit += 1
             if hit >= 2:
                 return True
+    # 仅当出现「变更/修订/更改」这类明确修订动词且带版本/日期特征时才判为修订记录行；
+    # 签批行不会出现这些动词，避免误伤「编制/审核/批准 + 日期」的签批行。
+    if ("变更" in txt or "修订" in txt or "更改" in txt) and (
+        _REVISION_VERSION_TOKEN_RE.search(txt) or _REVISION_DATE_TOKEN_RE.search(txt)
+    ):
+        return True
+    # 英文版修订记录
+    if ("revision" in txt_l or "change history" in txt_l) and _REVISION_DATE_TOKEN_RE.search(txt):
+        return True
     return False
+
+
+def _looks_like_data_table_header_row(cells) -> bool:
+    txt = _cells_joined_text(cells)
+    if not txt:
+        return False
+    txt_l = txt.lower()
+    # 有明确签批提示词时，不按表头拦截
+    for term in _TABLE_SIGNOFF_HINT_TERMS:
+        if term.lower() in txt_l:
+            return False
+    nonempty = 0
+    for c in cells or []:
+        if _cell_text(c):
+            nonempty += 1
+    if nonempty < 5:
+        return False
+    hit = 0
+    for term in _TABLE_HEADER_NOISE_TERMS:
+        if term in txt_l:
+            hit += 1
+    return hit >= 2
 
 
 def _cell_has_table_signoff_reservation(
