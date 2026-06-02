@@ -63,10 +63,13 @@ _XLSX_SIGNOFF_HINT_TERMS = (
     "/日期",
     "日期：",
     "date:",
+    "作者",
     "编制",
     "审核",
     "批准",
     "复核",
+    "测试人员",
+    "执行人员",
     "签字",
     "签名",
 )
@@ -175,6 +178,37 @@ def _xlsx_row_looks_like_header(ws, r: int, *, max_c: Optional[int] = None) -> b
         if t in txt:
             hit += 1
     return hit >= 2
+
+
+def _xlsx_row_is_revision_history(ws, r: int, *, max_c: Optional[int] = None) -> bool:
+    max_c_use = int(max_c or min(int(ws.max_column or 1), 128))
+    vals = []
+    for c in range(1, max_c_use + 1):
+        v = ws.cell(row=r, column=c).value
+        s = str(v or "").strip()
+        if s:
+            vals.append(s)
+    if not vals:
+        return False
+    txt = " | ".join(vals)
+    txt_l = txt.lower()
+    if any(t in txt for t in ("更改历史", "修订记录", "变更记录")):
+        return True
+    if ("变更" in txt or "修订" in txt or "更改" in txt) and re.search(
+        r"20\d{2}[./-]\d{1,2}|版本|版次|A/\d", txt, re.IGNORECASE
+    ):
+        return True
+    if ("revision" in txt_l or "change history" in txt_l) and re.search(
+        r"20\d{2}|日期|date", txt_l
+    ):
+        return True
+    return False
+
+
+def _xlsx_row_skip_for_signoff(ws, r: int, *, max_c: Optional[int] = None) -> bool:
+    return _xlsx_row_is_revision_history(ws, r, max_c=max_c) or _xlsx_row_looks_like_header(
+        ws, r, max_c=max_c
+    )
 
 
 def _col_width_px(ws, col_idx: int) -> int:
@@ -478,6 +512,8 @@ def _try_xlsx_four_column_row(
     ws, r: int, label_c: int, kw: str, sig, dt, max_r: int
 ) -> bool:
     max_c = min(int(ws.max_column or 1), 128)
+    if _xlsx_row_skip_for_signoff(ws, r, max_c=max_c):
+        return False
     if not _is_xlsx_label_blank_date_blank_row(ws, r, label_c, kw, max_c):
         return False
     placed = False
@@ -556,6 +592,8 @@ def _try_xlsx_role_layout_cells(
 
 def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int) -> bool:
     max_c = min(int(ws.max_column or 1), 128)
+    if _xlsx_row_skip_for_signoff(ws, r, max_c=max_c):
+        return False
     for label_c in range(max(1, c - 1), min(c + 2, max_c + 1)):
         if _try_xlsx_four_column_row(ws, r, label_c, kw, sig, dt, max_r):
             return True
@@ -575,7 +613,16 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
     signoff_slot = cell_is_role_signoff_label_slot(val, kw)
     inline_slot = cell_has_label_inline_reservation(val, kw)
     date_ctx = _has_date_context_nearby(ws, r, c, val)
-    if not (signoff_slot or inline_slot or ((has_blank_right or has_blank_below) and date_ctx)):
+    four_col_ok = any(
+        _is_xlsx_label_blank_date_blank_row(ws, r, lc, kw, max_c)
+        for lc in range(max(1, c - 1), min(c + 2, max_c + 1))
+    )
+    if not (
+        signoff_slot
+        or inline_slot
+        or four_col_ok
+        or ((has_blank_right or has_blank_below) and date_ctx and r >= max(1, max_r - 8))
+    ):
         return False
     sig_cell = ws.cell(row=r, column=c + 1)
     inline_x = cell_inline_insert_offset_px(val, kw) if (signoff_slot or inline_slot) else None
@@ -758,10 +805,13 @@ def sign_xlsx(
                     "placed": False,
                     "placed_by": "skip_no_material",
                     "keywords": [],
+                    "attempt_chain": [],
+                    "failure_reason": "未提供签名/日期素材",
                 }
             continue
         placed = False
         placed_by = ""
+        attempt_chain: list[str] = []
         fallback_kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
         planned_kws = _planned_keywords_for_role(role_id, placement_plan)
         planned_hints = _planned_source_hints_for_role(role_id, placement_plan)
@@ -782,11 +832,14 @@ def sign_xlsx(
                 "keywords": kws[:],
                 "source_hints": planned_hints[:],
                 "layout_types": planned_layout_types[:],
+                "attempt_chain": [],
+                "failure_reason": "",
             }
         if (not placed) and placement_plan:
             placed = _try_xlsx_role_layout_cells(
                 wb, role_id, placement_plan, kws, sig, dt_use
             )
+            attempt_chain.append("layout_cells:" + ("ok" if placed else "miss"))
             if placed:
                 placed_by = "layout_cells"
         if planned_hints and kws:
@@ -820,6 +873,7 @@ def sign_xlsx(
                             break
                 if placed:
                     break
+            attempt_chain.append("planned_source_hint:" + ("ok" if placed else "miss"))
         if not placed:
             for kw in kws:
                 if placed:
@@ -829,7 +883,7 @@ def sign_xlsx(
                         break
                     max_r = int(ws.max_row or 1)
                     row_range = (
-                        range(max_r, 0, -1) if max_r > 10 else range(1, max_r + 1)
+                        range(max_r, 0, -1) if max_r > 3 else range(1, max_r + 1)
                     )
                     for r in row_range:
                         if placed:
@@ -838,19 +892,21 @@ def sign_xlsx(
                             if _try_place_at_keyword_cell(ws, r, c, kw, sig, dt_use, max_r):
                                 placed = True
                                 if not placed_by:
-                                    placed_by = (
-                                        "planned_keywords" if planned_kws else "fallback_keywords"
-                                    )
+                                    placed_by = "fallback_keywords"
                                 break
                             if placed:
                                 break
+            attempt_chain.append("global_sheet_scan:" + ("ok" if placed else "miss"))
         if isinstance(placement_result, dict):
             one = placement_result.get(str(role_id)) or {}
+            one["attempt_chain"] = attempt_chain
             one["placed"] = bool(placed)
             if placed:
                 one["placed_by"] = placed_by or "fallback_keywords"
+                one["failure_reason"] = ""
             else:
                 one["placed_by"] = "not_found"
+                one["failure_reason"] = "未命中表格中的角色+日期+右侧/下方留白签字位模式"
             placement_result[str(role_id)] = one
     wb.save(out_path)
     return out_path

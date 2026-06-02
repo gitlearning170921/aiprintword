@@ -44,7 +44,7 @@ from sign_handlers.png_word_compat import (
 # 可见占位字符（作者：____ 等）
 _PLACEHOLDER_CHARS = re.compile(r"^[\s_\-—–\u2014\u2015\u2500\u3000\.·]+$")
 # 右侧「日期」列表头（整格以 Date/日期 开头）
-_DATE_HEADER_CELL = re.compile(r"^\s*(日期|Date)\s*[:：]?\s*", re.IGNORECASE)
+_DATE_HEADER_CELL = re.compile(r"^\s*(测试日期|签署日期|日期|Date)\s*[:：]?\s*", re.IGNORECASE)
 _REVISION_ROW_NOISE_TERMS = (
     "更改历史",
     "修订记录",
@@ -71,6 +71,23 @@ _REVISION_DATE_TOKEN_RE = re.compile(
     r"(?:20\d{2}[./-]\d{1,2}[./-]\d{1,2}|日期|Date)",
     re.IGNORECASE,
 )
+# 封面元数据区常见签批角色（与「文件版本号」同表/同段时不应按修订记录拦截）
+_COVER_SIGNOFF_ROLE_MARKERS = ("作者", "编制", "审核", "批准", "复核", "研发负责人", "审计人")
+# 仅含下列词时才累计「修订记录行」命中（不含裸「版本/版本号/版次」，避免误伤封面）
+_REVISION_CONTENT_TERMS = (
+    "更改历史",
+    "修订记录",
+    "变更记录",
+    "更改日期",
+    "变更日期",
+    "修订日期",
+    "变更内容",
+    "更改内容",
+    "修订内容",
+    "变更号",
+    "修订号",
+    "修订说明",
+)
 _TABLE_HEADER_NOISE_TERMS = (
     "用例",
     "步骤",
@@ -92,6 +109,7 @@ _TABLE_SIGNOFF_HINT_TERMS = (
     "日期：",
     "Date:",
     "Date：",
+    "作者",
     "编制",
     "审核",
     "批准",
@@ -452,6 +470,8 @@ def _place_four_column_row(
     date_png: Optional[bytes],
 ) -> bool:
     """角色 | 姓名空白 | 日期标签 | 日期空白。"""
+    if _docx_row_skip_for_signoff(cells):
+        return False
     if not _is_label_blank_date_blank_row(cells, label_ci, keyword):
         return False
     placed = False
@@ -518,6 +538,8 @@ def _try_docx_role_layout_cells(
             ct = _cell_text(cell)
             if not cell_has_role_keyword(ct, kw):
                 continue
+            if _docx_row_skip_for_signoff(cells):
+                continue
             if _place_four_column_row(cells, ci, sig_png, dt, kw):
                 return True
             if _place_sig_date_at_signoff_anchor(
@@ -576,6 +598,8 @@ def _try_table_adjacent_date_column(
     rows_list = list(table.rows)
     for ri in _table_row_scan_order(table):
         cells = rows_list[ri].cells
+        if _docx_row_skip_for_signoff(cells):
+            continue
         for ci in range(len(cells) - 1):
             left = cells[ci]
             lt = _cell_text(left)
@@ -630,6 +654,56 @@ def _try_table_adjacent_date_column(
     return False
 
 
+def _row_has_cover_signoff_labels(txt: str) -> bool:
+    """封面/扉页签批区：含作者/审核/批准等且带日期标签，不是更改记录表。"""
+    if not txt:
+        return False
+    roles = sum(1 for m in _COVER_SIGNOFF_ROLE_MARKERS if m in txt)
+    if roles < 1:
+        return False
+    return ("日期" in txt) or ("date" in txt.lower())
+
+
+def _try_cover_stack_role_date_inline(
+    p: Paragraph,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """
+    封面竖排同段：… 作者： <空> 日期： <空> 审核： <空> 日期： …（网络安全测试方案/报告等通用封面）。
+    在角色关键词与紧随其后的「日期/Date」标签之间落签名，在日期标签后落日期。
+    """
+    full = _paragraph_full_text(p)
+    kw_end = _find_keyword_in_paragraph(p, keyword)
+    if kw_end < 0:
+        return False
+    seg = full[kw_end:]
+    date_m = re.search(r"(?:日期|Date)\s*[:：]?", seg, re.IGNORECASE)
+    if not date_m:
+        return False
+    date_label_end = kw_end + date_m.end()
+    placed = False
+    if sig_png:
+        sig_rest = full[kw_end : kw_end + date_m.start()].lstrip(" ：:\t")
+        if _is_emptyish_text(sig_rest) or _PLACEHOLDER_CHARS.match(sig_rest.strip()):
+            anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, kw_end)
+            _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, None)
+            placed = True
+    if date_png:
+        date_rest = full[date_label_end:].lstrip(" ：:\t")
+        head = date_rest[:24] if len(date_rest) > 24 else date_rest
+        if _is_emptyish_text(date_rest) or (head and _PLACEHOLDER_CHARS.match(head)):
+            anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, date_label_end)
+            _insert_pictures_after_anchor_run_idx(p, anchor_idx, None, date_png)
+            placed = True
+    if sig_png and not date_png:
+        return placed
+    if date_png:
+        return placed
+    return placed
+
+
 def _try_paragraph_inline(
     p: Paragraph,
     keyword: str,
@@ -637,6 +711,8 @@ def _try_paragraph_inline(
     date_png: Optional[bytes],
 ) -> bool:
     """段落内：关键词后占位符清除并插图，或下划线 run 后插图，否则关键词后追加。"""
+    if _try_cover_stack_role_date_inline(p, keyword, sig_png, date_png):
+        return True
     off = _find_keyword_in_paragraph(p, keyword)
     if off < 0:
         return False
@@ -680,9 +756,37 @@ def _try_paragraph_inline(
 def _table_row_scan_order(table: Table) -> range:
     """宽表（如用例表）从下往上找签批行，避免先命中列头「测试人」。"""
     n = len(table.rows)
-    if n > 10:
+    if n > 3:
         return range(n - 1, -1, -1)
     return range(n)
+
+
+def _docx_row_skip_for_signoff(cells) -> bool:
+    """True = 本行不应落签（修订记录行、宽表列头行）。"""
+    if _is_revision_history_row(cells):
+        return True
+    if _looks_like_data_table_header_row(cells):
+        return True
+    return False
+
+
+def _table_looks_like_revision_history_section(table: Table) -> bool:
+    """整表为更改/修订记录区时不做泛化表格扫描。"""
+    try:
+        rows = list(table.rows)[:4]
+    except Exception:
+        return False
+    for row in rows:
+        cells = row.cells
+        txt = _cells_joined_text(cells)
+        if not txt:
+            continue
+        if any(t in txt for t in ("更改历史", "修订记录", "变更记录")):
+            return True
+        txt_l = txt.lower()
+        if "change history" in txt_l or "revision history" in txt_l:
+            return True
+    return False
 
 
 def _find_date_label_cell_in_row(cells, label_ci: int, rows_list, ri: int):
@@ -769,16 +873,27 @@ def _is_revision_history_row(cells) -> bool:
     if not txt:
         return False
     txt_l = txt.lower()
+    # 封面行常同时出现「文件版本号 A/0」与「作者/审核/批准 + 日期」，不可按修订记录跳过
+    if _row_has_cover_signoff_labels(txt):
+        return False
     hit = 0
-    for term in _REVISION_ROW_NOISE_TERMS:
+    for term in _REVISION_CONTENT_TERMS:
         if term in txt:
             hit += 1
             if hit >= 2:
                 return True
-    # 仅当出现「变更/修订/更改」这类明确修订动词且带版本/日期特征时才判为修订记录行；
-    # 签批行不会出现这些动词，避免误伤「编制/审核/批准 + 日期」的签批行。
+    if any(t in txt for t in ("更改历史", "修订记录", "变更记录")):
+        return True
+    # 仅当出现「变更/修订/更改」这类明确修订动词且带版本/日期特征时才判为修订记录行
     if ("变更" in txt or "修订" in txt or "更改" in txt) and (
         _REVISION_VERSION_TOKEN_RE.search(txt) or _REVISION_DATE_TOKEN_RE.search(txt)
+    ):
+        return True
+    # 数据行：版本 token + 日历日期，且无封面签批角色
+    if (
+        _REVISION_VERSION_TOKEN_RE.search(txt)
+        and re.search(r"20\d{2}[./-]\d{1,2}", txt)
+        and not _row_has_cover_signoff_labels(txt)
     ):
         return True
     # 英文版修订记录
@@ -807,6 +922,63 @@ def _looks_like_data_table_header_row(cells) -> bool:
         if term in txt_l:
             hit += 1
     return hit >= 2
+
+
+def _place_two_row_signoff_pair(
+    label_cell,
+    keyword: str,
+    cells,
+    label_ci: int,
+    rows_list,
+    ri: int,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """
+    两行签批表：角色行右侧空白签名格；下一行同列「日期/Date」标签右侧空白日期格。
+    例：作者 | <空> | 研发负责人 | <空> / 下一行：日期 | <空> | 日期 | <空>
+    """
+    if _docx_row_skip_for_signoff(cells):
+        return False
+    lt = _cell_text(label_cell)
+    if not cell_has_role_keyword(lt, keyword):
+        return False
+    if cell_is_role_signoff_label_slot(lt, keyword):
+        return False
+    if _cell_looks_like_date_header_cell(lt):
+        return False
+    sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
+    if sig_blank is None or not _is_slot_target_text(_cell_text(sig_blank)):
+        return False
+    date_blank = None
+    if ri + 1 < len(rows_list):
+        nrow = rows_list[ri + 1]
+        ncells = list(nrow.cells)
+        for cand_col in (label_ci, label_ci + 1, label_ci + 2):
+            if cand_col >= len(ncells):
+                continue
+            if _cell_looks_like_date_header_cell(_cell_text(ncells[cand_col])):
+                dt = _next_distinct_cell(ncells, cand_col)
+                if dt is not None and _is_slot_target_text(_cell_text(dt)):
+                    date_blank = dt
+                    break
+    placed = False
+    if sig_png:
+        _insert_sig_only_in_empty_cell(sig_blank, sig_png)
+        placed = True
+    if date_png and date_blank is not None:
+        _insert_sig_and_date_in_empty_cell(date_blank, None, date_png)
+        placed = True
+    elif date_png and date_blank is None:
+        below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
+        if below is not None and _is_slot_target_text(_cell_text(below)):
+            _insert_sig_and_date_in_empty_cell(below, None, date_png)
+            placed = True
+    if sig_png and not date_png:
+        return placed
+    if date_png:
+        return bool(placed and (date_blank is not None or sig_png))
+    return placed
 
 
 def _cell_has_table_signoff_reservation(
@@ -852,6 +1024,244 @@ def _cell_has_table_signoff_reservation(
     return False
 
 
+def _insert_sig_and_date_vertical_in_paragraph(
+    p: Paragraph,
+    char_offset: int,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> None:
+    """在同一段落锚点后竖排：签名在上、日期在下（中间换行）。"""
+    anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, char_offset)
+    cur = anchor_idx
+    if sig_png:
+        rs = p.add_run()
+        rs.add_picture(io.BytesIO(sig_png), width=_PIC_WIDTH)
+        _move_run_after_run_idx(p, rs, cur)
+        cur += 1
+        br = p.add_run("\n")
+        _move_run_after_run_idx(p, br, cur)
+        cur += 1
+    if date_png:
+        rd = p.add_run()
+        rd.add_picture(io.BytesIO(date_png), width=_PIC_WIDTH_DATE)
+        _move_run_after_run_idx(p, rd, cur)
+
+
+def _try_signoff_label_underscore_vertical(
+    p: Paragraph,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """「角色/日期：」后仅一段下划线占位：竖排签名在上、日期在下。"""
+    full = _paragraph_full_text(p)
+    if not cell_is_role_signoff_label_slot(full, keyword):
+        return False
+    kw_pos = full.find(str(keyword or ""))
+    if kw_pos < 0:
+        return False
+    tail_from_kw = full[kw_pos:]
+    dm = re.search(r"(?:日期|Date)\s*[:：]?\s*", tail_from_kw, re.IGNORECASE)
+    if not dm:
+        return False
+    label_end = kw_pos + dm.end()
+    tail = full[label_end:]
+    if "\n" in tail or "\r" in tail:
+        return False
+    stripped = tail.strip()
+    if not stripped or not _PLACEHOLDER_CHARS.match(stripped):
+        return False
+    if not sig_png and not date_png:
+        return False
+    _insert_sig_and_date_vertical_in_paragraph(p, label_end, sig_png, date_png)
+    return True
+
+
+def _paragraph_offset_after_newline(full: str, start: int, line_skip: int = 1) -> int:
+    """从 start 起跳过 line_skip 行，返回下一行起始字符偏移。"""
+    pos = max(0, int(start))
+    for _ in range(max(1, int(line_skip))):
+        while pos < len(full) and full[pos] in "\r\n":
+            pos += 1
+        while pos < len(full) and full[pos] not in "\r\n":
+            pos += 1
+    while pos < len(full) and full[pos] in "\r\n":
+        pos += 1
+    return min(pos, len(full))
+
+
+def _try_paragraph_sig_above_date_below(
+    p: Paragraph,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """
+    同段竖排：角色关键词 … [签名留白] … 日期/Date … [日期留白]（测试者在上面、日期在下面）。
+    """
+    full = _paragraph_full_text(p)
+    kw_end = _find_keyword_in_paragraph(p, keyword)
+    if kw_end < 0:
+        return False
+    seg = full[kw_end:]
+    date_m = re.search(r"(?:测试日期|日期|Date)\s*[:：]?", seg, re.IGNORECASE)
+    if not date_m:
+        return False
+    date_label_end = kw_end + date_m.end()
+    placed = False
+    if sig_png:
+        sig_gap = full[kw_end : kw_end + date_m.start()].lstrip(" ：:\t/\r\n")
+        if not sig_gap or _is_emptyish_text(sig_gap) or _PLACEHOLDER_CHARS.match(sig_gap.strip()):
+            anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, kw_end)
+            _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, None)
+            placed = True
+    if date_png:
+        date_rest = full[date_label_end:].lstrip(" ：:\t")
+        head = date_rest[:32] if len(date_rest) > 32 else date_rest
+        if not date_rest or _is_emptyish_text(date_rest) or (head and _PLACEHOLDER_CHARS.match(head)):
+            anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, date_label_end)
+            _insert_pictures_after_anchor_run_idx(p, anchor_idx, None, date_png)
+            placed = True
+    if sig_png and not date_png:
+        return placed
+    if date_png:
+        return placed
+    return placed
+
+
+def _try_signoff_two_line_stack(
+    p: Paragraph,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """签批栏「角色/日期：」下方两行留白：上行签名、下行日期（用例执行表页脚常见）。"""
+    full = _paragraph_full_text(p)
+    if not cell_is_role_signoff_label_slot(full, keyword):
+        return False
+    kw_pos = full.find(str(keyword or ""))
+    if kw_pos < 0:
+        return False
+    tail_from_kw = full[kw_pos:]
+    dm = re.search(r"(?:日期|Date)\s*[:：]?\s*", tail_from_kw, re.IGNORECASE)
+    if not dm:
+        return False
+    label_end = kw_pos + dm.end()
+    tail = full[label_end:]
+    if "\n" not in tail and "\r" not in tail:
+        return False
+    line1_off = _paragraph_offset_after_newline(full, label_end, 1)
+    line2_off = _paragraph_offset_after_newline(full, label_end, 2)
+    if line1_off >= len(full):
+        return False
+    line1_txt = full[line1_off:].splitlines()[0] if full[line1_off:] else ""
+    if line1_txt.strip() and not _PLACEHOLDER_CHARS.match(line1_txt.strip()):
+        return False
+    placed = False
+    if sig_png:
+        anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, line1_off)
+        _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, None)
+        placed = True
+    if date_png and line2_off < len(full):
+        line2_txt = full[line2_off:].splitlines()[0] if full[line2_off:] else ""
+        if (not line2_txt.strip()) or _PLACEHOLDER_CHARS.match(line2_txt.strip()):
+            anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, line2_off)
+            _insert_pictures_after_anchor_run_idx(p, anchor_idx, None, date_png)
+            placed = True
+    if sig_png and not date_png:
+        return placed
+    if date_png:
+        return placed
+    return placed
+
+
+def _try_table_sig_above_date_below(
+    label_cell,
+    keyword: str,
+    cells,
+    label_ci: int,
+    rows_list,
+    ri: int,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """表格：本行落签名，下一行同列或「日期」右侧落日期（文末测试者上/日期下）。"""
+    if _docx_row_skip_for_signoff(cells):
+        return False
+    ct = _cell_text(label_cell)
+    if not cell_has_role_keyword(ct, keyword):
+        return False
+    placed = False
+    for p0 in label_cell.paragraphs:
+        if _try_paragraph_sig_above_date_below(p0, keyword, sig_png, date_png):
+            return True
+        if _try_signoff_two_line_stack(p0, keyword, sig_png, date_png):
+            return True
+        if _try_signoff_label_underscore_vertical(p0, keyword, sig_png, date_png):
+            return True
+    sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
+    if sig_png and sig_blank is not None and _is_slot_target_text(_cell_text(sig_blank)):
+        _insert_sig_only_in_empty_cell(sig_blank, sig_png)
+        placed = True
+    elif sig_png and cell_is_role_signoff_label_slot(ct, keyword):
+        for p0 in label_cell.paragraphs:
+            if _try_signoff_two_line_stack(p0, keyword, sig_png, None):
+                placed = True
+                break
+            if _try_paragraph_sig_above_date_below(p0, keyword, sig_png, None):
+                placed = True
+                break
+            if _try_signoff_label_underscore_vertical(p0, keyword, sig_png, None):
+                placed = True
+                break
+    if not placed and sig_png and ri + 1 < len(rows_list):
+        nrow = rows_list[ri + 1]
+        ncells = list(nrow.cells)
+        if label_ci < len(ncells):
+            sig_cell = ncells[label_ci]
+            sig_t = _cell_text(sig_cell)
+            if _is_slot_target_text(sig_t) and not _cell_looks_like_date_header_cell(sig_t):
+                if not cell_has_role_keyword(sig_t, keyword):
+                    _insert_sig_only_in_empty_cell(sig_cell, sig_png)
+                    placed = True
+    if not date_png:
+        return placed
+    date_blank = None
+    if ri + 1 < len(rows_list):
+        nrow = rows_list[ri + 1]
+        ncells = list(nrow.cells)
+        if label_ci < len(ncells) and _cell_looks_like_date_header_cell(_cell_text(ncells[label_ci])):
+            dt = _next_distinct_cell(ncells, label_ci)
+            if dt is not None and _is_slot_target_text(_cell_text(dt)):
+                date_blank = dt
+        if date_blank is None and label_ci < len(ncells):
+            cand = ncells[label_ci]
+            cand_t = _cell_text(cand)
+            if (
+                _is_slot_target_text(cand_t)
+                and not _cell_looks_like_date_header_cell(cand_t)
+                and not (placed and sig_png and cand is not None)
+            ):
+                if not (sig_png and not placed and cand_t.strip()):
+                    date_blank = cand
+    if date_blank is None and ri + 2 < len(rows_list) and placed:
+        nrow2 = rows_list[ri + 2]
+        ncells2 = list(nrow2.cells)
+        if label_ci < len(ncells2):
+            cand2 = ncells2[label_ci]
+            if _is_slot_target_text(_cell_text(cand2)):
+                date_blank = cand2
+    if date_blank is None:
+        below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
+        if below is not None and _is_slot_target_text(_cell_text(below)):
+            if placed or not sig_png:
+                date_blank = below
+    if date_blank is not None:
+        _insert_sig_and_date_in_empty_cell(date_blank, None, date_png)
+        placed = True
+    return placed
+
+
 def _place_sig_date_at_signoff_anchor(
     label_cell,
     keyword: str,
@@ -867,10 +1277,22 @@ def _place_sig_date_at_signoff_anchor(
     1) 签批栏「角色/日期」：同行第 1 个空白格签名、第 2 个空白格日期（与复核人一致）；
     2) 其它：同行/下方空白格；同格下划线留白；独立 Date/日期 列。
     """
+    if _try_table_sig_above_date_below(
+        label_cell, keyword, cells, label_ci, rows_list, ri, sig_png, date_png
+    ):
+        return True
+    for p0 in label_cell.paragraphs:
+        if _try_cover_stack_role_date_inline(p0, keyword, sig_png, date_png):
+            return True
+    if _place_two_row_signoff_pair(
+        label_cell, keyword, cells, label_ci, rows_list, ri, sig_png, date_png
+    ):
+        return True
     if _place_four_column_row(cells, label_ci, keyword, sig_png, date_png):
         return True
 
     placed_any = False
+    sig_target_cell = None
     ct = _cell_text(label_cell)
     date_cell = _find_date_label_cell_in_row(cells, label_ci, rows_list, ri)
     signoff_slot = cell_is_role_signoff_label_slot(ct, keyword)
@@ -894,16 +1316,23 @@ def _place_sig_date_at_signoff_anchor(
         if row_blanks:
             _insert_sig_and_date_in_empty_cell(row_blanks[0], sig_png, None)
             placed_any = True
+            sig_target_cell = row_blanks[0]
         else:
             sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
             if sig_blank is not None:
                 _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, None)
                 placed_any = True
+                sig_target_cell = sig_blank
         if not placed_any:
             below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
-            if below is not None:
-                _insert_sig_and_date_in_empty_cell(below, sig_png, None)
-                placed_any = True
+            if below is not None and _is_slot_target_text(_cell_text(below)):
+                # 签批栏「日期在下」时，下方格优先留给日期，避免签名/date 颠倒
+                if signoff_slot and date_png and not placed_any:
+                    pass
+                else:
+                    _insert_sig_and_date_in_empty_cell(below, sig_png, None)
+                    placed_any = True
+                    sig_target_cell = below
         if not placed_any and cell_has_label_inline_reservation(ct, keyword):
             if _insert_sig_in_role_cell_for_adjacent_date_column(label_cell, keyword, sig_png):
                 placed_any = True
@@ -913,6 +1342,7 @@ def _place_sig_date_at_signoff_anchor(
                 if date_cell is None or sig_blank._tc != date_cell._tc:
                     _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, None)
                     placed_any = True
+                    sig_target_cell = sig_blank
         if not placed_any and signoff_slot and cell_has_signoff_inline_reservation(
             ct, keyword
         ):
@@ -960,6 +1390,19 @@ def _place_sig_date_at_signoff_anchor(
             for p0 in label_cell.paragraphs:
                 if _try_paragraph_inline(p0, keyword, sig_png, date_png):
                     return True
+        elif signoff_slot and not date_placed:
+            for p0 in label_cell.paragraphs:
+                if _try_signoff_two_line_stack(p0, keyword, None, date_png):
+                    date_placed = True
+                    break
+                if _try_signoff_label_underscore_vertical(p0, keyword, None, date_png):
+                    date_placed = True
+                    break
+            if not date_placed:
+                below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
+                if below is not None and _is_slot_target_text(_cell_text(below)):
+                    _insert_sig_and_date_in_empty_cell(below, None, date_png)
+                    date_placed = True
         elif not sig_png:
             for p0 in label_cell.paragraphs:
                 off = _find_keyword_in_paragraph(p0, keyword)
@@ -968,6 +1411,19 @@ def _place_sig_date_at_signoff_anchor(
                     _insert_pictures_in_paragraph(p0, None, date_png)
                     date_placed = True
                     break
+        # 通用兜底：存在角色+日期标签，但无独立日期列时，日期追加到签名格或最近空白格。
+        if not date_placed and placed_any:
+            fb = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
+            if fb is None:
+                fb = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
+            if fb is not None and _is_slot_target_text(_cell_text(fb)):
+                if sig_target_cell is not None and getattr(fb, "_tc", None) == getattr(
+                    sig_target_cell, "_tc", None
+                ):
+                    _append_date_to_cell(fb, date_png)
+                else:
+                    _insert_sig_and_date_in_empty_cell(fb, None, date_png)
+                date_placed = True
         if date_placed:
             placed_any = True
 
@@ -1002,6 +1458,8 @@ def _try_table_role(
     date_png: Optional[bytes],
     role_id: str = "",
 ) -> bool:
+    if _table_looks_like_revision_history_section(table):
+        return False
     if _try_table_four_column_scan(table, keyword, sig_png, date_png):
         return True
     if _try_table_adjacent_date_column(table, keyword, sig_png, date_png):
@@ -1229,6 +1687,8 @@ def sign_docx(
         base, ext = os.path.splitext(path)
         out_path = f"{base}_signed{ext}"
     doc = Document(path)
+    body_paras = _iter_body_paragraphs(doc)
+    tail_paras = body_paras[-40:] if len(body_paras) > 40 else body_paras
 
     sig_map: dict = {}
     date_map: dict = {}
@@ -1266,14 +1726,18 @@ def sign_docx(
                     "placed": False,
                     "placed_by": "",
                     "keywords": [],
+                    "attempt_chain": [],
+                    "failure_reason": "",
                 },
             )
         if not sig and not dt_use:
             if isinstance(role_result, dict):
                 role_result["placed"] = False
                 role_result["placed_by"] = "skip_no_material"
+                role_result["failure_reason"] = "未提供签名/日期素材"
             continue
         done = False
+        attempt_chain: list[str] = []
         fallback_kws = sorted(role_keywords_for_apply(role_id), key=lambda x: len(x), reverse=True)
         planned_kws = _planned_keywords_for_role(role_id, placement_plan)
         planned_hints = _planned_source_hints_for_role(role_id, placement_plan)
@@ -1295,9 +1759,10 @@ def sign_docx(
             done = _try_docx_role_layout_cells(
                 doc, role_id, placement_plan, kws, sig, dt_use
             )
+            attempt_chain.append("layout_cells:" + ("ok" if done else "miss"))
             if done:
                 placed_by = "layout_cells"
-        if ("two_row_signoff_table" in planned_layout_types) and kws:
+        if ("footer_sig_above_date" in planned_layout_types or "below_cell" in planned_layout_types) and kws:
             for kw in kws:
                 if done:
                     break
@@ -1306,40 +1771,128 @@ def sign_docx(
                         done = True
                         placed_by = "planned_layout_type"
                         break
-        if (not done) and planned_hints and kws:
-            done = _try_docx_plan_placement(doc, kws, planned_hints, sig, dt_use)
-            if done:
-                placed_by = "planned_source_hint"
-        if not done:
+            attempt_chain.append("planned_layout_type:" + ("ok" if done else "miss"))
+        if ("two_row_signoff_table" in planned_layout_types) and kws and not done:
             for kw in kws:
                 if done:
                     break
                 for table in tables:
                     if _try_table_role(table, kw, sig, dt_use, role_id=role_id):
                         done = True
-                        if not placed_by:
-                            placed_by = (
-                                "planned_keywords" if planned_kws else "fallback_keywords"
-                            )
+                        placed_by = "planned_layout_type"
                         break
+            attempt_chain.append("planned_two_row_layout:" + ("ok" if done else "miss"))
+        if (not done) and planned_hints and kws:
+            done = _try_docx_plan_placement(doc, kws, planned_hints, sig, dt_use)
+            attempt_chain.append("planned_source_hint:" + ("ok" if done else "miss"))
+            if done:
+                placed_by = "planned_source_hint"
+        if (not done) and kws:
+            # 1) 封面优先：先扫正文前段中带角色+日期标签的签批段
+            cover_scope = body_paras[:24] if len(body_paras) > 24 else body_paras
+            for kw in kws:
                 if done:
                     break
-                for p in _iter_body_paragraphs(doc):
+                for p in cover_scope:
+                    txt = _paragraph_full_text(p)
+                    if not _row_has_cover_signoff_labels(txt):
+                        continue
+                    if _find_keyword_in_paragraph(p, kw) < 0:
+                        continue
+                    if _try_paragraph_inline(p, kw, sig, dt_use):
+                        done = True
+                        placed_by = "fallback_keywords_cover"
+                        break
+            attempt_chain.append("cover_paragraph:" + ("ok" if done else "miss"))
+        if (not done) and kws:
+            # 2) 表格任意位置
+            for kw in kws:
+                if done:
+                    break
+                for table in tables:
+                    if _try_table_role(table, kw, sig, dt_use, role_id=role_id):
+                        done = True
+                        placed_by = "fallback_keywords_table"
+                        break
+            attempt_chain.append("table_scan:" + ("ok" if done else "miss"))
+        if (not done) and kws:
+            # 3) 表格末尾：仅扫每表最后 8 行，适配“表格末尾签批”
+            for kw in kws:
+                if done:
+                    break
+                for table in tables:
+                    if _table_looks_like_revision_history_section(table):
+                        continue
+                    rows_list = list(table.rows)
+                    if not rows_list:
+                        continue
+                    end_ri = len(rows_list) - 1
+                    start_ri = max(0, len(rows_list) - 8)
+                    for ri in range(end_ri, start_ri - 1, -1):
+                        row_cells = list(rows_list[ri].cells)
+                        if _docx_row_skip_for_signoff(row_cells):
+                            continue
+                        for ci, cell in enumerate(row_cells):
+                            ct = _cell_text(cell)
+                            if not _cell_has_table_signoff_reservation(
+                                ct, kw, row_cells, ci, rows_list, ri
+                            ):
+                                continue
+                            if _place_sig_date_at_signoff_anchor(
+                                cell, kw, row_cells, ci, rows_list, ri, sig, dt_use
+                            ):
+                                done = True
+                                placed_by = "fallback_keywords_table_tail"
+                                break
+                        if done:
+                            break
+                    if done:
+                        break
+            attempt_chain.append("table_tail_scan:" + ("ok" if done else "miss"))
+        if (not done) and kws:
+            # 4) 正文末尾：反向扫描尾部段落
+            for kw in kws:
+                if done:
+                    break
+                for p in reversed(tail_paras):
+                    if _find_keyword_in_paragraph(p, kw) < 0:
+                        continue
+                    if _try_paragraph_inline(p, kw, sig, dt_use):
+                        done = True
+                        placed_by = "fallback_keywords_body_tail"
+                        break
+            attempt_chain.append("body_tail_paragraph:" + ("ok" if done else "miss"))
+        if not done:
+            for kw in kws:
+                if done:
+                    break
+                for p in body_paras:
                     if _find_keyword_in_paragraph(p, kw) < 0:
                         continue
                     if _try_paragraph_inline(p, kw, sig, dt_use):
                         done = True
                         if not placed_by:
-                            placed_by = (
-                                "planned_keywords" if planned_kws else "fallback_keywords"
-                            )
+                            placed_by = "fallback_keywords"
                         break
                 if done:
                     break
                 for table in tables:
+                    if _try_table_role(table, kw, sig, dt_use, role_id=role_id):
+                        done = True
+                        if not placed_by:
+                            placed_by = "fallback_keywords"
+                        break
+                if done:
+                    break
+                for table in tables:
+                    if _table_looks_like_revision_history_section(table):
+                        continue
                     rows_list = list(table.rows)
-                    for ri, row in enumerate(rows_list):
+                    for ri in _table_row_scan_order(table):
+                        row = rows_list[ri]
                         row_cells = list(row.cells)
+                        if _docx_row_skip_for_signoff(row_cells):
+                            continue
                         for ci, cell in enumerate(row_cells):
                             ct = _cell_text(cell)
                             if not _cell_has_table_signoff_reservation(
@@ -1351,21 +1904,25 @@ def sign_docx(
                             ):
                                 done = True
                                 if not placed_by:
-                                    placed_by = (
-                                        "planned_keywords" if planned_kws else "fallback_keywords"
-                                    )
+                                    placed_by = "fallback_keywords"
                                 break
                         if done:
                             break
                     if done:
                         break
+            attempt_chain.append("global_fallback_scan:" + ("ok" if done else "miss"))
 
         if isinstance(role_result, dict):
+            role_result["attempt_chain"] = attempt_chain
             role_result["placed"] = bool(done)
             if done:
                 role_result["placed_by"] = placed_by or "fallback_keywords"
+                role_result["failure_reason"] = ""
             else:
                 role_result["placed_by"] = "not_found"
+                role_result["failure_reason"] = (
+                    "未命中封面/表格/表格末尾/正文末尾中的角色+日期+留白签字位模式"
+                )
 
     doc.save(out_path)
     return out_path

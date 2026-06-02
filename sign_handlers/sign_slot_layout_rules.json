@@ -280,9 +280,23 @@
       ]
     },
     {
+      "pattern": "用例执行表",
+      "match": "contains",
+      "note": "文末页脚：测试者签名在上、测试日期在下（换行竖排）",
+      "date_relation": "paragraph_inline",
+      "date_position": "below",
+      "separator": "newline",
+      "date_layout_forms": [
+        "签名在上、日期在下（换行）"
+      ],
+      "layout_types": [
+        "footer_sig_above_date"
+      ]
+    },
+    {
       "pattern": "单元测试用例执行表",
       "match": "contains",
-      "note": "人工签字位标误：日期位未识别出来；未指定",
+      "note": "人工签字位标误：日期位未识别；文末签名在上、日期在下",
       "source_example": "附件 单元测试用例执行表（A0）.docx",
       "learned_from_correction": true,
       "date_relation": "paragraph_inline",
@@ -291,9 +305,11 @@
       "arrangement_label": "未指定",
       "signature_slot_forms": [],
       "date_layout_forms": [
-        "与角色同一单元格/字段标记"
+        "签名在上、日期在下（换行）"
       ],
-      "layout_types": []
+      "layout_types": [
+        "footer_sig_above_date"
+      ]
     },
     {
       "pattern": "ECGAP-SOP003  成品检验作业指导书",
@@ -304,6 +320,15 @@
     }
   ],
   "layout_priority_rules": [
+    {
+      "layout_type": "footer_sig_above_date",
+      "priority": 90,
+      "match_contains": [
+        "签名在上、日期在下（换行）",
+        "footer_sig_above_date"
+      ],
+      "description": "页脚/文末：测试者签名在上、测试日期在下"
+    },
     {
       "layout_type": "two_row_signoff_table",
       "priority": 100,

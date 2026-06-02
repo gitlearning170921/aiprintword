@@ -3372,6 +3372,7 @@ def _layout_to_plan_types(layout_item):
     if rel == "different_cell" and pos == "right":
         out.append("adjacent_right_cell")
     if pos == "below":
+        out.append("footer_sig_above_date")
         out.append("below_cell")
     return out
 
@@ -3977,7 +3978,8 @@ def _sign_process_document_bytes(
                 missing_roles.append(rid_s)
                 continue
             placed_roles.append(rid_s)
-            if str(one.get("placed_by") or "") == "fallback_keywords":
+            placed_by_val = str(one.get("placed_by") or "")
+            if placed_by_val.startswith("fallback_keywords"):
                 fallback_roles.append(rid_s)
         tail_appended_roles = []
         if missing_roles and ext == ".docx":
@@ -7689,10 +7691,29 @@ def _build_signed_zip_summary_text(
             detail = []
             miss = [str(x) for x in (it.get("missing_roles") or []) if str(x).strip()]
             tail = [str(x) for x in (it.get("tail_appended_roles") or []) if str(x).strip()]
+            per = it.get("per_role_results") if isinstance(it.get("per_role_results"), dict) else {}
             if miss:
                 detail.append("未落位角色：" + "、".join(miss))
             if tail:
                 detail.append("文末补签：" + "、".join(tail))
+            if per:
+                role_lines = []
+                for rid, one in per.items():
+                    if not isinstance(one, dict) or one.get("placed"):
+                        continue
+                    why = str(one.get("failure_reason") or "").strip()
+                    placed_by = str(one.get("placed_by") or "").strip() or "not_found"
+                    chain = one.get("attempt_chain") if isinstance(one.get("attempt_chain"), list) else []
+                    chain_txt = " -> ".join(str(x) for x in chain if str(x).strip())[:400]
+                    line = f"{rid}（{placed_by}"
+                    if why:
+                        line += f"，{why}"
+                    if chain_txt:
+                        line += f"，链路={chain_txt}"
+                    line += "）"
+                    role_lines.append(line)
+                if role_lines:
+                    detail.append("识别失败原因：" + "；".join(role_lines[:8]))
             failed_items.append((nm, err, detail))
         if failed_items:
             lines.append("")

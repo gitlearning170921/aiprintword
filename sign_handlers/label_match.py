@@ -99,14 +99,17 @@ def iter_role_label_lines(cell_text) -> List[str]:
     return lines
 
 
-# 签批栏「测试人/日期」「复核人/日期」；区别于用例表列头仅「测试人」
-_SIGNOFF_DATE_IN_LABEL_RE = re.compile(r"[/／]\s*日期|日期\s*[:：]", re.IGNORECASE)
+# 签批栏「测试人/日期」「编制及日期」「批准人和日期」等；区别于用例表列头仅「测试人」
+_SIGNOFF_DATE_IN_LABEL_RE = re.compile(
+    r"(?:[/／]|及|和|与)\s*(?:测试日期|签署日期|日期|date)|(?:测试日期|签署日期|日期|date)\s*[:：]",
+    re.IGNORECASE,
+)
 
 
 def _signoff_role_date_label_end_offset(text: str, keyword: str) -> int:
     """
-    识别「角色/日期[:：]」标签结束位置。
-    例如：测试人/日期：____、Reviewer/Date: ____。
+    识别「角色 + 连接词 + 日期[:：]」标签结束位置。
+    例如：测试人/日期：____、编制及日期：____、Reviewer and Date: ____。
     """
     s = str(text or "")
     kw = str(keyword or "").strip()
@@ -115,16 +118,12 @@ def _signoff_role_date_label_end_offset(text: str, keyword: str) -> int:
     esc = re.escape(kw)
     ascii_only = all(ord(c) < 128 for c in kw)
     use_word_boundary = ascii_only and bool(re.match(r"^[A-Za-z0-9_]+$", kw))
+    joiner = r"(?:[/／]|及|和|与|and)"
+    date_tag = r"(?:测试日期|签署日期|日期|date)"
     if use_word_boundary:
-        m = re.search(
-            r"(?i)\b" + esc + r"\b\s*[/／]\s*(?:日期|date)\s*[:：]?",
-            s,
-        )
+        m = re.search(r"(?i)\b" + esc + r"\b\s*" + joiner + r"\s*" + date_tag + r"\s*[:：]?", s)
     else:
-        m = re.search(
-            r"(?i)" + esc + r"\s*[/／]\s*(?:日期|date)\s*[:：]?",
-            s,
-        )
+        m = re.search(r"(?i)" + esc + r"\s*" + joiner + r"\s*" + date_tag + r"\s*[:：]?", s)
     return m.end() if m else -1
 
 

@@ -1910,7 +1910,12 @@
           var one = it.per_role_results[rid] || {};
           if (one && one.placed) return;
           var why = one && one.placed_by ? String(one.placed_by) : 'not_found';
-          missLines.push(rid + '（' + why + '）');
+          var reason = one && one.failure_reason ? String(one.failure_reason) : '';
+          if (reason) {
+            missLines.push(rid + '（' + why + '，' + reason + '）');
+          } else {
+            missLines.push(rid + '（' + why + '）');
+          }
         });
         if (missLines.length) {
           failParts.push('  角色明细：' + missLines.join('；'));

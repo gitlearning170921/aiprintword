@@ -51,6 +51,9 @@ def _esl_to_vocabulary(esl: Dict[str, Any]) -> Dict[str, Any]:
             date_layout_forms.append("日期在右侧隔列单元格")
     elif rel == "paragraph_inline":
         date_layout_forms.append("与角色同一单元格/字段标记")
+        if pos == "below":
+            date_layout_forms.append("签名在上、日期在下（换行）")
+            layout_types.append("footer_sig_above_date")
 
     if sep == "slash" and "与角色同一单元格/字段标记" not in date_layout_forms:
         date_layout_forms.append("与角色同一单元格/字段标记")
