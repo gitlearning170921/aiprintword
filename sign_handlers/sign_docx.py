@@ -76,8 +76,12 @@ _COVER_SIGNOFF_ROLE_MARKERS = ("作者", "编制", "审核", "批准", "复核",
 # 仅含下列词时才累计「修订记录行」命中（不含裸「版本/版本号/版次」，避免误伤封面）
 _REVISION_CONTENT_TERMS = (
     "更改历史",
+    "更改记录",
+    "修订历史",
+    "修订履历",
     "修订记录",
     "变更记录",
+    "版本变更",
     "更改日期",
     "变更日期",
     "修订日期",
@@ -87,6 +91,15 @@ _REVISION_CONTENT_TERMS = (
     "变更号",
     "修订号",
     "修订说明",
+)
+_REVISION_SECTION_TERMS = (
+    "更改历史",
+    "更改记录",
+    "修订记录",
+    "修订历史",
+    "修订履历",
+    "变更记录",
+    "版本变更",
 )
 _TABLE_HEADER_NOISE_TERMS = (
     "用例",
@@ -172,6 +185,17 @@ def _run_has_underline_or_border(r) -> bool:
     except Exception:
         pass
     return False
+
+
+def _cell_has_drawing(cell) -> bool:
+    """单元格内是否已存在图片，防止后续角色串位覆盖。"""
+    try:
+        tc = getattr(cell, "_tc", None)
+        if tc is None:
+            return False
+        return bool(tc.xpath(".//w:drawing"))
+    except Exception:
+        return False
 
 
 def _find_keyword_in_paragraph(p: Paragraph, keyword: str) -> int:
@@ -658,6 +682,11 @@ def _row_has_cover_signoff_labels(txt: str) -> bool:
     """封面/扉页签批区：含作者/审核/批准等且带日期标签，不是更改记录表。"""
     if not txt:
         return False
+    txt_l = txt.lower()
+    if any(t in txt for t in _REVISION_SECTION_TERMS):
+        return False
+    if "revision" in txt_l or "change history" in txt_l:
+        return False
     roles = sum(1 for m in _COVER_SIGNOFF_ROLE_MARKERS if m in txt)
     if roles < 1:
         return False
@@ -773,7 +802,7 @@ def _docx_row_skip_for_signoff(cells) -> bool:
 def _table_looks_like_revision_history_section(table: Table) -> bool:
     """整表为更改/修订记录区时不做泛化表格扫描。"""
     try:
-        rows = list(table.rows)[:4]
+        rows = list(table.rows)[:10]
     except Exception:
         return False
     for row in rows:
@@ -781,10 +810,15 @@ def _table_looks_like_revision_history_section(table: Table) -> bool:
         txt = _cells_joined_text(cells)
         if not txt:
             continue
-        if any(t in txt for t in ("更改历史", "修订记录", "变更记录")):
+        if any(t in txt for t in _REVISION_SECTION_TERMS):
             return True
         txt_l = txt.lower()
-        if "change history" in txt_l or "revision history" in txt_l:
+        if (
+            "change history" in txt_l
+            or "revision history" in txt_l
+            or "revision record" in txt_l
+            or "version change" in txt_l
+        ):
             return True
     return False
 
@@ -821,6 +855,8 @@ def _iter_reserved_blank_cells_same_row(cells, label_ci: int, keyword: str):
         except Exception:
             pass
         t = _cell_text(c2)
+        if _cell_has_drawing(c2):
+            continue
         if _cell_looks_like_date_header_cell(t):
             continue
         if (
@@ -853,9 +889,12 @@ def _first_reserved_blank_cell_below(rows_list, ri: int, label_ci: int):
     nrow = rows_list[ri + 1]
     for cand_col in (label_ci, label_ci + 1, label_ci + 2):
         if cand_col < len(nrow.cells):
-            t = _cell_text(nrow.cells[cand_col])
+            c2 = nrow.cells[cand_col]
+            if _cell_has_drawing(c2):
+                continue
+            t = _cell_text(c2)
             if _is_slot_target_text(t) and not _cell_looks_like_date_header_cell(t):
-                return nrow.cells[cand_col]
+                return c2
     return None
 
 
@@ -873,17 +912,16 @@ def _is_revision_history_row(cells) -> bool:
     if not txt:
         return False
     txt_l = txt.lower()
-    # 封面行常同时出现「文件版本号 A/0」与「作者/审核/批准 + 日期」，不可按修订记录跳过
-    if _row_has_cover_signoff_labels(txt):
-        return False
+    if any(t in txt for t in _REVISION_SECTION_TERMS):
+        return True
+    if "change history" in txt_l or "revision history" in txt_l:
+        return True
     hit = 0
     for term in _REVISION_CONTENT_TERMS:
         if term in txt:
             hit += 1
             if hit >= 2:
                 return True
-    if any(t in txt for t in ("更改历史", "修订记录", "变更记录")):
-        return True
     # 仅当出现「变更/修订/更改」这类明确修订动词且带版本/日期特征时才判为修订记录行
     if ("变更" in txt or "修订" in txt or "更改" in txt) and (
         _REVISION_VERSION_TOKEN_RE.search(txt) or _REVISION_DATE_TOKEN_RE.search(txt)
@@ -948,7 +986,11 @@ def _place_two_row_signoff_pair(
     if _cell_looks_like_date_header_cell(lt):
         return False
     sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
-    if sig_blank is None or not _is_slot_target_text(_cell_text(sig_blank)):
+    if (
+        sig_blank is None
+        or _cell_has_drawing(sig_blank)
+        or not _is_slot_target_text(_cell_text(sig_blank))
+    ):
         return False
     date_blank = None
     if ri + 1 < len(rows_list):
@@ -959,26 +1001,36 @@ def _place_two_row_signoff_pair(
                 continue
             if _cell_looks_like_date_header_cell(_cell_text(ncells[cand_col])):
                 dt = _next_distinct_cell(ncells, cand_col)
-                if dt is not None and _is_slot_target_text(_cell_text(dt)):
+                if (
+                    dt is not None
+                    and (not _cell_has_drawing(dt))
+                    and _is_slot_target_text(_cell_text(dt))
+                ):
                     date_blank = dt
                     break
-    placed = False
+    sig_placed = False
+    date_placed = False
     if sig_png:
         _insert_sig_only_in_empty_cell(sig_blank, sig_png)
-        placed = True
+        sig_placed = True
     if date_png and date_blank is not None:
         _insert_sig_and_date_in_empty_cell(date_blank, None, date_png)
-        placed = True
+        date_placed = True
     elif date_png and date_blank is None:
         below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
         if below is not None and _is_slot_target_text(_cell_text(below)):
+            if _cell_has_drawing(below):
+                below = None
+        if below is not None:
             _insert_sig_and_date_in_empty_cell(below, None, date_png)
-            placed = True
+            date_placed = True
     if sig_png and not date_png:
-        return placed
-    if date_png:
-        return bool(placed and (date_blank is not None or sig_png))
-    return placed
+        return sig_placed
+    if date_png and not sig_png:
+        return date_placed
+    if sig_png and date_png:
+        return bool(sig_placed and date_placed)
+    return False
 
 
 def _cell_has_table_signoff_reservation(
@@ -1108,25 +1160,28 @@ def _try_paragraph_sig_above_date_below(
     if not date_m:
         return False
     date_label_end = kw_end + date_m.end()
-    placed = False
+    sig_placed = False
+    date_placed = False
     if sig_png:
         sig_gap = full[kw_end : kw_end + date_m.start()].lstrip(" ：:\t/\r\n")
         if not sig_gap or _is_emptyish_text(sig_gap) or _PLACEHOLDER_CHARS.match(sig_gap.strip()):
             anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, kw_end)
             _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, None)
-            placed = True
+            sig_placed = True
     if date_png:
         date_rest = full[date_label_end:].lstrip(" ：:\t")
         head = date_rest[:32] if len(date_rest) > 32 else date_rest
         if not date_rest or _is_emptyish_text(date_rest) or (head and _PLACEHOLDER_CHARS.match(head)):
             anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, date_label_end)
             _insert_pictures_after_anchor_run_idx(p, anchor_idx, None, date_png)
-            placed = True
+            date_placed = True
     if sig_png and not date_png:
-        return placed
-    if date_png:
-        return placed
-    return placed
+        return sig_placed
+    if date_png and not sig_png:
+        return date_placed
+    if sig_png and date_png:
+        return bool(sig_placed and date_placed)
+    return False
 
 
 def _try_signoff_two_line_stack(
@@ -1157,22 +1212,25 @@ def _try_signoff_two_line_stack(
     line1_txt = full[line1_off:].splitlines()[0] if full[line1_off:] else ""
     if line1_txt.strip() and not _PLACEHOLDER_CHARS.match(line1_txt.strip()):
         return False
-    placed = False
+    sig_placed = False
+    date_placed = False
     if sig_png:
         anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, line1_off)
         _insert_pictures_after_anchor_run_idx(p, anchor_idx, sig_png, None)
-        placed = True
+        sig_placed = True
     if date_png and line2_off < len(full):
         line2_txt = full[line2_off:].splitlines()[0] if full[line2_off:] else ""
         if (not line2_txt.strip()) or _PLACEHOLDER_CHARS.match(line2_txt.strip()):
             anchor_idx = _truncate_after_offset_and_get_anchor_run_idx(p, line2_off)
             _insert_pictures_after_anchor_run_idx(p, anchor_idx, None, date_png)
-            placed = True
+            date_placed = True
     if sig_png and not date_png:
-        return placed
-    if date_png:
-        return placed
-    return placed
+        return sig_placed
+    if date_png and not sig_png:
+        return date_placed
+    if sig_png and date_png:
+        return bool(sig_placed and date_placed)
+    return False
 
 
 def _try_table_sig_above_date_below(
@@ -1191,7 +1249,8 @@ def _try_table_sig_above_date_below(
     ct = _cell_text(label_cell)
     if not cell_has_role_keyword(ct, keyword):
         return False
-    placed = False
+    sig_placed = False
+    date_placed = False
     for p0 in label_cell.paragraphs:
         if _try_paragraph_sig_above_date_below(p0, keyword, sig_png, date_png):
             return True
@@ -1200,45 +1259,61 @@ def _try_table_sig_above_date_below(
         if _try_signoff_label_underscore_vertical(p0, keyword, sig_png, date_png):
             return True
     sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
-    if sig_png and sig_blank is not None and _is_slot_target_text(_cell_text(sig_blank)):
+    if (
+        sig_png
+        and sig_blank is not None
+        and (not _cell_has_drawing(sig_blank))
+        and _is_slot_target_text(_cell_text(sig_blank))
+    ):
         _insert_sig_only_in_empty_cell(sig_blank, sig_png)
-        placed = True
+        sig_placed = True
     elif sig_png and cell_is_role_signoff_label_slot(ct, keyword):
         for p0 in label_cell.paragraphs:
             if _try_signoff_two_line_stack(p0, keyword, sig_png, None):
-                placed = True
+                sig_placed = True
                 break
             if _try_paragraph_sig_above_date_below(p0, keyword, sig_png, None):
-                placed = True
+                sig_placed = True
                 break
             if _try_signoff_label_underscore_vertical(p0, keyword, sig_png, None):
-                placed = True
+                sig_placed = True
                 break
-    if not placed and sig_png and ri + 1 < len(rows_list):
+    if (not sig_placed) and sig_png and ri + 1 < len(rows_list):
         nrow = rows_list[ri + 1]
         ncells = list(nrow.cells)
         if label_ci < len(ncells):
             sig_cell = ncells[label_ci]
             sig_t = _cell_text(sig_cell)
-            if _is_slot_target_text(sig_t) and not _cell_looks_like_date_header_cell(sig_t):
+            if (
+                _is_slot_target_text(sig_t)
+                and (not _cell_has_drawing(sig_cell))
+                and not _cell_looks_like_date_header_cell(sig_t)
+            ):
                 if not cell_has_role_keyword(sig_t, keyword):
                     _insert_sig_only_in_empty_cell(sig_cell, sig_png)
-                    placed = True
+                    sig_placed = True
     if not date_png:
-        return placed
+        return sig_placed
+    if sig_png and not sig_placed:
+        return False
     date_blank = None
     if ri + 1 < len(rows_list):
         nrow = rows_list[ri + 1]
         ncells = list(nrow.cells)
         if label_ci < len(ncells) and _cell_looks_like_date_header_cell(_cell_text(ncells[label_ci])):
             dt = _next_distinct_cell(ncells, label_ci)
-            if dt is not None and _is_slot_target_text(_cell_text(dt)):
+            if (
+                dt is not None
+                and (not _cell_has_drawing(dt))
+                and _is_slot_target_text(_cell_text(dt))
+            ):
                 date_blank = dt
         if date_blank is None and label_ci < len(ncells):
             cand = ncells[label_ci]
             cand_t = _cell_text(cand)
             if (
                 _is_slot_target_text(cand_t)
+                and (not _cell_has_drawing(cand))
                 and not _cell_looks_like_date_header_cell(cand_t)
                 and not (placed and sig_png and cand is not None)
             ):
@@ -1249,17 +1324,25 @@ def _try_table_sig_above_date_below(
         ncells2 = list(nrow2.cells)
         if label_ci < len(ncells2):
             cand2 = ncells2[label_ci]
-            if _is_slot_target_text(_cell_text(cand2)):
+            if _is_slot_target_text(_cell_text(cand2)) and (not _cell_has_drawing(cand2)):
                 date_blank = cand2
     if date_blank is None:
         below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
-        if below is not None and _is_slot_target_text(_cell_text(below)):
+        if (
+            below is not None
+            and (not _cell_has_drawing(below))
+            and _is_slot_target_text(_cell_text(below))
+        ):
             if placed or not sig_png:
                 date_blank = below
     if date_blank is not None:
         _insert_sig_and_date_in_empty_cell(date_blank, None, date_png)
-        placed = True
-    return placed
+        date_placed = True
+    if sig_png and date_png:
+        return bool(sig_placed and date_placed)
+    if date_png and not sig_png:
+        return date_placed
+    return sig_placed
 
 
 def _place_sig_date_at_signoff_anchor(
@@ -1292,6 +1375,8 @@ def _place_sig_date_at_signoff_anchor(
         return True
 
     placed_any = False
+    sig_placed = False
+    date_placed = False
     sig_target_cell = None
     ct = _cell_text(label_cell)
     date_cell = _find_date_label_cell_in_row(cells, label_ci, rows_list, ri)
@@ -1316,32 +1401,45 @@ def _place_sig_date_at_signoff_anchor(
         if row_blanks:
             _insert_sig_and_date_in_empty_cell(row_blanks[0], sig_png, None)
             placed_any = True
+            sig_placed = True
             sig_target_cell = row_blanks[0]
         else:
             sig_blank = _first_reserved_blank_cell_same_row(cells, label_ci, keyword)
-            if sig_blank is not None:
+            if sig_blank is not None and (not _cell_has_drawing(sig_blank)):
                 _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, None)
                 placed_any = True
+                sig_placed = True
                 sig_target_cell = sig_blank
         if not placed_any:
             below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
-            if below is not None and _is_slot_target_text(_cell_text(below)):
+            if (
+                below is not None
+                and (not _cell_has_drawing(below))
+                and _is_slot_target_text(_cell_text(below))
+            ):
                 # 签批栏「日期在下」时，下方格优先留给日期，避免签名/date 颠倒
                 if signoff_slot and date_png and not placed_any:
                     pass
                 else:
                     _insert_sig_and_date_in_empty_cell(below, sig_png, None)
                     placed_any = True
+                    sig_placed = True
                     sig_target_cell = below
         if not placed_any and cell_has_label_inline_reservation(ct, keyword):
             if _insert_sig_in_role_cell_for_adjacent_date_column(label_cell, keyword, sig_png):
                 placed_any = True
+                sig_placed = True
         if not placed_any and signoff_slot:
             sig_blank = _next_distinct_cell(cells, label_ci)
-            if sig_blank is not None and _is_slot_target_text(_cell_text(sig_blank)):
+            if (
+                sig_blank is not None
+                and (not _cell_has_drawing(sig_blank))
+                and _is_slot_target_text(_cell_text(sig_blank))
+            ):
                 if date_cell is None or sig_blank._tc != date_cell._tc:
                     _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, None)
                     placed_any = True
+                    sig_placed = True
                     sig_target_cell = sig_blank
         if not placed_any and signoff_slot and cell_has_signoff_inline_reservation(
             ct, keyword
@@ -1349,6 +1447,7 @@ def _place_sig_date_at_signoff_anchor(
             for p0 in label_cell.paragraphs:
                 if _try_paragraph_inline(p0, keyword, sig_png, None):
                     placed_any = True
+                    sig_placed = True
                     break
 
     if date_png:
@@ -1360,6 +1459,9 @@ def _place_sig_date_at_signoff_anchor(
             except Exception:
                 dt_target = None
             if dt_target is not None and _is_slot_target_text(_cell_text(dt_target)):
+                if _cell_has_drawing(dt_target):
+                    dt_target = None
+            if dt_target is not None:
                 _insert_sig_and_date_in_empty_cell(dt_target, None, date_png)
                 date_placed = True
             elif _insert_date_only_in_date_cell(date_cell, date_png):
@@ -1400,7 +1502,11 @@ def _place_sig_date_at_signoff_anchor(
                     break
             if not date_placed:
                 below = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
-                if below is not None and _is_slot_target_text(_cell_text(below)):
+                if (
+                    below is not None
+                    and (not _cell_has_drawing(below))
+                    and _is_slot_target_text(_cell_text(below))
+                ):
                     _insert_sig_and_date_in_empty_cell(below, None, date_png)
                     date_placed = True
         elif not sig_png:
@@ -1417,6 +1523,9 @@ def _place_sig_date_at_signoff_anchor(
             if fb is None:
                 fb = _first_reserved_blank_cell_below(rows_list, ri, label_ci)
             if fb is not None and _is_slot_target_text(_cell_text(fb)):
+                if _cell_has_drawing(fb):
+                    fb = None
+            if fb is not None:
                 if sig_target_cell is not None and getattr(fb, "_tc", None) == getattr(
                     sig_target_cell, "_tc", None
                 ):
@@ -1432,7 +1541,17 @@ def _place_sig_date_at_signoff_anchor(
         if sig_blank is not None:
             _insert_sig_and_date_in_empty_cell(sig_blank, sig_png, date_png)
             placed_any = True
+            if sig_png:
+                sig_placed = True
+            if date_png:
+                date_placed = True
 
+    if sig_png and date_png:
+        return bool(sig_placed and date_placed)
+    if sig_png:
+        return sig_placed
+    if date_png:
+        return date_placed
     return placed_any
 
 
@@ -1468,6 +1587,35 @@ def _try_table_role(
     for ri in _table_row_scan_order(table):
         row = rows_list[ri]
         cells = row.cells
+        for ci, cell in enumerate(cells):
+            ct = _cell_text(cell)
+            if not _cell_has_table_signoff_reservation(ct, keyword, cells, ci, rows_list, ri):
+                continue
+            if _place_sig_date_at_signoff_anchor(
+                cell, keyword, cells, ci, rows_list, ri, sig_png, date_png
+            ):
+                return True
+    return False
+
+
+def _try_cover_table_role(
+    table: Table,
+    keyword: str,
+    sig_png: Optional[bytes],
+    date_png: Optional[bytes],
+) -> bool:
+    """封面签批表优先：前几行中按「角色 + 右侧/下方日期」规则尝试落位。"""
+    if _table_looks_like_revision_history_section(table):
+        return False
+    rows_list = list(table.rows)
+    top_n = min(len(rows_list), 14)
+    for ri in range(0, top_n):
+        cells = list(rows_list[ri].cells)
+        if _docx_row_skip_for_signoff(cells):
+            continue
+        row_txt = _cells_joined_text(cells)
+        if not _row_has_cover_signoff_labels(row_txt):
+            continue
         for ci, cell in enumerate(cells):
             ct = _cell_text(cell)
             if not _cell_has_table_signoff_reservation(ct, keyword, cells, ci, rows_list, ri):
@@ -1787,6 +1935,17 @@ def sign_docx(
             attempt_chain.append("planned_source_hint:" + ("ok" if done else "miss"))
             if done:
                 placed_by = "planned_source_hint"
+        if (not done) and kws:
+            cover_tables = _iter_tables(doc)[:10]
+            for kw in kws:
+                if done:
+                    break
+                for tb in cover_tables:
+                    if _try_cover_table_role(tb, kw, sig, dt_use):
+                        done = True
+                        placed_by = "fallback_keywords_cover_table"
+                        break
+            attempt_chain.append("cover_table_scan:" + ("ok" if done else "miss"))
         if (not done) and kws:
             # 1) 封面优先：先扫正文前段中带角色+日期标签的签批段
             cover_scope = body_paras[:24] if len(body_paras) > 24 else body_paras

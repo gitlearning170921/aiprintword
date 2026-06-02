@@ -19,6 +19,20 @@ def _rest_is_blank_or_placeholder(rest: str) -> bool:
     return bool(_PLACEHOLDER_TAIL_RE.match(rest))
 
 
+def _rest_is_signoff_date_phrase(rest: str) -> bool:
+    """识别「及日期/和日期/与日期//日期」这类签批标签尾巴。"""
+    s = str(rest or "").strip()
+    if not s:
+        return False
+    return bool(
+        re.match(
+            r"^(?:[/／]|及|和|与|and)\s*(?:测试日期|签署日期|日期|date)\s*[:：]?$",
+            s,
+            re.IGNORECASE,
+        )
+    )
+
+
 def cell_text_matches_keyword(cell_text, keyword: str) -> bool:
     """
     单元格整格为「标签」时成立，例如：Author、Author:、作者、编制人：、编制人____（无冒号仅下划线/空格留位）。
@@ -41,6 +55,9 @@ def cell_text_matches_keyword(cell_text, keyword: str) -> bool:
         return True
     # 「编制人____」「Author ___」等同格标签+留空，无冒号
     if m_full and _rest_is_blank_or_placeholder(m_full.group(1)):
+        return True
+    # 「编制及日期」「批准人/日期」等签批标签
+    if m_full and _rest_is_signoff_date_phrase(m_full.group(1)):
         return True
     return False
 
@@ -66,6 +83,8 @@ def xlsx_cell_has_leading_role_keyword(cell_text, keyword: str) -> bool:
         m = re.match(r"^\s*" + esc + r"(.*)$", s, re.IGNORECASE)
         if m and _rest_is_blank_or_placeholder(m.group(1)):
             return True
+        if m and _rest_is_signoff_date_phrase(m.group(1)):
+            return True
         return bool(re.match(r"^\s*" + esc + r"\s*$", s, re.IGNORECASE))
     if not s.startswith(kw):
         return False
@@ -73,6 +92,8 @@ def xlsx_cell_has_leading_role_keyword(cell_text, keyword: str) -> bool:
     if not rest:
         return True
     if _rest_is_blank_or_placeholder(rest):
+        return True
+    if _rest_is_signoff_date_phrase(rest):
         return True
     if rest[0] in (":", "："):
         return True

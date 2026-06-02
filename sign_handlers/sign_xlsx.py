@@ -409,6 +409,26 @@ def _clear_slot_cell_and_anchor(ws, cell):
     return target, _merged_top_left_coordinate(ws, target)
 
 
+def _cell_has_existing_image(ws, cell) -> bool:
+    """目标单元格是否已有图片（防串位覆盖）。"""
+    try:
+        imgs = list(getattr(ws, "_images", None) or [])
+    except Exception:
+        imgs = []
+    if not imgs:
+        return False
+    r0 = int(cell.row) - 1
+    c0 = int(cell.column) - 1
+    for img in imgs:
+        anc = getattr(img, "anchor", None)
+        marker = getattr(anc, "_from", None)
+        if marker is None:
+            continue
+        if int(getattr(marker, "row", -1)) == r0 and int(getattr(marker, "col", -1)) == c0:
+            return True
+    return False
+
+
 def _add_png_after_label_in_cell(
     ws, png_bytes: bytes, cell, offset_x_px: int, max_w: int = _EXCEL_ABS_MAX_IMG_WIDTH_PX
 ) -> None:
@@ -516,36 +536,42 @@ def _try_xlsx_four_column_row(
         return False
     if not _is_xlsx_label_blank_date_blank_row(ws, r, label_c, kw, max_c):
         return False
-    placed = False
+    sig_placed = False
+    date_placed = False
     sig_cell = ws.cell(row=r, column=label_c + 1)
     date_hdr = ws.cell(row=r, column=label_c + 2)
     date_cell = ws.cell(row=r, column=label_c + 3)
-    if sig and _is_slot_target(sig_cell.value):
+    if sig and _is_slot_target(sig_cell.value) and not _cell_has_existing_image(ws, sig_cell):
         sig_slot, sig_anchor = _clear_slot_cell_and_anchor(ws, sig_cell)
         _add_png(ws, sig, sig_anchor, sig_slot)
-        placed = True
+        sig_placed = True
     if dt:
-        if _is_slot_target(date_cell.value):
+        if _is_slot_target(date_cell.value) and not _cell_has_existing_image(ws, date_cell):
             date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
             _add_png(ws, dt, date_anchor, date_slot)
-            placed = True
+            date_placed = True
         else:
             d_inline = cell_inline_insert_offset_px(date_hdr.value, "Date")
             if d_inline is None:
                 d_inline = cell_inline_insert_offset_px(date_hdr.value, "日期")
             if d_inline is not None:
                 _add_png_after_label_in_cell(ws, dt, date_hdr, d_inline)
-                placed = True
+                date_placed = True
             elif _is_slot_target(ws.cell(row=r, column=label_c + 4).value):
                 dc2 = ws.cell(row=r, column=label_c + 4)
-                dc2_slot, dc2_anchor = _clear_slot_cell_and_anchor(ws, dc2)
-                _add_png(ws, dt, dc2_anchor, dc2_slot)
-                placed = True
+                if _cell_has_existing_image(ws, dc2):
+                    dc2 = None
+                if dc2 is not None:
+                    dc2_slot, dc2_anchor = _clear_slot_cell_and_anchor(ws, dc2)
+                    _add_png(ws, dt, dc2_anchor, dc2_slot)
+                    date_placed = True
     if sig and not dt:
-        return placed
-    if dt:
-        return placed
-    return placed
+        return sig_placed
+    if dt and not sig:
+        return date_placed
+    if sig and dt:
+        return bool(sig_placed and date_placed)
+    return False
 
 
 def _try_xlsx_role_layout_cells(
@@ -621,12 +647,12 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
         signoff_slot
         or inline_slot
         or four_col_ok
-        or ((has_blank_right or has_blank_below) and date_ctx and r >= max(1, max_r - 8))
+        or ((has_blank_right or has_blank_below) and date_ctx)
     ):
         return False
     sig_cell = ws.cell(row=r, column=c + 1)
     inline_x = cell_inline_insert_offset_px(val, kw) if (signoff_slot or inline_slot) else None
-    if sig and (not _is_slot_target(sig_cell.value)):
+    if sig and ((not _is_slot_target(sig_cell.value)) or _cell_has_existing_image(ws, sig_cell)):
         if inline_x is None:
             return False
     date_label_cell, date_cell = _find_date_cell_same_row(ws, r, c)
@@ -653,24 +679,28 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
         sig_placed = True
     if sig and not sig_placed:
         if _is_slot_target(sig_cell.value):
-            sig_slot, sig_anchor = _clear_slot_cell_and_anchor(ws, sig_cell)
-            _add_png(
-                ws,
-                sig,
-                sig_anchor,
-                sig_slot,
-            )
-            sig_placed = True
+            if _cell_has_existing_image(ws, sig_cell):
+                sig_cell = None
+            if sig_cell is not None:
+                sig_slot, sig_anchor = _clear_slot_cell_and_anchor(ws, sig_cell)
+                _add_png(
+                    ws,
+                    sig,
+                    sig_anchor,
+                    sig_slot,
+                )
+                sig_placed = True
         if not sig_placed and has_blank_below:
             below = ws.cell(row=r + 1, column=c)
-            below_slot, below_anchor = _clear_slot_cell_and_anchor(ws, below)
-            _add_png(
-                ws,
-                sig,
-                below_anchor,
-                below_slot,
-            )
-            sig_placed = True
+            if not _cell_has_existing_image(ws, below):
+                below_slot, below_anchor = _clear_slot_cell_and_anchor(ws, below)
+                _add_png(
+                    ws,
+                    sig,
+                    below_anchor,
+                    below_slot,
+                )
+                sig_placed = True
         if not sig_placed:
             sig_inline_x = cell_inline_insert_offset_px(cell.value, kw)
             if sig_inline_x is not None:
@@ -696,6 +726,8 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                 ):
                     break
                 if _is_slot_target(dv):
+                    if _cell_has_existing_image(ws, dcell):
+                        continue
                     dcell_slot, dcell_anchor = _clear_slot_cell_and_anchor(ws, dcell)
                     _add_png(
                         ws,
@@ -727,6 +759,7 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
             and not signoff_slot
             and date_cell is not None
             and _is_slot_target(date_cell.value)
+            and not _cell_has_existing_image(ws, date_cell)
         ):
             date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
             _add_png(ws, dt, date_anchor, date_slot)
@@ -741,12 +774,13 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                 _add_png_after_label_in_cell(ws, dt, date_label_cell, date_inline_x)
                 date_placed = True
             elif date_cell is not None:
-                date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
-                _add_png(ws, dt, date_anchor, date_slot)
-                date_placed = True
+                if not _cell_has_existing_image(ws, date_cell):
+                    date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
+                    _add_png(ws, dt, date_anchor, date_slot)
+                    date_placed = True
             elif (not _is_slot_target(sig_cell.value)) and sig:
                 dnext = ws.cell(row=r, column=c + 2)
-                if _is_slot_target(dnext.value):
+                if _is_slot_target(dnext.value) and not _cell_has_existing_image(ws, dnext):
                     dnext_slot, dnext_anchor = _clear_slot_cell_and_anchor(ws, dnext)
                     _add_png(
                         ws,
@@ -755,12 +789,23 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                         dnext_slot,
                     )
                     date_placed = True
-            if not date_placed:
+            if (
+                not date_placed
+                and r + 1 <= max_r
+                and _is_slot_target(ws.cell(row=r + 1, column=c + 1).value)
+                and not _cell_has_existing_image(ws, ws.cell(row=r + 1, column=c + 1))
+            ):
                 below = f"{get_column_letter(c + 1)}{r + 1}"
                 below_cell = ws.cell(row=r + 1, column=c + 1)
                 _add_png(ws, dt, below, below_cell)
                 date_placed = True
-    return bool(sig_placed or date_placed)
+    if sig and dt:
+        return bool(sig_placed and date_placed)
+    if sig:
+        return sig_placed
+    if dt:
+        return date_placed
+    return False
 
 
 def sign_xlsx(
