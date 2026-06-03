@@ -650,7 +650,7 @@
       white-space: normal;
     }
     .batch-workbench-table .col-op {
-      width: 7.5%;
+      width: 9%;
       white-space: normal;
     }
     .batch-workbench-table .col-op .btn {
@@ -662,6 +662,32 @@
       line-height: 1.2;
       white-space: normal;
       word-break: break-all;
+    }
+    .batch-workbench-table .col-op .wb-dl-wrap {
+      margin-top: 4px;
+      padding-top: 4px;
+      border-top: 1px solid var(--border);
+    }
+    .batch-workbench-table .col-op .wb-dl-title {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+      line-height: 1.2;
+    }
+    .batch-workbench-table .col-op .wb-dl-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px;
+    }
+    .batch-workbench-table .col-op .wb-dl-btn {
+      display: inline-block !important;
+      width: auto !important;
+      min-width: 0;
+      margin: 0 !important;
+      padding: 2px 3px !important;
+      font-size: 0.65rem !important;
+      line-height: 1.15;
+      word-break: keep-all;
     }
     .batch-workbench-table .col-material .batch-wb-mat-badge {
       display: inline-block;
@@ -1402,7 +1428,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js?v=138';
+      s.src = (p || '') + '/js/sign-page.js?v=139';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +
