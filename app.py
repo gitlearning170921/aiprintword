@@ -7024,6 +7024,102 @@ def api_sign_stroke_item_get(item_id):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/sign/files/<file_id>/role-material-png", methods=["POST"])
+def api_sign_file_role_material_png(file_id):
+    """导出与自动签字落位同缩放比例的 PNG，供工作台手动贴图。"""
+    if not _SIGN_FILE_ID_RE.match(file_id or ""):
+        return jsonify({"ok": False, "error": "无效的文件 id"}), 400
+    data = request.get_json(silent=True) or {}
+    role_id = str(data.get("role") or "").strip()
+    kind = str(data.get("kind") or "sig").strip().lower()
+    map_override = data.get("map")
+    doc_date_fallback = str(data.get("doc_date") or "").strip()
+    from sign_handlers import ROLE_ID_TO_KEYWORD
+
+    if role_id not in ROLE_ID_TO_KEYWORD:
+        return jsonify({"ok": False, "error": f"无效角色 id: {role_id}"}), 400
+    if kind not in ("sig", "date"):
+        return jsonify({"ok": False, "error": "kind 须为 sig 或 date"}), 400
+    try:
+        file_bytes = None
+        ext = ".docx"
+        det = {}
+        pair: dict = {}
+        export_kw: dict = {}
+        if _sign_using_mysql():
+            from sign_handlers import mysql_store
+
+            mysql_store.ensure_sign_mysql()
+            row = mysql_store.get_file_row(file_id)
+            if not row or not row.get("file_data"):
+                err = (row.get("file_load_error") or "").strip() if row else ""
+                return jsonify({"ok": False, "error": err or "未找到该文件"}), 404
+            file_bytes = row["file_data"]
+            ext = (row.get("ext") or ".docx").lower()
+            if isinstance(map_override, dict):
+                pair = map_override.get(role_id) if isinstance(map_override.get(role_id), dict) else {}
+            else:
+                mapping = mysql_store.get_file_role_signer_map(file_id) or {}
+                pair = mapping.get(role_id) if isinstance(mapping.get(role_id), dict) else {}
+            det = mysql_store.get_file_detect_snapshot(file_id) or {}
+            export_kw = {"using_mysql": True, "mysql_store": mysql_store}
+        else:
+            _sign_ensure_session_inbox()
+            sid = session["sign_inbox_sid"]
+            rec = _sign_find_record(file_id)
+            if not rec:
+                return jsonify({"ok": False, "error": "未找到该文件"}), 404
+            ext = (rec.get("ext") or ".docx").lower()
+            source_path = _sign_saved_disk_path(sid, file_id, ext)
+            if not os.path.isfile(source_path):
+                return jsonify({"ok": False, "error": "文件内容缺失"}), 404
+            with open(source_path, "rb") as fp:
+                file_bytes = fp.read()
+            from sign_handlers.sign_library_local import get_file_role_map as local_get_map
+            from sign_handlers.sign_library_local import get_stroke_item_bytes as local_get_item_fn
+            from sign_handlers.sign_library_local import get_file_detect_snapshot as local_get_det
+
+            if isinstance(map_override, dict):
+                pair = map_override.get(role_id) if isinstance(map_override.get(role_id), dict) else {}
+            else:
+                mapping = local_get_map(SIGN_INBOX_ROOT, sid, file_id) or {}
+                pair = mapping.get(role_id) if isinstance(mapping.get(role_id), dict) else {}
+            det = local_get_det(SIGN_INBOX_ROOT, sid, file_id) or {}
+            export_kw = {
+                "using_mysql": False,
+                "mysql_store": None,
+                "local_get_item": local_get_item_fn,
+                "inbox_root": SIGN_INBOX_ROOT,
+                "sid": sid,
+            }
+        if ext not in SIGN_ALLOWED_EXT:
+            return jsonify({"ok": False, "error": "不支持的文件类型"}), 400
+        if isinstance(pair, dict) and doc_date_fallback and not (pair.get("date_iso") or "").strip():
+            pair = dict(pair)
+            pair["date_iso"] = doc_date_fallback[:10]
+        placement_plan = _build_placement_plan_from_detect(det, [role_id])
+        from sign_handlers.material_png_export import export_role_material_png
+
+        png_b, err = export_role_material_png(
+            file_bytes=file_bytes,
+            ext=ext,
+            role_id=role_id,
+            kind=kind,
+            pair=pair if isinstance(pair, dict) else {},
+            placement_plan=placement_plan,
+            **export_kw,
+        )
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        if not png_b:
+            return jsonify({"ok": False, "error": "无法生成图片"}), 400
+        resp = send_file(io.BytesIO(png_b), mimetype="image/png")
+        resp.headers["X-Insert-Scale"] = "docx" if ext in (".docx", ".doc") else "xlsx"
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/sign/files/<file_id>/role-map", methods=["GET"])
 def api_sign_file_role_map_get(file_id):
     if not _SIGN_FILE_ID_RE.match(file_id or ""):

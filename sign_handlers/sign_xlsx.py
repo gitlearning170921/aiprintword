@@ -73,6 +73,27 @@ _XLSX_SIGNOFF_HINT_TERMS = (
     "签字",
     "签名",
 )
+_XLSX_COVER_SHEET_TITLES = frozenset(
+    {"封面", "cover", "cover page", "coverpage", "扉页", "首页"}
+)
+_XLSX_COVER_SIGNOFF_ROLE_MARKERS = (
+    "作者",
+    "编制",
+    "编写",
+    "审核",
+    "复核",
+    "批准",
+    "审计",
+    "签字",
+    "签名",
+)
+_XLSX_REVISION_SECTION_TERMS = (
+    "更改历史",
+    "修订记录",
+    "变更记录",
+    "更改记录",
+    "修订历史",
+)
 
 
 def _planned_keywords_for_role(
@@ -279,6 +300,25 @@ def _fit_to_box_excel(w: int, h: int, max_w: int, max_h: int) -> tuple[int, int]
     return max(1, int(round(w * s))), max(1, int(round(h * s)))
 
 
+def compute_xlsx_insert_pixel_size(
+    png_bytes: bytes,
+    ws,
+    layout_cell,
+    *,
+    inline_offset_px: int = 0,
+    max_w: int = _EXCEL_ABS_MAX_IMG_WIDTH_PX,
+) -> tuple[int, int]:
+    """与 _add_png / _add_png_after_label_in_cell 落位时一致的像素宽高。"""
+    img = XLImage(io.BytesIO(png_bytes))
+    w = int(getattr(img, "width", None) or max_w)
+    h = int(getattr(img, "height", None) or int(max_w * 0.35))
+    cell_w, cell_h = _merged_span_box_px(ws, layout_cell)
+    avail_w = max(28, cell_w - int(inline_offset_px) - 4)
+    max_w2 = min(int(max_w), int(avail_w), _excel_content_max_width_px(cell_w))
+    max_h2 = max(14, int(cell_h) - 4)
+    return _fit_to_box_excel(w, h, max_w2, max_h2)
+
+
 def _find_date_cell_same_row(ws, r: int, author_col: int):
     """同行查找「Date / 日期」标签格与其右侧空白格。"""
     max_col = min(ws.max_column or 0, 64)
@@ -289,7 +329,7 @@ def _find_date_cell_same_row(ws, r: int, author_col: int):
         for dkw in _DATE_LABEL_KEYWORDS:
             if cell_text_matches_keyword(cl.value, dkw):
                 dc = ws.cell(row=r, column=col + 1)
-                if _is_emptyish(dc.value):
+                if _is_xlsx_slot_target(ws, dc):
                     return cl, dc
                 return cl, None
     return None, None
@@ -309,6 +349,144 @@ def _is_emptyish(v) -> bool:
 def _is_slot_target(v) -> bool:
     """签名/日期可落位目标：空白占位，或可替换的电脑输入值。"""
     return _is_emptyish(v) or is_replaceable_prefilled_slot_text(str(v or ""))
+
+
+def _cell_has_underline_blank_slot(cell) -> bool:
+    """Excel 封面常见：单元格值为空但带下边框，表示待签字位。"""
+    try:
+        if not _is_emptyish(cell.value):
+            return False
+        border = getattr(cell, "border", None)
+        if border is None:
+            return False
+        bottom = getattr(border, "bottom", None)
+        style = getattr(bottom, "style", None) if bottom is not None else None
+        return bool(style)
+    except Exception:
+        return False
+
+
+def _is_xlsx_slot_target(ws, cell) -> bool:
+    """Excel 签字位：空白/占位符，或仅下划线边框的空格。"""
+    if _is_slot_target(cell.value):
+        return True
+    return _cell_has_underline_blank_slot(cell)
+
+
+def _xlsx_row_join_text(ws, r: int, *, max_c: Optional[int] = None) -> str:
+    max_c_use = int(max_c or min(int(ws.max_column or 1), 128))
+    vals = []
+    for c in range(1, max_c_use + 1):
+        v = ws.cell(row=r, column=c).value
+        s = str(v or "").strip()
+        if s:
+            vals.append(s)
+    return " | ".join(vals)
+
+
+def _xlsx_row_has_cover_signoff_labels(ws, r: int, *, max_c: Optional[int] = None) -> bool:
+    """封面/扉页签批行：含作者/审核/批准等且带日期标签，不是更改记录表。"""
+    txt = _xlsx_row_join_text(ws, r, max_c=max_c)
+    if not txt:
+        return False
+    txt_l = txt.lower()
+    if any(t in txt for t in _XLSX_REVISION_SECTION_TERMS):
+        return False
+    if "revision" in txt_l or "change history" in txt_l:
+        return False
+    roles = sum(1 for m in _XLSX_COVER_SIGNOFF_ROLE_MARKERS if m in txt)
+    if roles < 1:
+        return False
+    return ("日期" in txt) or ("date" in txt_l)
+
+
+def _xlsx_ws_is_cover_sheet(ws) -> bool:
+    t = str(getattr(ws, "title", "") or "").strip().lower()
+    if t in _XLSX_COVER_SHEET_TITLES:
+        return True
+    if t.startswith("cover") or t.endswith("cover"):
+        return True
+    return False
+
+
+def _xlsx_ws_has_cover_signoff_block(ws) -> bool:
+    max_c = min(int(ws.max_column or 1), 128)
+    max_r = min(int(ws.max_row or 1), 48)
+    hits = 0
+    for r in range(1, max_r + 1):
+        if _xlsx_row_has_cover_signoff_labels(ws, r, max_c=max_c):
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
+
+def _iter_xlsx_cover_worksheets(wb):
+    seen = set()
+    out = []
+    for ws in wb.worksheets:
+        if _xlsx_ws_is_cover_sheet(ws):
+            key = id(ws)
+            if key not in seen:
+                seen.add(key)
+                out.append(ws)
+    if out:
+        return out
+    for ws in wb.worksheets[: min(len(wb.worksheets), 3)]:
+        if _xlsx_ws_has_cover_signoff_block(ws):
+            key = id(ws)
+            if key not in seen:
+                seen.add(key)
+                out.append(ws)
+    return out
+
+
+def _parse_xlsx_signoff_row_layout(
+    ws, r: int, label_c: int, kw: str, max_c: int
+) -> Optional[dict]:
+    """
+    解析签批行布局：角色 | 签名空白 | (可选空列) | 日期标签 | 日期空白。
+    兼容 ECGAP-NSA 等封面：角色与日期间可有空列，签名格可为仅下划线边框的空单元格。
+    """
+    lv = ws.cell(row=r, column=label_c).value
+    if not cell_has_role_keyword(str(lv or ""), kw):
+        return None
+    sig_col = label_c + 1
+    if sig_col > max_c:
+        return None
+    sig_cell = ws.cell(row=r, column=sig_col)
+    if not _is_xlsx_slot_target(ws, sig_cell):
+        return None
+    for dc in range(label_c + 2, min(label_c + 8, max_c + 1)):
+        dv = ws.cell(row=r, column=dc).value
+        if not (
+            cell_text_matches_keyword(dv, "日期")
+            or cell_text_matches_keyword(dv, "Date")
+            or cell_looks_like_signoff_date_label(dv)
+        ):
+            continue
+        date_hdr = ws.cell(row=r, column=dc)
+        date_col = dc + 1
+        if date_col <= max_c:
+            date_cell = ws.cell(row=r, column=date_col)
+            if _is_xlsx_slot_target(ws, date_cell):
+                return {
+                    "sig_col": sig_col,
+                    "date_label_col": dc,
+                    "date_col": date_col,
+                    "date_inline": None,
+                }
+        d_inline = cell_inline_insert_offset_px(dv, "Date")
+        if d_inline is None:
+            d_inline = cell_inline_insert_offset_px(dv, "日期")
+        if d_inline is not None:
+            return {
+                "sig_col": sig_col,
+                "date_label_col": dc,
+                "date_col": None,
+                "date_inline": d_inline,
+            }
+    return None
 
 
 def _has_date_context_nearby(ws, r: int, c: int, val) -> bool:
@@ -510,67 +688,71 @@ def _add_sig_and_date_after_label_in_cell(
 def _is_xlsx_label_blank_date_blank_row(
     ws, r: int, label_c: int, kw: str, max_c: int
 ) -> bool:
-    """Excel 四列：角色 | 姓名空白 | 日期 | 日期空白。"""
+    """Excel 签批行：角色 | 签名空白 | (可选空列) | 日期标签 | 日期空白。"""
     if label_c + 3 > max_c:
         return False
-    lv = ws.cell(row=r, column=label_c).value
-    if not cell_has_role_keyword(str(lv or ""), kw):
-        return False
-    if not _is_slot_target(ws.cell(row=r, column=label_c + 1).value):
-        return False
-    dv = ws.cell(row=r, column=label_c + 2).value
-    if not (
-        cell_text_matches_keyword(dv, "日期")
-        or cell_text_matches_keyword(dv, "Date")
-        or cell_looks_like_signoff_date_label(dv)
-    ):
-        return False
-    return _is_slot_target(ws.cell(row=r, column=label_c + 3).value)
+    return _parse_xlsx_signoff_row_layout(ws, r, label_c, kw, max_c) is not None
 
 
-def _try_xlsx_four_column_row(
-    ws, r: int, label_c: int, kw: str, sig, dt, max_r: int
+def _try_xlsx_signoff_row_layout(
+    ws, r: int, label_c: int, kw: str, sig, dt, max_r: int, *, max_c: Optional[int] = None
 ) -> bool:
-    max_c = min(int(ws.max_column or 1), 128)
-    if _xlsx_row_skip_for_signoff(ws, r, max_c=max_c):
+    max_c_use = int(max_c or min(int(ws.max_column or 1), 128))
+    if _xlsx_row_skip_for_signoff(ws, r, max_c=max_c_use):
         return False
-    if not _is_xlsx_label_blank_date_blank_row(ws, r, label_c, kw, max_c):
+    layout = _parse_xlsx_signoff_row_layout(ws, r, label_c, kw, max_c_use)
+    if not layout:
         return False
     sig_placed = False
     date_placed = False
-    sig_cell = ws.cell(row=r, column=label_c + 1)
-    date_hdr = ws.cell(row=r, column=label_c + 2)
-    date_cell = ws.cell(row=r, column=label_c + 3)
-    if sig and _is_slot_target(sig_cell.value) and not _cell_has_existing_image(ws, sig_cell):
+    sig_cell = ws.cell(row=r, column=int(layout["sig_col"]))
+    date_hdr = ws.cell(row=r, column=int(layout["date_label_col"]))
+    date_col = layout.get("date_col")
+    date_cell = ws.cell(row=r, column=int(date_col)) if date_col else None
+    if sig and not _cell_has_existing_image(ws, sig_cell):
         sig_slot, sig_anchor = _clear_slot_cell_and_anchor(ws, sig_cell)
         _add_png(ws, sig, sig_anchor, sig_slot)
         sig_placed = True
     if dt:
-        if _is_slot_target(date_cell.value) and not _cell_has_existing_image(ws, date_cell):
+        if date_cell is not None and not _cell_has_existing_image(ws, date_cell):
             date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
             _add_png(ws, dt, date_anchor, date_slot)
             date_placed = True
-        else:
-            d_inline = cell_inline_insert_offset_px(date_hdr.value, "Date")
-            if d_inline is None:
-                d_inline = cell_inline_insert_offset_px(date_hdr.value, "日期")
-            if d_inline is not None:
-                _add_png_after_label_in_cell(ws, dt, date_hdr, d_inline)
-                date_placed = True
-            elif _is_slot_target(ws.cell(row=r, column=label_c + 4).value):
-                dc2 = ws.cell(row=r, column=label_c + 4)
-                if _cell_has_existing_image(ws, dc2):
-                    dc2 = None
-                if dc2 is not None:
-                    dc2_slot, dc2_anchor = _clear_slot_cell_and_anchor(ws, dc2)
-                    _add_png(ws, dt, dc2_anchor, dc2_slot)
-                    date_placed = True
+        elif layout.get("date_inline") is not None:
+            _add_png_after_label_in_cell(ws, dt, date_hdr, int(layout["date_inline"]))
+            date_placed = True
     if sig and not dt:
         return sig_placed
     if dt and not sig:
         return date_placed
     if sig and dt:
         return bool(sig_placed and date_placed)
+    return False
+
+
+def _try_xlsx_four_column_row(
+    ws, r: int, label_c: int, kw: str, sig, dt, max_r: int
+) -> bool:
+    max_c = min(int(ws.max_column or 1), 128)
+    return _try_xlsx_signoff_row_layout(ws, r, label_c, kw, sig, dt, max_r, max_c=max_c)
+
+
+def _try_xlsx_cover_sheet_scan(ws, kws: list, sig, dt, max_r: int) -> bool:
+    """封面工作表优先：自上而下扫描「作者/审核/批准 + 日期 + 下划线空白」签批行。"""
+    max_c = min(int(ws.max_column or 1), 128)
+    max_r_use = min(int(max_r or ws.max_row or 1), 64)
+    for r in range(1, max_r_use + 1):
+        if not _xlsx_row_has_cover_signoff_labels(ws, r, max_c=max_c):
+            continue
+        for kw in kws:
+            for label_c in range(1, max_c + 1):
+                lv = ws.cell(row=r, column=label_c).value
+                if not cell_has_role_keyword(str(lv or ""), kw):
+                    continue
+                if _try_xlsx_signoff_row_layout(
+                    ws, r, label_c, kw, sig, dt, max_r, max_c=max_c
+                ):
+                    return True
     return False
 
 
@@ -652,21 +834,21 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
         return False
     sig_cell = ws.cell(row=r, column=c + 1)
     inline_x = cell_inline_insert_offset_px(val, kw) if (signoff_slot or inline_slot) else None
-    if sig and ((not _is_slot_target(sig_cell.value)) or _cell_has_existing_image(ws, sig_cell)):
+    if sig and ((not _is_xlsx_slot_target(ws, sig_cell)) or _cell_has_existing_image(ws, sig_cell)):
         if inline_x is None:
             return False
     date_label_cell, date_cell = _find_date_cell_same_row(ws, r, c)
     if date_cell is None:
         c2 = ws.cell(row=r, column=c + 2)
-        if _is_slot_target(c2.value):
+        if _is_xlsx_slot_target(ws, c2):
             date_cell = c2
         else:
             d1 = ws.cell(row=r + 1, column=c + 1)
-            if _is_slot_target(d1.value):
+            if _is_xlsx_slot_target(ws, d1):
                 date_cell = d1
             else:
                 d0 = ws.cell(row=r + 1, column=c)
-                if _is_slot_target(d0.value):
+                if _is_xlsx_slot_target(ws, d0):
                     date_cell = d0
     sig_placed = False
     date_placed = False
@@ -678,7 +860,7 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
         _add_png_after_label_in_cell(ws, sig, cell, inline_x)
         sig_placed = True
     if sig and not sig_placed:
-        if _is_slot_target(sig_cell.value):
+        if _is_xlsx_slot_target(ws, sig_cell):
             if _cell_has_existing_image(ws, sig_cell):
                 sig_cell = None
             if sig_cell is not None:
@@ -725,7 +907,7 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                     and not cell_has_role_keyword(dv, kw)
                 ):
                     break
-                if _is_slot_target(dv):
+                if _is_xlsx_slot_target(ws, dcell):
                     if _cell_has_existing_image(ws, dcell):
                         continue
                     dcell_slot, dcell_anchor = _clear_slot_cell_and_anchor(ws, dcell)
@@ -758,7 +940,7 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
             not date_placed
             and not signoff_slot
             and date_cell is not None
-            and _is_slot_target(date_cell.value)
+            and _is_xlsx_slot_target(ws, date_cell)
             and not _cell_has_existing_image(ws, date_cell)
         ):
             date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
@@ -778,9 +960,9 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
                     date_slot, date_anchor = _clear_slot_cell_and_anchor(ws, date_cell)
                     _add_png(ws, dt, date_anchor, date_slot)
                     date_placed = True
-            elif (not _is_slot_target(sig_cell.value)) and sig:
+            elif (not _is_xlsx_slot_target(ws, sig_cell)) and sig:
                 dnext = ws.cell(row=r, column=c + 2)
-                if _is_slot_target(dnext.value) and not _cell_has_existing_image(ws, dnext):
+                if _is_xlsx_slot_target(ws, dnext) and not _cell_has_existing_image(ws, dnext):
                     dnext_slot, dnext_anchor = _clear_slot_cell_and_anchor(ws, dnext)
                     _add_png(
                         ws,
@@ -792,7 +974,7 @@ def _try_place_at_keyword_cell(ws, r: int, c: int, kw: str, sig, dt, max_r: int)
             if (
                 not date_placed
                 and r + 1 <= max_r
-                and _is_slot_target(ws.cell(row=r + 1, column=c + 1).value)
+                and _is_xlsx_slot_target(ws, ws.cell(row=r + 1, column=c + 1))
                 and not _cell_has_existing_image(ws, ws.cell(row=r + 1, column=c + 1))
             ):
                 below = f"{get_column_letter(c + 1)}{r + 1}"
@@ -887,6 +1069,15 @@ def sign_xlsx(
             attempt_chain.append("layout_cells:" + ("ok" if placed else "miss"))
             if placed:
                 placed_by = "layout_cells"
+        if not placed:
+            for ws_cov in _iter_xlsx_cover_worksheets(wb):
+                if _try_xlsx_cover_sheet_scan(
+                    ws_cov, kws, sig, dt_use, int(ws_cov.max_row or 1)
+                ):
+                    placed = True
+                    placed_by = "cover_sheet"
+                    break
+            attempt_chain.append("cover_sheet:" + ("ok" if placed else "miss"))
         if planned_hints and kws:
             for hint in planned_hints:
                 parsed = _parse_xlsx_row_hint(hint)

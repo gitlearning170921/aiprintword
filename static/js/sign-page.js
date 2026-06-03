@@ -8840,7 +8840,7 @@
     return base.replace(/[\\/:*?"<>|]/g, '_') || 'file';
   }
 
-  /** 解析工作台某角色签名/日期 PNG 下载地址与建议文件名 */
+  /** 校验工作台某角色签名/日期是否可下载（缩放由服务端按落位规则生成） */
   function resolveWorkbenchRoleMaterialDownload(fileId, row, roleId, kind) {
     var map = getFileRoleMapForWorkbench(fileId);
     var pair = map[roleId] && typeof map[roleId] === 'object' ? map[roleId] : {};
@@ -8850,97 +8850,87 @@
     var filename = base + '_' + roleLbl + '_' + kindLbl + '.png';
 
     if (kind === 'sig') {
-      var sigId = String(pair.sig || '').trim();
-      if (!sigId) {
+      if (!String(pair.sig || '').trim()) {
         return { ok: false, error: roleLbl + '签名素材未选择' };
       }
-      return {
-        ok: true,
-        url:
-          apiUrl('/api/sign/stroke-items/' + encodeURIComponent(sigId) + '/png') +
-          '?t=' +
-          Date.now(),
-        filename: filename,
-      };
-    }
-
-    if (isCompositeDateMode(pair.date_mode)) {
+    } else if (isCompositeDateMode(pair.date_mode)) {
       if (!signersDbShare) {
         return { ok: false, error: roleLbl + '拼接日期需启用 MySQL' };
       }
-      var sid = _strokeItemSignerId('sig', pair.sig);
-      if (!sid) {
+      if (!_strokeItemSignerId('sig', pair.sig)) {
         return { ok: false, error: roleLbl + '请先选择签名素材（拼接日期需确定签署人）' };
       }
-      var iso = _workbenchCompositeDateIso(row, pair);
-      if (!iso) {
+      if (!_workbenchCompositeDateIso(row, pair)) {
         return { ok: false, error: roleLbl + '请先填写文档日期或角色日期' };
       }
-      var lay = compositeModeToLayout(pair.date_mode);
-      return {
-        ok: true,
-        url:
-          apiUrl('/api/sign/signers/' + encodeURIComponent(sid) + '/composite-date-preview') +
-          '?iso=' +
-          encodeURIComponent(iso) +
-          '&layout=' +
-          encodeURIComponent(lay) +
-          '&_=' +
-          Date.now(),
-        filename: filename,
-      };
-    }
-
-    var dateId = String(pair.date || '').trim();
-    if (!dateId) {
+    } else if (!String(pair.date || '').trim()) {
       return { ok: false, error: roleLbl + '日期素材未选择' };
     }
+
     return {
       ok: true,
-      url:
-        apiUrl('/api/sign/stroke-items/' + encodeURIComponent(dateId) + '/png') +
-        '?t=' +
-        Date.now(),
+      fileId: fileId,
+      roleId: roleId,
+      kind: kind,
+      map: map,
+      docDate: (row && row.doc_date) || '',
       filename: filename,
     };
   }
 
-  function downloadPngFromFetchUrl(url, filename, btnEl) {
-    var run = function () {
-      return fetch(url, { credentials: 'same-origin' })
-        .then(function (res) {
-          var ct = String(res.headers.get('content-type') || '').toLowerCase();
-          if (!res.ok || ct.indexOf('json') >= 0) {
-            return res
-              .json()
-              .catch(function () {
-                return { ok: false, error: 'HTTP ' + res.status };
-              })
-              .then(function (j) {
-                throw new Error((j && j.error) || '下载失败（HTTP ' + res.status + '）');
-              });
-          }
-          return res.blob();
+  function downloadPngFromFetchResponse(res, filename) {
+    var ct = String(res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok || ct.indexOf('json') >= 0) {
+      return res
+        .json()
+        .catch(function () {
+          return { ok: false, error: 'HTTP ' + res.status };
         })
-        .then(function (blob) {
-          if (!blob || !blob.size) {
-            throw new Error('服务器返回空图片');
-          }
-          var a = document.createElement('a');
-          var objUrl = URL.createObjectURL(blob);
-          a.href = objUrl;
-          a.download = filename || 'image.png';
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(function () {
-            try {
-              URL.revokeObjectURL(objUrl);
-            } catch (_) {}
-            try {
-              document.body.removeChild(a);
-            } catch (_) {}
-          }, 1500);
+        .then(function (j) {
+          throw new Error((j && j.error) || '下载失败（HTTP ' + res.status + '）');
         });
+    }
+    return res.blob().then(function (blob) {
+      if (!blob || !blob.size) {
+        throw new Error('服务器返回空图片');
+      }
+      var a = document.createElement('a');
+      var objUrl = URL.createObjectURL(blob);
+      a.href = objUrl;
+      a.download = filename || 'image.png';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () {
+        try {
+          URL.revokeObjectURL(objUrl);
+        } catch (_) {}
+        try {
+          document.body.removeChild(a);
+        } catch (_) {}
+      }, 1500);
+    });
+  }
+
+  function downloadWorkbenchRoleMaterial(fileId, row, roleId, kind, btnEl) {
+    var resolved = resolveWorkbenchRoleMaterialDownload(fileId, row, roleId, kind);
+    if (!resolved.ok) {
+      alert(resolved.error || '无法下载');
+      return Promise.resolve();
+    }
+    var run = function () {
+      return fetch(apiUrl('/api/sign/files/' + encodeURIComponent(resolved.fileId) + '/role-material-png'), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          role: resolved.roleId,
+          kind: resolved.kind,
+          map: resolved.map || {},
+          doc_date: resolved.docDate || '',
+        }),
+      }).then(function (res) {
+        return downloadPngFromFetchResponse(res, resolved.filename);
+      });
     };
     if (btnEl) {
       return withButtonBusy(btnEl, '…', run, { skipPageProgress: true }).catch(function (e) {
@@ -8952,22 +8942,13 @@
     });
   }
 
-  function downloadWorkbenchRoleMaterial(fileId, row, roleId, kind, btnEl) {
-    var resolved = resolveWorkbenchRoleMaterialDownload(fileId, row, roleId, kind);
-    if (!resolved.ok) {
-      alert(resolved.error || '无法下载');
-      return Promise.resolve();
-    }
-    return downloadPngFromFetchUrl(resolved.url, resolved.filename, btnEl);
-  }
-
   function appendWorkbenchDownloadButtons(tdOp, fileId, row) {
     var wrap = document.createElement('div');
     wrap.className = 'wb-dl-wrap';
     var title = document.createElement('div');
     title.className = 'wb-dl-title';
     title.textContent = '下载图片';
-    title.title = '自动签字效果不佳时，可下载签名/日期 PNG 手动贴入文档';
+    title.title = '下载与自动签字相同缩放比例的 PNG，可手动贴入文档';
     wrap.appendChild(title);
     var grid = document.createElement('div');
     grid.className = 'wb-dl-grid';
