@@ -16,6 +16,19 @@ from sign_handlers.png_word_compat import (
     prepare_signature_date_pair_for_word,
 )
 
+
+def _flatten_rgba_to_rgb(im):
+    if im.mode == "RGB":
+        return im
+    if im.mode != "RGBA":
+        im = im.convert("RGBA")
+    bg = Image.new("RGB", im.size, (255, 255, 255))
+    try:
+        bg.paste(im, mask=im.split()[3])
+    except Exception:
+        bg.paste(im.convert("RGB"))
+    return bg
+
 # 与 sign_docx._PIC_WIDTH 一致（Cm(2.8)）
 DOCX_INSERT_WIDTH_CM = 2.8
 # Word 粘贴/显示常用 DPI；与 Cm(2.8) 对应的像素宽度约 106px
@@ -34,6 +47,21 @@ _EXPORT_ROLE_ORDER = ("author", "reviewer", "approver")
 _EXPORT_KIND_ORDER = ("sig", "date")
 
 
+def _safe_open_rgb(png_bytes: Optional[bytes]):
+    """打开 PNG 为 RGB；失败返回 None。"""
+    if not png_bytes or Image is None:
+        return None
+    try:
+        im = Image.open(io.BytesIO(png_bytes))
+        if im.mode == "RGBA":
+            return _flatten_rgba_to_rgb(im)
+        if im.mode != "RGB":
+            return im.convert("RGB")
+        return im
+    except Exception:
+        return None
+
+
 def scale_png_for_docx_insert(
     png_bytes: Optional[bytes],
     *,
@@ -44,22 +72,20 @@ def scale_png_for_docx_insert(
     if not png_bytes or Image is None:
         return png_bytes
     try:
-        im = Image.open(io.BytesIO(png_bytes))
+        rgb = _safe_open_rgb(png_bytes)
+        if rgb is None:
+            return png_bytes
+        w, h = rgb.size
+        if w < 1 or h < 1:
+            return png_bytes
+        target_w = max(1, int(round(float(width_cm) / 2.54 * float(dpi))))
+        target_h = max(1, int(round(h * (target_w / float(w)))))
+        out_im = rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        out_im.save(out, format="PNG", dpi=(dpi, dpi), optimize=True)
+        return out.getvalue()
     except Exception:
         return png_bytes
-    w, h = im.size
-    if w < 1 or h < 1:
-        return png_bytes
-    target_w = max(1, int(round(float(width_cm) / 2.54 * float(dpi))))
-    target_h = max(1, int(round(h * (target_w / float(w)))))
-    if im.mode not in ("RGB", "RGBA"):
-        im = im.convert("RGBA")
-    flat = Image.new("RGBA", (w, h), (255, 255, 255, 255))
-    flat.alpha_composite(im)
-    rgb = flat.convert("RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
-    out = io.BytesIO()
-    rgb.save(out, format="PNG", dpi=(dpi, dpi), optimize=True)
-    return out.getvalue()
 
 
 def scale_png_to_pixel_box(
@@ -73,20 +99,18 @@ def scale_png_to_pixel_box(
     tw = max(1, int(target_w))
     th = max(1, int(target_h))
     try:
-        im = Image.open(io.BytesIO(png_bytes))
+        rgb = _safe_open_rgb(png_bytes)
+        if rgb is None:
+            return png_bytes
+        w, h = rgb.size
+        if w < 1 or h < 1:
+            return png_bytes
+        out_im = rgb.resize((tw, th), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        out_im.save(out, format="PNG", optimize=True)
+        return out.getvalue()
     except Exception:
         return png_bytes
-    w, h = im.size
-    if w < 1 or h < 1:
-        return png_bytes
-    if im.mode not in ("RGB", "RGBA"):
-        im = im.convert("RGBA")
-    flat = Image.new("RGBA", (w, h), (255, 255, 255, 255))
-    flat.alpha_composite(im)
-    rgb = flat.convert("RGB").resize((tw, th), Image.Resampling.LANCZOS)
-    out = io.BytesIO()
-    rgb.save(out, format="PNG", optimize=True)
-    return out.getvalue()
 
 
 def _coerce_png_bytes(val) -> Optional[bytes]:
@@ -230,6 +254,73 @@ def _load_stroke_item_png(
     )
 
 
+def _stroke_row_png(row) -> Optional[bytes]:
+    return _coerce_png_bytes((row or {}).get("png"))
+
+
+def _load_sig_png_like_batch_sign(
+    sig_id,
+    *,
+    using_mysql: bool,
+    mysql_store,
+    local_get_item,
+    inbox_root: str,
+    sid: str,
+) -> Optional[bytes]:
+    """与 POST /api/sign 库映射一致：优先 stroke_item 行内 png。"""
+    iid = str(sig_id or "").strip()
+    if not iid:
+        return None
+    if using_mysql and mysql_store:
+        row = mysql_store.get_stroke_item_row(iid)
+        png = _stroke_row_png(row)
+        if png:
+            return png
+        return _load_stroke_png_resolved(
+            iid,
+            "sig",
+            using_mysql=using_mysql,
+            mysql_store=mysql_store,
+            local_get_item=local_get_item,
+            inbox_root=inbox_root,
+            sid=sid,
+        )
+    if local_get_item:
+        return _coerce_png_bytes(local_get_item(inbox_root, sid, iid))
+    return None
+
+
+def _load_date_png_like_batch_sign(
+    date_id,
+    *,
+    using_mysql: bool,
+    mysql_store,
+    local_get_item,
+    inbox_root: str,
+    sid: str,
+) -> Optional[bytes]:
+    iid = str(date_id or "").strip()
+    if not iid:
+        return None
+    if using_mysql and mysql_store:
+        row = mysql_store.get_stroke_item_row(iid)
+        png = _stroke_row_png(row)
+        if png:
+            return png
+        return _load_stroke_png_resolved(
+            iid,
+            "date",
+            using_mysql=using_mysql,
+            mysql_store=mysql_store,
+            local_get_item=local_get_item,
+            inbox_root=inbox_root,
+            sid=sid,
+        )
+    if local_get_item:
+        return _coerce_png_bytes(local_get_item(inbox_root, sid, iid))
+    return None
+
+
 def _resolve_pair_material_bytes(
     pair: dict,
     *,
@@ -252,9 +343,8 @@ def _resolve_pair_material_bytes(
     err: Optional[str] = None
 
     if sig_id:
-        sig_png = _load_stroke_png_resolved(
+        sig_png = _load_sig_png_like_batch_sign(
             sig_id,
-            "sig",
             using_mysql=using_mysql,
             mysql_store=mysql_store,
             local_get_item=local_get_item,
@@ -287,10 +377,21 @@ def _resolve_pair_material_bytes(
                         err = "日期拼接结果为空"
                 except Exception as e:
                     err = f"日期拼接失败：{e}"
+                    date_png = None
+                    if date_id:
+                        date_png = _load_date_png_like_batch_sign(
+                            date_id,
+                            using_mysql=using_mysql,
+                            mysql_store=mysql_store,
+                            local_get_item=local_get_item,
+                            inbox_root=inbox_root,
+                            sid=sid,
+                        )
+                        if date_png:
+                            err = None
     elif date_id:
-        date_png = _load_stroke_png_resolved(
+        date_png = _load_date_png_like_batch_sign(
             date_id,
-            "date",
             using_mysql=using_mysql,
             mysql_store=mysql_store,
             local_get_item=local_get_item,
@@ -308,14 +409,18 @@ def _preprocess_role_pair(
     ext: str,
 ) -> Tuple[Optional[bytes], Optional[bytes]]:
     ext_l = (ext or "").lower()
-    if sig_png and date_png:
-        if ext_l in (".xlsx", ".xls"):
-            return prepare_signature_date_pair_for_word(
-                sig_png, date_png, equalize_ink_scale=False
-            )
-        return prepare_signature_date_pair_for_word(sig_png, date_png)
-    sig = prepare_png_for_word(sig_png) if sig_png else None
-    dt = prepare_png_for_word(date_png) if date_png else None
+    try:
+        if sig_png and date_png:
+            if ext_l in (".xlsx", ".xls"):
+                return prepare_signature_date_pair_for_word(
+                    sig_png, date_png, equalize_ink_scale=False
+                )
+            return prepare_signature_date_pair_for_word(sig_png, date_png)
+        sig = prepare_png_for_word(sig_png) if sig_png else None
+        dt = prepare_png_for_word(date_png) if date_png else None
+    except Exception:
+        sig = sig_png
+        dt = date_png
     if sig is None and sig_png:
         sig = sig_png
     if dt is None and date_png:
@@ -460,13 +565,19 @@ def _finalize_export_png(
     if not png_bytes:
         return None
     ext_l = (ext or "").lower()
-    if ext_l in (".docx", ".doc"):
-        return scale_png_for_docx_insert(png_bytes) or png_bytes
-    if ext_l in (".xlsx", ".xls"):
-        return _scale_for_xlsx_insert(
-            png_bytes, file_bytes, role_id, kind, placement_plan, wb=wb
-        )
-    return png_bytes
+    try:
+        if ext_l in (".docx", ".doc"):
+            return scale_png_for_docx_insert(png_bytes) or png_bytes
+        if ext_l in (".xlsx", ".xls"):
+            return (
+                _scale_for_xlsx_insert(
+                    png_bytes, file_bytes, role_id, kind, placement_plan, wb=wb
+                )
+                or png_bytes
+            )
+        return png_bytes
+    except Exception:
+        return png_bytes
 
 
 def _pair_with_doc_date(pair: dict, doc_date_fallback: str) -> dict:

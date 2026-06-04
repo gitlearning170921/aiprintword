@@ -21,6 +21,21 @@ _TARGET_EXPORT_W = 1200
 _INK_BG_SUM_MAX = 740
 
 
+def _flatten_rgba_to_rgb(im) -> "Image.Image":
+    """RGBA → 白底 RGB；用 paste+mask 避免 alpha_composite 尺寸不一致报错。"""
+    if im.mode == "RGB":
+        return im
+    if im.mode != "RGBA":
+        im = im.convert("RGBA")
+    bg = Image.new("RGB", im.size, (255, 255, 255))
+    try:
+        alpha = im.split()[3]
+        bg.paste(im, mask=alpha)
+    except Exception:
+        bg.paste(im.convert("RGB"))
+    return bg
+
+
 def _png_to_flat_rgb_image(png_bytes: Optional[bytes]):
     """透明底展平到白底，并把过窄图拉到统一像素宽度（与单图入库逻辑一致）。"""
     if not png_bytes or Image is None:
@@ -35,10 +50,10 @@ def _png_to_flat_rgb_image(png_bytes: Optional[bytes]):
     if w < _TARGET_EXPORT_W:
         nh = max(1, int(round(h * (_TARGET_EXPORT_W / float(w)))))
         im = im.resize((_TARGET_EXPORT_W, nh), Image.Resampling.LANCZOS)
-        w, h = im.size
-    flat = Image.new("RGBA", (w, h), (255, 255, 255, 255))
-    flat.alpha_composite(im, (0, 0))
-    return flat.convert("RGB")
+    try:
+        return _flatten_rgba_to_rgb(im)
+    except Exception:
+        return None
 
 
 def _rgb_to_png_bytes(im) -> bytes:

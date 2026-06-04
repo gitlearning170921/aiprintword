@@ -8120,7 +8120,7 @@
       })
       .catch(function (e) {
         var msg = (e && e.message) || String(e || '保存角色映射失败');
-        if (isBatchWorkbenchMode()) {
+        if (isBatchWorkbenchMode() && !opt.silent) {
           setBatchWorkbenchMsg('角色映射保存失败：' + msg, true);
         }
       });
@@ -8864,9 +8864,23 @@
     return base.replace(/[\\/:*?"<>|]/g, '_') || 'file';
   }
 
-  /** 下载用 map：读 cache + 补文档日期，不再重跑 plan（避免清空已匹配素材） */
+  /** 下载用 map：合并 cache + plan（签署人库就绪时）+ 补文档日期 */
   function _workbenchExportRoleMap(fileId, row) {
-    var m = _deepCloneJsonish(getFileRoleMapForWorkbench(fileId) || {});
+    var existing = _deepCloneJsonish(getFileRoleMapForWorkbench(fileId) || {});
+    try {
+      if (
+        row &&
+        typeof _workbenchPlanRoleMap === 'function' &&
+        signersList &&
+        signersList.length
+      ) {
+        var plan = _workbenchPlanRoleMap(fileId, row, existing);
+        if (plan && plan.map && typeof plan.map === 'object') {
+          existing = plan.map;
+          cachePatchCurrentRoleMap(fileId, existing);
+        }
+      }
+    } catch (_) {}
     var docIso = _parseAiwordDocDateIso(
       (row && row.doc_date) ||
         rowCtxFromRowState(row).doc_date ||
@@ -8875,14 +8889,14 @@
     );
     if (docIso) {
       ['author', 'reviewer', 'approver', 'executor'].forEach(function (rid) {
-        var p = m[rid];
+        var p = existing[rid];
         if (!p || typeof p !== 'object') return;
         if (isCompositeDateMode(p.date_mode) && !p.date_iso) {
           p.date_iso = docIso;
         }
       });
     }
-    return m;
+    return existing;
   }
 
   function _workbenchRoleMaterialExportable(pair, row, kind) {
@@ -8896,19 +8910,30 @@
     return !!String(p.date || '').trim();
   }
 
-  function _ensureWorkbenchRoleMapPersisted(fileId, map) {
-    return persistWorkbenchRoleMapChange(fileId, map, { force: true })
-      .then(function () {
-        return map;
-      })
-      .catch(function () {
-        return map;
-      });
+  function _syncWorkbenchExportMapCache(fileId, map) {
+    cachePatchCurrentRoleMap(fileId, map);
+    return map;
+  }
+
+  function _isRoleMaterialExportRetryableError(msg) {
+    var s = String(msg || '');
+    if (!s) return false;
+    return (
+      s.indexOf('没有可导出的签名/日期素材') >= 0 ||
+      s.indexOf('素材未绑定') >= 0 ||
+      s.indexOf('签名素材未选择或不可用') >= 0 ||
+      s.indexOf('日期素材未选择或不可用') >= 0 ||
+      s.indexOf('images do not match') >= 0 ||
+      s.indexOf('images not match') >= 0 ||
+      s.indexOf('图片') >= 0
+    );
   }
 
   /** 校验工作台某角色签名/日期是否可下载（缩放由服务端按落位规则生成） */
-  function resolveWorkbenchRoleMaterialDownload(fileId, row, roleId, kind) {
-    var map = _workbenchExportRoleMap(fileId, row);
+  function resolveWorkbenchRoleMaterialDownload(fileId, row, roleId, kind, mapOverride) {
+    var map = mapOverride && typeof mapOverride === 'object'
+      ? mapOverride
+      : _workbenchExportRoleMap(fileId, row);
     var pair = map[roleId] && typeof map[roleId] === 'object' ? map[roleId] : {};
     var roleLbl = WB_DL_ROLE_LABELS[roleId] || roleId;
     var shortTag = _workbenchMaterialShortTag(roleId, kind);
@@ -8940,23 +8965,22 @@
     };
   }
 
-  function _fetchWorkbenchRoleMaterialBlob(resolved) {
-    var q =
-      'role=' +
-      encodeURIComponent(resolved.roleId) +
-      '&kind=' +
-      encodeURIComponent(resolved.kind) +
-      '&doc_date=' +
-      encodeURIComponent(resolved.docDate || '');
-    return fetch(
-      apiUrl(
-        '/api/sign/files/' + encodeURIComponent(resolved.fileId) + '/role-material-png?' + q
-      ),
-      {
-        method: 'GET',
-        credentials: 'same-origin',
-      }
-    ).then(function (res) {
+  function _fetchWorkbenchRoleMaterialBlob(resolved, opt) {
+    opt = opt || {};
+    var body = {
+      role: resolved.roleId,
+      kind: resolved.kind,
+      doc_date: resolved.docDate || '',
+    };
+    if (!opt.noMap) {
+      body.map = resolved.map || {};
+    }
+    return fetch(apiUrl('/api/sign/files/' + encodeURIComponent(resolved.fileId) + '/role-material-png'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function (res) {
       var ct = String(res.headers.get('content-type') || '').toLowerCase();
       if (!res.ok || ct.indexOf('json') >= 0) {
         return res
@@ -9051,17 +9075,56 @@
   }
 
   function downloadWorkbenchRoleMaterial(fileId, row, roleId, kind, btnEl) {
-    var resolved = resolveWorkbenchRoleMaterialDownload(fileId, row, roleId, kind);
-    if (!resolved.ok) {
-      alert(resolved.error || '无法下载');
-      return Promise.resolve();
-    }
     var run = function () {
-      return _ensureWorkbenchRoleMapPersisted(fileId, resolved.map).then(function () {
-        return _fetchWorkbenchRoleMaterialBlob(resolved).then(function (blob) {
-          _downloadBlobFile(blob, resolved.filename, { mime: 'image/png', emptyMsg: '服务器返回空图片' });
+      var map = _workbenchExportRoleMap(fileId, row);
+      _syncWorkbenchExportMapCache(fileId, map);
+      var resolved = resolveWorkbenchRoleMaterialDownload(fileId, row, roleId, kind, map);
+      if (!resolved.ok) {
+        throw new Error(resolved.error || '无法下载');
+      }
+      var docQ = resolved.docDate
+        ? '?role=' +
+          encodeURIComponent(resolved.roleId) +
+          '&kind=' +
+          encodeURIComponent(resolved.kind) +
+          '&doc_date=' +
+          encodeURIComponent(resolved.docDate)
+        : '?role=' +
+          encodeURIComponent(resolved.roleId) +
+          '&kind=' +
+          encodeURIComponent(resolved.kind);
+      var getUrl =
+        apiUrl('/api/sign/files/' + encodeURIComponent(resolved.fileId) + '/role-material-png') +
+        docQ;
+      return _fetchWorkbenchRoleMaterialBlob(resolved)
+        .catch(function (e) {
+          if (!_isRoleMaterialExportRetryableError((e && e.message) || '')) throw e;
+          return fetch(getUrl, { method: 'GET', credentials: 'same-origin' }).then(function (res) {
+            var ct = String(res.headers.get('content-type') || '').toLowerCase();
+            if (!res.ok || ct.indexOf('json') >= 0) {
+              return res
+                .json()
+                .catch(function () {
+                  return { ok: false, error: 'HTTP ' + res.status };
+                })
+                .then(function (j) {
+                  throw new Error((j && j.error) || '下载失败（HTTP ' + res.status + '）');
+                });
+            }
+            return res.blob().then(function (blob) {
+              if (!blob || !blob.size) {
+                throw new Error('服务器返回空图片');
+              }
+              return blob;
+            });
+          });
+        })
+        .then(function (blob) {
+          _downloadBlobFile(blob, resolved.filename, {
+            mime: 'image/png',
+            emptyMsg: '服务器返回空图片',
+          });
         });
-      });
     };
     if (btnEl) {
       return withButtonBusy(btnEl, '…', run, { skipPageProgress: true }).catch(function (e) {
@@ -9074,46 +9137,65 @@
   }
 
   function downloadAllWorkbenchRoleMaterials(fileId, row, btnEl) {
-    var map = _workbenchExportRoleMap(fileId, row);
-    var hasAny = false;
-    [
-      { role: 'author', kind: 'sig' },
-      { role: 'author', kind: 'date' },
-      { role: 'reviewer', kind: 'sig' },
-      { role: 'reviewer', kind: 'date' },
-      { role: 'approver', kind: 'sig' },
-      { role: 'approver', kind: 'date' },
-    ].some(function (def) {
-      if (resolveWorkbenchRoleMaterialDownload(fileId, row, def.role, def.kind).ok) {
-        hasAny = true;
-        return true;
-      }
-      return false;
-    });
-    if (!hasAny) {
-      alert('当前行没有可下载的签名/日期素材（请确认素材列已选中且文档日期已填）');
-      return Promise.resolve();
-    }
     var zipName = _workbenchDownloadBaseName(row, fileId) + '_签字素材.zip';
     var docDate = (row && row.doc_date) || '';
+    function fetchZip(noMap, mapForPost) {
+      var url =
+        apiUrl('/api/sign/files/' + encodeURIComponent(fileId) + '/role-materials-zip') +
+        (noMap && docDate ? '?doc_date=' + encodeURIComponent(docDate) : '');
+      if (noMap) {
+        return fetch(url, { method: 'GET', credentials: 'same-origin' });
+      }
+      return fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          map: mapForPost || {},
+          doc_date: docDate,
+        }),
+      });
+    }
     var run = function () {
-      return _ensureWorkbenchRoleMapPersisted(fileId, map).then(function () {
-        var q = 'doc_date=' + encodeURIComponent(docDate);
-        return fetch(
-          apiUrl('/api/sign/files/' + encodeURIComponent(fileId) + '/role-materials-zip?' + q),
-          {
-            method: 'GET',
-            credentials: 'same-origin',
-          }
-        ).then(function (res) {
+      var map = _workbenchExportRoleMap(fileId, row);
+      _syncWorkbenchExportMapCache(fileId, map);
+      var hasAny = false;
+      [
+        { role: 'author', kind: 'sig' },
+        { role: 'author', kind: 'date' },
+        { role: 'reviewer', kind: 'sig' },
+        { role: 'reviewer', kind: 'date' },
+        { role: 'approver', kind: 'sig' },
+        { role: 'approver', kind: 'date' },
+      ].some(function (def) {
+        if (resolveWorkbenchRoleMaterialDownload(fileId, row, def.role, def.kind, map).ok) {
+          hasAny = true;
+          return true;
+        }
+        return false;
+      });
+      if (!hasAny) {
+        setBatchWorkbenchMsg('当前行无可导出项，将尝试从已保存映射兜底导出…', 'warn');
+      }
+      return fetchZip(false, map)
+        .then(function (res) {
           return _downloadFromFetchResponse(res, zipName, {
             emptyMsg: 'ZIP 为空，请确认素材已匹配且 PNG 可用',
             mime: 'application/zip',
-          }).then(function (info) {
-            setBatchWorkbenchMsg('已开始下载 ' + (info.filename || zipName), false);
           });
+        })
+        .catch(function (e) {
+          if (!_isRoleMaterialExportRetryableError((e && e.message) || '')) throw e;
+          return fetchZip(true).then(function (res2) {
+            return _downloadFromFetchResponse(res2, zipName, {
+              emptyMsg: 'ZIP 为空，请确认素材已匹配且 PNG 可用',
+              mime: 'application/zip',
+            });
+          });
+        })
+        .then(function (info) {
+          setBatchWorkbenchMsg('已开始下载 ' + (info.filename || zipName), false);
         });
-      });
     };
     if (btnEl) {
       return withButtonBusy(btnEl, '打包…', run, { skipPageProgress: true }).catch(function (e) {
@@ -11529,7 +11611,7 @@
     });
     var title = titleParts.join('；');
     if (!missing.length) {
-      if (libN === total && !sigOnly.length) {
+      if (libN === total && !sigOnly.length && !dateOnly.length) {
         return {
           state: 'full',
           label: '全部已匹配',
