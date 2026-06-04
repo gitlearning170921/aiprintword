@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import io
-from typing import Any, Dict, Optional, Tuple
+import zipfile
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from PIL import Image
@@ -19,6 +20,18 @@ from sign_handlers.png_word_compat import (
 DOCX_INSERT_WIDTH_CM = 2.8
 # Word 粘贴/显示常用 DPI；与 Cm(2.8) 对应的像素宽度约 106px
 DOCX_INSERT_DPI = 96
+
+MATERIAL_SHORT_TAGS: Dict[Tuple[str, str], str] = {
+    ("author", "sig"): "编签",
+    ("author", "date"): "编日",
+    ("reviewer", "sig"): "审签",
+    ("reviewer", "date"): "审日",
+    ("approver", "sig"): "批签",
+    ("approver", "date"): "批日",
+}
+
+_EXPORT_ROLE_ORDER = ("author", "reviewer", "approver")
+_EXPORT_KIND_ORDER = ("sig", "date")
 
 
 def scale_png_for_docx_insert(
@@ -76,6 +89,147 @@ def scale_png_to_pixel_box(
     return out.getvalue()
 
 
+def _coerce_png_bytes(val) -> Optional[bytes]:
+    if val is None:
+        return None
+    if isinstance(val, memoryview):
+        val = val.tobytes()
+    elif isinstance(val, bytearray):
+        val = bytes(val)
+    elif not isinstance(val, bytes):
+        try:
+            val = bytes(val)
+        except Exception:
+            return None
+    return val if len(val) > 0 else None
+
+
+def _role_map_entry_nonempty(pair: dict, *, mysql_store=None) -> bool:
+    if not isinstance(pair, dict):
+        return False
+    if (pair.get("sig") or "").strip() if isinstance(pair.get("sig"), str) else pair.get("sig"):
+        return True
+    dm = pair.get("date_mode")
+    if mysql_store and mysql_store.is_composite_date_mode(dm):
+        return bool((pair.get("date_iso") or "").strip())
+    return bool((pair.get("date") or "").strip() if isinstance(pair.get("date"), str) else pair.get("date"))
+
+
+def _merge_role_material_maps(base: dict, override: dict) -> dict:
+    from sign_handlers.config import normalize_role_signer_map
+
+    out: dict = {}
+    for src in (base or {}, override or {}):
+        if not isinstance(src, dict):
+            continue
+        for rk, rv in src.items():
+            rid = str(rk or "").strip()
+            if not rid or not isinstance(rv, dict):
+                continue
+            cur = dict(out.get(rid) or {})
+            for k, v in rv.items():
+                if k not in ("sig", "date", "date_mode", "date_iso"):
+                    continue
+                if v is None:
+                    cur[k] = None
+                elif isinstance(v, str):
+                    if v.strip():
+                        cur[k] = v.strip()
+                else:
+                    cur[k] = v
+            if cur:
+                out[rid] = cur
+    return normalize_role_signer_map(out)
+
+
+def _load_stroke_png_resolved(
+    ref_id,
+    kind: str,
+    *,
+    using_mysql: bool,
+    mysql_store,
+    local_get_item,
+    inbox_root: str,
+    sid: str,
+    locale_hint: Optional[str] = None,
+) -> Optional[bytes]:
+    """加载 sig/date PNG：与批量签字、GET /stroke-items 同链路（item → signer → stroke_set）。"""
+    iid = str(ref_id or "").strip()
+    if not iid:
+        return None
+    k = (kind or "sig").strip().lower()
+    if k not in ("sig", "date"):
+        k = "sig"
+    loc = (locale_hint or "").strip().lower()
+    if loc not in ("zh", "en"):
+        loc = ""
+
+    if using_mysql and mysql_store:
+        row = mysql_store.get_stroke_item_row(iid) or {}
+        png = _coerce_png_bytes(row.get("png"))
+        if png:
+            return png
+        signer_id = str(row.get("signer_id") or "").strip()
+        item_loc = str(row.get("locale") or loc or "zh").strip().lower()
+        if signer_id:
+            try:
+                alt = mysql_store.get_signer_stroke_png_resolved(
+                    signer_id,
+                    k,
+                    item_loc if item_loc in ("zh", "en") else (loc or None),
+                )
+                png2 = _coerce_png_bytes(alt)
+                if png2:
+                    return png2
+            except Exception:
+                pass
+            try:
+                row2 = mysql_store.get_stroke_item_row_by_signer_kind(
+                    signer_id,
+                    item_loc if item_loc in ("zh", "en") else (loc or "zh"),
+                    k,
+                )
+                png3 = _coerce_png_bytes((row2 or {}).get("png"))
+                if png3:
+                    return png3
+            except Exception:
+                pass
+        try:
+            alt_set = mysql_store.get_stroke_set_stroke_png_resolved(
+                iid, k, loc or None
+            )
+            png4 = _coerce_png_bytes(alt_set)
+            if png4:
+                return png4
+        except Exception:
+            pass
+        return None
+
+    if local_get_item:
+        return _coerce_png_bytes(local_get_item(inbox_root, sid, iid))
+    return None
+
+
+def _load_stroke_item_png(
+    item_id,
+    *,
+    using_mysql: bool,
+    mysql_store,
+    local_get_item,
+    inbox_root: str,
+    sid: str,
+) -> Optional[bytes]:
+    return _load_stroke_png_resolved(
+        item_id,
+        "sig",
+        using_mysql=using_mysql,
+        mysql_store=mysql_store,
+        local_get_item=local_get_item,
+        inbox_root=inbox_root,
+        sid=sid,
+    )
+
+
 def _resolve_pair_material_bytes(
     pair: dict,
     *,
@@ -88,36 +242,63 @@ def _resolve_pair_material_bytes(
     """解析 role-map 条目为 (sig_png, date_png, error)。"""
     if not isinstance(pair, dict):
         return None, None, "角色素材未配置"
-    sig_id = (pair.get("sig") or "").strip() or None
-    date_id = (pair.get("date") or "").strip() or None
+    sig_id = str(pair.get("sig") or "").strip() or None
+    date_id = str(pair.get("date") or "").strip() or None
     dm = pair.get("date_mode")
-    diso = (pair.get("date_iso") or "").strip() or None
+    diso = str(pair.get("date_iso") or "").strip() or None
 
-    def _load_item(iid: str) -> Optional[bytes]:
-        if not iid:
-            return None
-        if using_mysql:
-            row = mysql_store.get_stroke_item_row(iid)
-            return (row or {}).get("png")
-        return local_get_item(inbox_root, sid, iid)
-
-    sig_png = _load_item(sig_id) if sig_id else None
+    sig_png = None
     date_png = None
-    if using_mysql and mysql_store and mysql_store.is_composite_date_mode(dm):
-        if not sig_id or not diso:
-            return sig_png, None, "拼接日期需绑定签名并填写日历日期"
-        srow = mysql_store.get_stroke_item_row(sig_id) if sig_id else None
-        sid0 = ((srow or {}).get("signer_id") or "").strip()
-        if not sid0:
-            return sig_png, None, "无法解析签署人（拼接日期）"
-        try:
-            lay = mysql_store.composite_mode_to_layout(dm)
-            date_png, _ = mysql_store.compose_date_piece_png(sid0, diso, lay)
-        except Exception as e:
-            return sig_png, None, f"日期拼接失败：{e}"
+    err: Optional[str] = None
+
+    if sig_id:
+        sig_png = _load_stroke_png_resolved(
+            sig_id,
+            "sig",
+            using_mysql=using_mysql,
+            mysql_store=mysql_store,
+            local_get_item=local_get_item,
+            inbox_root=inbox_root,
+            sid=sid,
+        )
+
+    use_composite = (
+        using_mysql
+        and mysql_store
+        and mysql_store.is_composite_date_mode(dm)
+        and bool(diso)
+    )
+    if use_composite:
+        if not sig_id:
+            err = "拼接日期需绑定签名并填写日历日期"
+        elif not sig_png:
+            err = "签名素材 PNG 不可用"
+        else:
+            srow = mysql_store.get_stroke_item_row(sig_id) if sig_id else None
+            sid0 = str((srow or {}).get("signer_id") or "").strip()
+            if not sid0:
+                err = "无法解析签署人（拼接日期）"
+            else:
+                try:
+                    lay = mysql_store.composite_mode_to_layout(dm)
+                    date_png, _ = mysql_store.compose_date_piece_png(sid0, diso, lay)
+                    date_png = _coerce_png_bytes(date_png)
+                    if not date_png:
+                        err = "日期拼接结果为空"
+                except Exception as e:
+                    err = f"日期拼接失败：{e}"
     elif date_id:
-        date_png = _load_item(date_id)
-    return sig_png, date_png, None
+        date_png = _load_stroke_png_resolved(
+            date_id,
+            "date",
+            using_mysql=using_mysql,
+            mysql_store=mysql_store,
+            local_get_item=local_get_item,
+            inbox_root=inbox_root,
+            sid=sid,
+        )
+
+    return sig_png, date_png, err
 
 
 def _preprocess_role_pair(
@@ -234,13 +415,18 @@ def _scale_for_xlsx_insert(
     role_id: str,
     kind: str,
     placement_plan: Optional[dict],
+    *,
+    wb=None,
 ) -> bytes:
     from openpyxl import load_workbook
 
     from sign_handlers.sign_xlsx import compute_xlsx_insert_pixel_size
 
-    bio = io.BytesIO(file_bytes)
-    wb = load_workbook(bio, data_only=True)
+    close_wb = False
+    if wb is None:
+        bio = io.BytesIO(file_bytes)
+        wb = load_workbook(bio, data_only=True)
+        close_wb = True
     try:
         rp = (placement_plan or {}).get(str(role_id)) if isinstance(placement_plan, dict) else {}
         rp = rp if isinstance(rp, dict) else {}
@@ -254,10 +440,40 @@ def _scale_for_xlsx_insert(
         scaled = scale_png_to_pixel_box(png_bytes, tw, th)
         return scaled or png_bytes
     finally:
-        try:
-            wb.close()
-        except Exception:
-            pass
+        if close_wb:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+
+def _finalize_export_png(
+    png_bytes: Optional[bytes],
+    *,
+    ext: str,
+    file_bytes: bytes,
+    role_id: str,
+    kind: str,
+    placement_plan: Optional[dict],
+    wb=None,
+) -> Optional[bytes]:
+    if not png_bytes:
+        return None
+    ext_l = (ext or "").lower()
+    if ext_l in (".docx", ".doc"):
+        return scale_png_for_docx_insert(png_bytes) or png_bytes
+    if ext_l in (".xlsx", ".xls"):
+        return _scale_for_xlsx_insert(
+            png_bytes, file_bytes, role_id, kind, placement_plan, wb=wb
+        )
+    return png_bytes
+
+
+def _pair_with_doc_date(pair: dict, doc_date_fallback: str) -> dict:
+    p = dict(pair) if isinstance(pair, dict) else {}
+    if doc_date_fallback and not (p.get("date_iso") or "").strip():
+        p["date_iso"] = str(doc_date_fallback).strip()[:10]
+    return p
 
 
 def export_role_material_png(
@@ -273,6 +489,7 @@ def export_role_material_png(
     local_get_item=None,
     inbox_root: str = "",
     sid: str = "",
+    wb=None,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
     返回 (png_bytes, error)。
@@ -300,11 +517,113 @@ def export_role_material_png(
             return None, "签名素材未选择或不可用"
         return None, err or "日期素材未选择或不可用"
 
+    out = _finalize_export_png(
+        png,
+        ext=ext,
+        file_bytes=file_bytes,
+        role_id=role_id,
+        kind=kind_l,
+        placement_plan=placement_plan,
+        wb=wb,
+    )
+    return out, None
+
+
+def export_role_materials_zip(
+    *,
+    file_bytes: bytes,
+    ext: str,
+    role_map: dict,
+    placement_plan: Optional[dict] = None,
+    using_mysql: bool,
+    mysql_store=None,
+    local_get_item=None,
+    inbox_root: str = "",
+    sid: str = "",
+    doc_date_fallback: str = "",
+) -> Tuple[Optional[bytes], Optional[str], int]:
+    """批量导出已有素材为 ZIP（仅打开 Excel 一次，避免多次请求卡顿）。"""
+    from openpyxl import load_workbook
+
+    role_map = role_map if isinstance(role_map, dict) else {}
+    wb = None
     ext_l = (ext or "").lower()
-    if ext_l in (".docx", ".doc"):
-        out = scale_png_for_docx_insert(png)
-        return out or png, None
     if ext_l in (".xlsx", ".xls"):
-        out = _scale_for_xlsx_insert(png, file_bytes, role_id, kind_l, placement_plan)
-        return out, None
-    return png, None
+        try:
+            wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        except Exception as e:
+            return None, f"读取 Excel 失败：{e}", 0
+
+    zbuf = io.BytesIO()
+    count = 0
+    misses: list[str] = []
+    try:
+        with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for role_id in _EXPORT_ROLE_ORDER:
+                pair = _pair_with_doc_date(role_map.get(role_id) or {}, doc_date_fallback)
+                if not _role_map_entry_nonempty(pair, mysql_store=mysql_store):
+                    continue
+                sig_id = str(pair.get("sig") or "").strip() or None
+                date_id = str(pair.get("date") or "").strip() or None
+                dm = pair.get("date_mode")
+                diso = str(pair.get("date_iso") or "").strip() or None
+                sig_raw, date_raw, err = _resolve_pair_material_bytes(
+                    pair,
+                    using_mysql=using_mysql,
+                    mysql_store=mysql_store,
+                    local_get_item=local_get_item,
+                    inbox_root=inbox_root,
+                    sid=sid,
+                )
+                sig_prep, date_prep = _preprocess_role_pair(sig_raw, date_raw, ext=ext)
+                for kind in _EXPORT_KIND_ORDER:
+                    tag = MATERIAL_SHORT_TAGS.get((role_id, kind), f"{role_id}_{kind}")
+                    if kind == "sig":
+                        if not sig_id:
+                            continue
+                        if not sig_raw:
+                            misses.append(f"{tag}：签名素材未绑定或 PNG 不可用")
+                            continue
+                    else:
+                        if not date_raw:
+                            if mysql_store and mysql_store.is_composite_date_mode(dm):
+                                if not diso:
+                                    misses.append(f"{tag}：缺文档体现日期")
+                                elif err:
+                                    misses.append(f"{tag}：{err}")
+                                else:
+                                    misses.append(f"{tag}：日期素材未绑定或 PNG 不可用")
+                            elif not date_id:
+                                continue
+                            else:
+                                misses.append(f"{tag}：日期素材未绑定或 PNG 不可用")
+                            continue
+                    src = sig_prep if kind == "sig" else date_prep
+                    if not src:
+                        misses.append(f"{tag}：PNG 预处理失败")
+                        continue
+                    png = _finalize_export_png(
+                        src,
+                        ext=ext,
+                        file_bytes=file_bytes,
+                        role_id=role_id,
+                        kind=kind,
+                        placement_plan=placement_plan,
+                        wb=wb,
+                    )
+                    if not png:
+                        misses.append(f"{tag}：缩放导出失败")
+                        continue
+                    zf.writestr(f"{tag}.png", png)
+                    count += 1
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+    if count <= 0:
+        hint = "；".join(misses[:8]) if misses else "role-map 中无可用签名/日期绑定"
+        return None, f"没有可导出的签名/日期素材（{hint}）", 0
+    return zbuf.getvalue(), None, count

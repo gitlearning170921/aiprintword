@@ -674,6 +674,15 @@
       margin-bottom: 2px;
       line-height: 1.2;
     }
+    .batch-workbench-table .col-op .wb-dl-all-btn {
+      display: block !important;
+      width: 100% !important;
+      margin: 0 0 3px !important;
+      padding: 2px 4px !important;
+      font-size: 0.68rem !important;
+      line-height: 1.2;
+      word-break: keep-all;
+    }
     .batch-workbench-table .col-op .wb-dl-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1428,7 +1437,7 @@
       var p = (window.__APP_ROOT__ != null ? String(window.__APP_ROOT__) : '').replace(/\/+$/, '');
       var s = document.createElement('script');
       s.defer = true;
-      s.src = (p || '') + '/js/sign-page.js?v=140';
+      s.src = (p || '') + '/js/sign-page.js?v=145';
       s.onerror = function () {
         showScriptLoadFail(
           '无法加载「' +
