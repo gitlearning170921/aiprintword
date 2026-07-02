@@ -183,6 +183,8 @@
   var DEFAULT_FETCH_TIMEOUT_MS = 45000;
   var SIGNERS_LIST_FETCH_TIMEOUT_MS = 60000;
   var SIGN_FILES_LIST_FETCH_TIMEOUT_MS = 45000;
+  /** 上传/批量识别进行中刷新列表：服务端忙于 detect 时 MySQL 查询易排队，给更长等待 */
+  var SIGN_FILES_LIST_DETECT_BUSY_TIMEOUT_MS = 90000;
   var HANDOFF_CLAIM_TIMEOUT_MS = 300000;
   var SIGN_BATCH_DELETE_CHUNK = 120;
   function _batchDeleteTimeoutMs(n) {
@@ -12993,6 +12995,9 @@
       .then(function () {
         mergeBatchWorkbenchRowsFromSavedFiles();
         if (savedFiles.length) enableBatchWorkbenchMode();
+        if (opt.skipBgTasks) {
+          return;
+        }
         _runWorkbenchBgTask('signers', '签署人库与素材列表', function () {
           return refreshSigners({
             skipPageProgress: true,
@@ -14537,7 +14542,7 @@
         );
         if (skipDetect) return true;
         function _detectOnceOrRetryLeft(retryLeft) {
-          var detectP = detectAndAutoSelectRoles(fileId, __aiwordHandoffDetectRetries, {
+          var detectP = detectAndAutoSelectRoles(fileId, opts.batchSilent ? 3 : __aiwordHandoffDetectRetries, {
             returnPromise: true,
             batchSilent: true,
           });
@@ -14768,6 +14773,7 @@
       try {
         _refreshWorkbenchSlotFilterOptions();
       } catch (_) {}
+      _scheduleDeferredWorkbenchSync(1500);
     })
     .finally(function () {
       if (!runOpt.skipPageProgress) endPageProgress();
@@ -15805,12 +15811,60 @@
       });
   }
 
+  function _scheduleDeferredWorkbenchSync(delayMs) {
+    var wait = typeof delayMs === 'number' ? delayMs : 2500;
+    setTimeout(function () {
+      if (_isFileListDetectBusy()) {
+        _scheduleDeferredWorkbenchSync(Math.min(wait + 2000, 15000));
+        return;
+      }
+      refreshFileList({ softFail: true, silent: true, skipPageProgress: true }).catch(function () {});
+      if (!signersList || !signersList.length) {
+        refreshSigners({
+          skipPageProgress: true,
+          brief: true,
+          deferRender: true,
+          loadStrokeOptions: false,
+        }).catch(function () {});
+      }
+      _runWorkbenchBgTask('caches', '行状态与角色映射', function () {
+        return hydrateFileCachesFromServer({ lite: true });
+      }).catch(function () {});
+    }, wait);
+  }
+
+  function _isFileListDetectBusy() {
+    if (__signUploadInFlight || __batchWorkbenchPipelineRunning || detectInFlightFor) {
+      return true;
+    }
+    var rows = __batchWorkbenchRows || {};
+    var keys = Object.keys(rows);
+    for (var i = 0; i < keys.length; i++) {
+      var st = String((rows[keys[i]] || {}).status || '');
+      if (/识别中|识别重试|识别较慢|匹配素材/.test(st)) return true;
+    }
+    return false;
+  }
+
+  function _resolveFileListFetchTimeoutMs(opt) {
+    if (opt && typeof opt.timeoutMs === 'number' && opt.timeoutMs > 0) {
+      return opt.timeoutMs;
+    }
+    return _isFileListDetectBusy()
+      ? SIGN_FILES_LIST_DETECT_BUSY_TIMEOUT_MS
+      : SIGN_FILES_LIST_FETCH_TIMEOUT_MS;
+  }
+
   function scheduleRefreshFileList(delayMs) {
     if (__refreshFileListDeferTimer) {
       clearTimeout(__refreshFileListDeferTimer);
     }
     __refreshFileListDeferTimer = setTimeout(function () {
       __refreshFileListDeferTimer = null;
+      if (_isFileListDetectBusy()) {
+        _scheduleDeferredWorkbenchSync(3000);
+        return;
+      }
       refreshFileList({ softFail: true }).catch(function () {});
     }, typeof delayMs === 'number' ? delayMs : 1500);
   }
@@ -15831,11 +15885,12 @@
     if (!opt.silent) {
       showFileListLoading();
     }
+    var fileListTimeoutMs = _resolveFileListFetchTimeoutMs(opt);
     __refreshFileListPromise = fetchJsonWithRetry(
       apiUrl('/api/sign/files') + '?_=' + Date.now(),
       {
         cache: 'no-store',
-        timeoutMs: opt.timeoutMs || SIGN_FILES_LIST_FETCH_TIMEOUT_MS,
+        timeoutMs: fileListTimeoutMs,
       },
       { maxTry: 2, delayMs: 1200 }
     )
@@ -16489,6 +16544,21 @@
           cacheDetectResultForFile(fileId, null, lastDetectError);
           if (
             retryLeft > 0 &&
+            opts.batchSilent &&
+            j &&
+            j.error_code === 'detect_busy'
+          ) {
+            var busyDelayMs = 1200 + (3 - retryLeft) * 900;
+            detectRetryScheduled = true;
+            setTimeout(function () {
+              if (myEpoch !== detectEpoch) return;
+              detectInFlightFor = null;
+              detectAndAutoSelectRoles(fileId, retryLeft - 1, opts);
+            }, busyDelayMs);
+            return { __retrying: true, __abort: true };
+          }
+          if (
+            retryLeft > 0 &&
             __aiwordHandoffTargetFileId != null &&
             String(fileId) === String(__aiwordHandoffTargetFileId)
           ) {
@@ -17102,7 +17172,11 @@
           var wbIds = addedIds.length
             ? addedIds
             : (selectedFileId ? [String(selectedFileId)] : []);
-          return refreshWorkbenchFilesFromServer({ silent: false, skipPageProgress: true })
+          return refreshWorkbenchFilesFromServer({
+            silent: false,
+            skipPageProgress: true,
+            skipBgTasks: true,
+          })
             .then(function () {
               var serverReplaced =
                 !!j.replaced_duplicates || !!replacePreConfirmed;
@@ -17741,16 +17815,17 @@
           }
           if (!IS_FILE_SIGN_PAGE) return;
           beginPageProgress('正在加载文件列表…');
+          var bootFileListTimeoutMs = _resolveFileListFetchTimeoutMs({});
           return _withPromiseTimeout(
             refreshFileList({
               force: true,
               softFail: true,
               skipPageProgress: true,
               silent: true,
-              timeoutMs: SIGN_FILES_LIST_FETCH_TIMEOUT_MS,
+              timeoutMs: bootFileListTimeoutMs,
             }),
             '文件列表',
-            SIGN_FILES_LIST_FETCH_TIMEOUT_MS + 5000
+            bootFileListTimeoutMs + 5000
           )
             .then(function () {
               _mountWorkbenchFromSavedFiles(

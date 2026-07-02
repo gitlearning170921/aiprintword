@@ -126,10 +126,16 @@ HANDOFF_DIR = os.path.join(ROOT, "data", "aiword_handoff")
 _HANDOFF_LOCK = threading.Lock()
 _HEAVY_SEM: Optional[threading.Semaphore] = None
 _HEAVY_SEM_SIZE = 0
+_DETECT_SEM: Optional[threading.Semaphore] = None
+_DETECT_SEM_SIZE = 0
 
 
 class _SignHeavyBusyError(Exception):
     """上传/签名等重任务并发槽位已满。"""
+
+
+class _SignDetectBusyError(Exception):
+    """文档识别并发槽位已满。"""
 
 
 def _sign_heavy_semaphore() -> threading.Semaphore:
@@ -174,6 +180,52 @@ def sign_heavy_route(fn):
                 return fn(*args, **kwargs)
         except _SignHeavyBusyError as e:
             return jsonify({"ok": False, "error": str(e), "error_code": "server_busy"}), 503
+
+    return _wrapped
+
+
+def _sign_detect_semaphore() -> threading.Semaphore:
+    global _DETECT_SEM, _DETECT_SEM_SIZE
+    if _DETECT_SEM is None:
+        try:
+            n = int((os.environ.get("SIGN_DETECT_CONCURRENCY") or "2").strip() or "2")
+        except ValueError:
+            n = 2
+        _DETECT_SEM_SIZE = max(1, min(n, 8))
+        _DETECT_SEM = threading.Semaphore(_DETECT_SEM_SIZE)
+    return _DETECT_SEM
+
+
+@contextmanager
+def _sign_detect_op_slot():
+    try:
+        wait = int((os.environ.get("SIGN_DETECT_WAIT_SEC") or "45").strip() or "45")
+    except ValueError:
+        wait = 45
+    wait = max(3, min(wait, 300))
+    sem = _sign_detect_semaphore()
+    if not sem.acquire(timeout=wait):
+        raise _SignDetectBusyError(
+            "服务器识别任务已满（同时最多 "
+            + str(_DETECT_SEM_SIZE)
+            + " 个文档在识别）。请稍候自动重试，或等当前批次完成后再操作。"
+        )
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+def sign_detect_route(fn):
+    """限制并发的识别路由，避免多轮上传/识别占满 Flask 工作线程。"""
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        try:
+            with _sign_detect_op_slot():
+                return fn(*args, **kwargs)
+        except _SignDetectBusyError as e:
+            return jsonify({"ok": False, "error": str(e), "error_code": "detect_busy"}), 503
 
     return _wrapped
 
@@ -5482,6 +5534,7 @@ def api_sign_upload_check_duplicates():
 
 
 @app.route("/api/sign/upload", methods=["POST"])
+@sign_heavy_route
 def api_sign_upload():
     """Save one or multiple sign docs, supports zip expansion."""
     t0 = time.time()
@@ -5793,6 +5846,7 @@ def _humanize_office_package_error(exc) -> str:
 
 
 @app.route("/api/sign/detect", methods=["GET"])
+@sign_detect_route
 def api_sign_detect():
     """自动识别文档中的签名位/角色（用于前端自动勾选）。"""
     file_id = (request.args.get("file_id") or "").strip()
@@ -6103,11 +6157,15 @@ def api_sign_server_status():
     """轻量状态：列表类接口不受重任务槽位限制；供前端判断服务器是否繁忙。"""
     sem = _sign_heavy_semaphore()
     avail = getattr(sem, "_value", None)
+    dsem = _sign_detect_semaphore()
+    detect_avail = getattr(dsem, "_value", None)
     return jsonify(
         {
             "ok": True,
             "heavy_slots": _HEAVY_SEM_SIZE,
             "heavy_slots_available": avail,
+            "detect_slots": _DETECT_SEM_SIZE,
+            "detect_slots_available": detect_avail,
             "mysql": _sign_using_mysql(),
             "threaded": True,
         }
