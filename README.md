@@ -31,7 +31,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-**Windows**：也可双击 **`start_server.bat`** 启动（自动进入脚本所在目录；若存在 **`.venv`** 或 **`venv`** 则优先用其中的 `python.exe`，否则使用系统 `python`）。
+**Windows**：`dev\local-run\start_server.bat`（优先 `.venv`/`venv` 中的 Python）。
 
 浏览器访问 **http://127.0.0.1:5050**（本机）或 **http://\<本机IP\>:5050**（局域网）。
 
@@ -66,11 +66,8 @@ python batch_print.py . -p "Microsoft Print to PDF" -n 2
 
 ### 一键提交并推送（Windows）
 
-根目录 **`commit_push.bat`**：执行 `git add -A` → `commit`（默认说明 `chore: update`）→ `push origin main`。可传参作为提交说明，例如：`commit_push.bat fix: 进度条`。
-
-**说明**：脚本内提示为英文，避免在 UTF-8 编码下 `cmd.exe` 误解析中文导致 `'IT_MSG'` 等乱报错；结束时仍会 `pause` 方便查看日志。
-
-**`repush.bat`**：只做 **`git push -u origin <当前分支>`**（不 `add`、不 `commit`），用于本地已提交后重新推送到远程或重试推送。
+`dev\git-no_tag\commit_push.bat "说明"`：`git add -A` → commit → push（**不打 tag**）。  
+`dev\git-no_tag\push_only.bat`：仅 push。详见 [`dev/README.md`](dev/README.md)。
 
 ### 参数说明
 
