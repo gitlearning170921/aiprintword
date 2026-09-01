@@ -95,6 +95,9 @@ def _ftp_upload_bytes_or_mysql(data: bytes, remote_rel: str) -> Tuple[Optional[s
 
 _mysql_init_lock = threading.Lock()
 _mysql_inited = False
+_signer_tables_lock = threading.Lock()
+_signer_ddl_ready = False
+_signer_migrate_ready = False
 
 
 def mysql_sign_enabled() -> bool:
@@ -437,18 +440,31 @@ def ensure_sign_mysql() -> None:
         if _mysql_inited:
             return
         init_schema()
+        start_signer_migrate_bg = False
         try:
             conn = _connect_db()
             try:
                 _ensure_signed_output_table(conn)
                 _ensure_sign_batch_result_table(conn)
                 _ensure_sign_file_columns(conn)
+                # 热路径（role-map PUT）禁止每次跑 ALTER/全表迁移；首次初始化只做 DDL。
+                _ensure_signer_tables(conn, migrate=False)
                 conn.commit()
             finally:
                 conn.close()
         except Exception:
             pass
         _mysql_inited = True
+        start_signer_migrate_bg = True
+    if start_signer_migrate_bg:
+        try:
+            threading.Thread(
+                target=_signer_legacy_migrate_bg,
+                name="sign-signer-migrate",
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
 
 
 @contextmanager
@@ -2099,7 +2115,53 @@ def migrate_signer_strokes_blobs_to_ftp(
     return stats
 
 
-def _ensure_signer_tables(conn) -> None:
+def _signer_legacy_migrate_bg() -> None:
+    """旧笔迹全表迁移放到后台，避免挡住 role-map 保存。"""
+    if not mysql_sign_enabled():
+        return
+    try:
+        conn = _connect_db()
+        try:
+            _ensure_signer_tables(conn, migrate=True)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _ensure_signer_tables(conn, *, migrate: bool = False) -> None:
+    """建表/兼容列：每个进程只做一次 DDL。
+
+    全表旧数据迁移（可能从 FTP 拉 PNG）默认不做。
+    热路径 role-map GET/PUT 若每次迁移，远程 MySQL 下会轻易超过前端 45s。
+    """
+    global _signer_ddl_ready, _signer_migrate_ready
+    need_ddl = not _signer_ddl_ready
+    need_mig = bool(migrate) and not _signer_migrate_ready
+    if not need_ddl and not need_mig:
+        return
+    with _signer_tables_lock:
+        need_ddl = not _signer_ddl_ready
+        need_mig = bool(migrate) and not _signer_migrate_ready
+        if not need_ddl and not need_mig:
+            return
+        if need_ddl:
+            _ensure_signer_tables_ddl(conn)
+            _signer_ddl_ready = True
+        if need_mig:
+            try:
+                _stroke_set_migrate_legacy_and_roles(conn)
+            except Exception:
+                pass
+            try:
+                _stroke_item_migrate_from_sets(conn)
+            except Exception:
+                pass
+            _signer_migrate_ready = True
+
+
+def _ensure_signer_tables_ddl(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -2323,14 +2385,7 @@ def _ensure_signer_tables(conn) -> None:
             )
     except Exception:
         pass
-    try:
-        _stroke_set_migrate_legacy_and_roles(conn)
-    except Exception:
-        pass
-    try:
-        _stroke_item_migrate_from_sets(conn)
-    except Exception:
-        pass
+    # 旧数据全表迁移已移出本函数，见 _ensure_signer_tables(..., migrate=True)
 
 
 def _stroke_item_migrate_from_sets(conn) -> None:
@@ -3877,7 +3932,7 @@ def get_file_role_signer_map(file_id: str) -> Dict[str, Any]:
     ensure_sign_mysql()
     out: Dict[str, dict] = {}
     with _conn_commit() as conn:
-        _ensure_signer_tables(conn)
+        _ensure_signer_tables(conn, migrate=False)
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT role_id, signer_id, stroke_set_id, sig_item_id, date_item_id, date_mode, date_iso "
@@ -3949,7 +4004,7 @@ def get_file_role_signer_map(file_id: str) -> Dict[str, Any]:
 def set_file_role_signer_map(file_id: str, mapping: Dict[str, Any]) -> None:
     ensure_sign_mysql()
     with _conn_commit() as conn:
-        _ensure_signer_tables(conn)
+        _ensure_signer_tables(conn, migrate=False)
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sign_file_role_signer WHERE file_id=%s", (file_id,))
             for role_id, val in (mapping or {}).items():

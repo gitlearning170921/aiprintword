@@ -120,7 +120,7 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY") or "aiprintword-dev-secret-c
 # Project root
 ROOT = os.path.dirname(os.path.abspath(__file__))
 # 与 /api/aiprintword-build 中 build 字段一致；用于确认 5050 是否加载了当前这份 app.py
-AIPRINTWORD_WEB_BUILD = 8
+AIPRINTWORD_WEB_BUILD = 9
 BATCH_EXPORT_ROOT = os.path.join(ROOT, "data", "batch_exports")
 HANDOFF_DIR = os.path.join(ROOT, "data", "aiword_handoff")
 _HANDOFF_LOCK = threading.Lock()

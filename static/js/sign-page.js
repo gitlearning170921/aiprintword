@@ -181,6 +181,8 @@
   }
 
   var DEFAULT_FETCH_TIMEOUT_MS = 45000;
+  /** 角色映射 GET/PUT：只写几行映射，但远程 MySQL 排队时可能超过默认 45s */
+  var ROLE_MAP_FETCH_TIMEOUT_MS = 120000;
   var SIGNERS_LIST_FETCH_TIMEOUT_MS = 60000;
   var SIGN_FILES_LIST_FETCH_TIMEOUT_MS = 45000;
   /** 上传/批量识别进行中刷新列表：服务端忙于 detect 时 MySQL 查询易排队，给更长等待 */
@@ -423,6 +425,39 @@
           throw new Error('接口返回无法解析为 JSON：' + t.slice(0, 160));
         }
     });
+  }
+
+  function fetchFileRoleMapJson(fileId, extraOpts) {
+    var opts = Object.assign(
+      { timeoutMs: ROLE_MAP_FETCH_TIMEOUT_MS, cache: 'no-store' },
+      extraOpts || {}
+    );
+    return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map'), opts);
+  }
+
+  var _roleMapPutTailByFile = {};
+  function putFileRoleMapRequest(fileId, nextMap) {
+    var key = String(fileId || '');
+    var body = JSON.stringify({ map: nextMap || {} });
+    var run = function () {
+      return fetchJsonWithRetry(
+        apiUrl('/api/sign/files/' + fileId + '/role-map'),
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: body,
+          timeoutMs: ROLE_MAP_FETCH_TIMEOUT_MS,
+        },
+        { maxTry: 3, delayMs: 1500 }
+      );
+    };
+    var prev = _roleMapPutTailByFile[key] || Promise.resolve();
+    var curr = prev.then(run, run);
+    _roleMapPutTailByFile[key] = curr.then(
+      function () {},
+      function () {}
+    );
+    return curr;
   }
 
   function fetchJsonWithRetry(url, options, retryOpt) {
@@ -1477,11 +1512,7 @@
     if (!fileId) return Promise.resolve(null);
     var m = mapOpt != null ? mapOpt : currentRoleMap;
     if (!m || typeof m !== 'object') m = {};
-    return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map'), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ map: m }),
-    }).then(function (r) {
+    return putFileRoleMapRequest(fileId, m).then(function (r) {
       var jj = r.data || {};
       if (!jj.ok) throw new Error(jj.error || '保存角色映射失败');
       if (String(selectedFileId) === String(fileId)) {
@@ -4000,11 +4031,7 @@
         else m[rid] = p;
         currentRoleMap = m;
         cachePatchCurrentRoleMap(fid, currentRoleMap);
-        fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ map: m }),
-        })
+        putFileRoleMapRequest(fid, m)
           .then(function (r) {
             var jj = r.data;
             if (String(selectedFileId) !== String(fid)) return;
@@ -4101,11 +4128,7 @@
         else m[rid] = p;
         currentRoleMap = m;
         cachePatchCurrentRoleMap(fid, currentRoleMap);
-        fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ map: m }),
-        })
+        putFileRoleMapRequest(fid, m)
           .then(function (r) {
             var jj = r.data;
             if (String(selectedFileId) !== String(fid)) return;
@@ -4195,11 +4218,7 @@
         else m[rid] = p;
         currentRoleMap = m;
         cachePatchCurrentRoleMap(fid, currentRoleMap);
-        return fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ map: m }),
-        })
+        return putFileRoleMapRequest(fid, m)
           .then(function (r) {
             var jj = r.data;
             if (String(selectedFileId) !== String(fid)) return;
@@ -5800,11 +5819,7 @@
                     m[rid] = p;
                     currentRoleMap = m;
                     cachePatchCurrentRoleMap(fidPanel, currentRoleMap);
-                    return fetchJson(apiUrl('/api/sign/files/' + fidPanel + '/role-map'), {
-                      method: 'PUT',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ map: m }),
-                    }).then(function (r2) {
+                    return putFileRoleMapRequest(fidPanel, m).then(function (r2) {
                       var j2 = r2.data;
                       if (j2 && j2.ok) {
                         if (String(selectedFileId) === String(fidPanel)) {
@@ -8101,11 +8116,7 @@
       currentRoleMap = nextMap;
     }
     refreshWorkbenchRowMaterial(fileId);
-    return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map'), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ map: nextMap }),
-    })
+    return putFileRoleMapRequest(fileId, nextMap)
       .then(function (r) {
         var jj = (r && r.data) || {};
         if (jj.ok) {
@@ -9524,9 +9535,7 @@
 
   function ensureFileRoleMapLoaded(fileId) {
     if (!fileId) return Promise.resolve();
-    return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map'), {
-      timeoutMs: 120000,
-    })
+    return fetchFileRoleMapJson(fileId)
       .then(function (r) {
         var jj = (r && r.data) || {};
         if (jj.ok) {
@@ -15036,7 +15045,7 @@
             detectAndAutoSelectRoles(selectedFileId);
           } else {
             // 仅加载 role-map，确保表格可编辑
-            fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'))
+            fetchFileRoleMapJson(selectedFileId)
               .then(function (r) {
                 var jj = r.data || {};
                 if (jj.ok) currentRoleMap = jj.map || {};
@@ -15048,7 +15057,7 @@
           }
         } else {
           // 已恢复：仍从服务端刷新一次 role-map（防止多端修改）
-          fetchJson(apiUrl('/api/sign/files/' + selectedFileId + '/role-map'))
+          fetchFileRoleMapJson(selectedFileId)
             .then(function (r) {
               var jj = r.data || {};
               if (jj.ok) currentRoleMap = jj.map || {};
@@ -15130,7 +15139,7 @@
       } else {
         // 有缓存则恢复；并刷新 role-map
         restoreFileUiFromCache(sid);
-        fetchJson(apiUrl('/api/sign/files/' + sid + '/role-map'))
+        fetchFileRoleMapJson(sid)
           .then(function (r) {
             var jj = r.data || {};
             if (jj.ok) currentRoleMap = jj.map || {};
@@ -16407,11 +16416,7 @@
         return Promise.resolve();
       }
 
-      return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map'), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ map: nextMap }),
-      })
+      return putFileRoleMapRequest(fileId, nextMap)
         .then(function (r) {
           if (!opts.skipSelectedCheck && String(selectedFileId) !== String(fileId)) {
             if (opts.batchSilent && isBatchWorkbenchMode()) {
@@ -16607,7 +16612,7 @@
         if (opts.batchSilent) {
           return { __abort: false };
         }
-        return fetchJson(apiUrl('/api/sign/files/' + fileId + '/role-map')).then(function (rm) {
+        return fetchFileRoleMapJson(fileId).then(function (rm) {
           if (String(selectedFileId) !== String(fileId)) {
             return { __abort: true };
           }
@@ -16843,11 +16848,7 @@
         var chain = Promise.resolve();
         ids.forEach(function (fid) {
           chain = chain.then(function () {
-            return fetchJson(apiUrl('/api/sign/files/' + fid + '/role-map'), {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ map: m0 }),
-            }).then(function (r) {
+            return putFileRoleMapRequest(fid, m0).then(function (r) {
               var jj = r.data || {};
               if (jj.ok) {
                 okN += 1;

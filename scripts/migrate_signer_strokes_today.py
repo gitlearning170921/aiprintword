@@ -51,7 +51,7 @@ def migrate(
     day_str = on_date.isoformat()
 
     with _conn_commit() as conn:
-        _ensure_signer_tables(conn)
+        _ensure_signer_tables(conn, migrate=True)
         with conn.cursor() as cur:
             from_id = _resolve_signer_id(cur, from_name)
             to_id = _resolve_signer_id(cur, to_name)
