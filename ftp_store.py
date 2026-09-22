@@ -140,6 +140,17 @@ def _cfg() -> Tuple[str, int, str, str, str, Optional[bool]]:
     return host, port, user, pwd, base_dir, pasv
 
 
+def _cfg_brief() -> str:
+    host, port, user, _, base_dir, pasv = _cfg()
+    return "host=%s port=%s user=%s base_dir=%s pasv=%s" % (
+        host,
+        port,
+        user,
+        base_dir,
+        pasv,
+    )
+
+
 @contextmanager
 def _ftp(*, pasv: Optional[bool] = None) -> Iterator["FTP"]:
     # 延迟导入，避免非 FTP 场景引入开销
@@ -148,7 +159,10 @@ def _ftp(*, pasv: Optional[bool] = None) -> Iterator["FTP"]:
     host, port, user, pwd, _, cfg_pasv = _cfg()
     if pasv is None:
         pasv = cfg_pasv
-    ftp = FTP()
+    try:
+        ftp = FTP(encoding="utf-8")
+    except TypeError:
+        ftp = FTP()
     ftp.connect(host=host, port=port, timeout=20)
     # 默认沿用历史：主动模式；但若指定 FTP_PASV 则尊重配置
     if pasv is not None:
@@ -207,6 +221,8 @@ def _should_retry_with_passive(e: Exception) -> bool:
             "timed out",
             "timeout",
             "Connection refused",
+            "Illegal PORT",
+            "550 Permission denied",
         )
     )
 
@@ -239,18 +255,9 @@ def upload_bytes(data: bytes, remote_rel_path: str) -> str:
             ftp.storbinary("STOR " + remote_abs, bio)
 
     try:
-        _stor(None)
+        _stor(True)
     except Exception as e:
-        _, _, _, _, _, cfg_pasv = _cfg()
-        if cfg_pasv is None and _should_retry_with_passive(e):
-            try:
-                _stor(True)
-            except Exception as e2:
-                if _should_retry_active_after_passive_server_error(e2):
-                    _stor(False)
-                else:
-                    raise
-        elif cfg_pasv is True and _should_retry_active_after_passive_server_error(e):
+        if _should_retry_active_after_passive_server_error(e):
             _stor(False)
         else:
             raise
@@ -274,22 +281,44 @@ def upload_file(local_path: str, remote_rel_path: str) -> str:
                 ftp.storbinary("STOR " + remote_abs, f)
 
     try:
-        _stor_file(None)
+        _stor_file(True)
     except Exception as e:
-        _, _, _, _, _, cfg_pasv = _cfg()
-        if cfg_pasv is None and _should_retry_with_passive(e):
-            try:
-                _stor_file(True)
-            except Exception as e2:
-                if _should_retry_active_after_passive_server_error(e2):
-                    _stor_file(False)
-                else:
-                    raise
-        elif cfg_pasv is True and _should_retry_active_after_passive_server_error(e):
+        if _should_retry_active_after_passive_server_error(e):
             _stor_file(False)
         else:
             raise
     return remote_abs
+
+
+def _cwd_stepwise(ftp, remote_dir: str) -> None:
+    """逐级 CWD，避免部分 vsftpd 对一次 CWD 多级路径返回 550。"""
+    ftp.cwd("/")
+    for part in [p for p in (remote_dir or "").replace("\\", "/").split("/") if p]:
+        ftp.cwd(part)
+
+
+def _retr_filezilla_style(ftp, abs_path: str, writer) -> None:
+    """与 FileZilla 一致：逐级进入目录再 RETR 文件名；失败再试绝对路径。"""
+    remote_dir = posixpath.dirname(abs_path) or "/"
+    base = posixpath.basename(abs_path)
+    last: Optional[BaseException] = None
+    sess = "session_pasv=%s %s" % (getattr(ftp, "passiveserver", "?"), _cfg_brief())
+    if base:
+        try:
+            _cwd_stepwise(ftp, remote_dir)
+            ftp.retrbinary("RETR " + base, writer)
+            return
+        except Exception as e:
+            last = e
+    try:
+        ftp.cwd("/")
+        ftp.retrbinary("RETR " + abs_path, writer)
+    except Exception as e2:
+        if last is not None:
+            raise RuntimeError(
+                "%s | cwd+name failed: %s | %s" % (e2, last, sess)
+            ) from e2
+        raise RuntimeError("%s | %s" % (e2, sess)) from e2
 
 
 def download_bytes(remote_abs_or_rel: str) -> bytes:
@@ -306,25 +335,12 @@ def download_bytes(remote_abs_or_rel: str) -> bytes:
 
     def _retr(pasv_override: Optional[bool]) -> None:
         with _ftp(pasv=pasv_override) as ftp:
-            ftp.retrbinary("RETR " + p, buf.write)
+            _retr_filezilla_style(ftp, p, buf.write)
 
     try:
-        _retr(None)
+        _retr(True)
     except Exception as e:
-        _, _, _, _, _, cfg_pasv = _cfg()
-        if cfg_pasv is None and _should_retry_with_passive(e):
-            try:
-                buf.seek(0)
-                buf.truncate(0)
-                _retr(True)
-            except Exception as e2:
-                if _should_retry_active_after_passive_server_error(e2):
-                    buf.seek(0)
-                    buf.truncate(0)
-                    _retr(False)
-                else:
-                    raise
-        elif cfg_pasv is True and _should_retry_active_after_passive_server_error(e):
+        if _should_retry_active_after_passive_server_error(e):
             buf.seek(0)
             buf.truncate(0)
             _retr(False)
@@ -351,7 +367,7 @@ def delete_path(remote_abs_or_rel: str) -> bool:
         return _del(None)
     except Exception as e:
         _, _, _, _, _, cfg_pasv = _cfg()
-        if cfg_pasv is None and _should_retry_with_passive(e):
+        if cfg_pasv is not True and _should_retry_with_passive(e):
             try:
                 return _del(True)
             except Exception as e2:

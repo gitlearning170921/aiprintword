@@ -44,6 +44,17 @@ def mysql_settings_enabled() -> bool:
     return bool(_config_env_only()["host"])
 
 
+def _pymysql_auth_kwargs() -> dict:
+    try:
+        import inspect
+
+        if "allow_public_key_retrieval" in inspect.signature(pymysql.connect).parameters:
+            return {"allow_public_key_retrieval": True}
+    except Exception:
+        pass
+    return {}
+
+
 def _connect_server():
     c = _config_env_only()
     return pymysql.connect(
@@ -53,6 +64,7 @@ def _connect_server():
         password=c["password"],
         charset=c["charset"],
         cursorclass=DictCursor,
+        **_pymysql_auth_kwargs(),
     )
 
 
@@ -66,6 +78,7 @@ def _connect_db():
         database=c["database"],
         charset=c["charset"],
         cursorclass=DictCursor,
+        **_pymysql_auth_kwargs(),
     )
 
 

@@ -160,7 +160,15 @@ def _mysql_timeout_kwargs() -> dict:
         rt = 30
     ct = max(1, min(ct, 60))
     rt = max(5, min(rt, 300))
-    return {"connect_timeout": ct, "read_timeout": rt, "write_timeout": rt}
+    extra = {"connect_timeout": ct, "read_timeout": rt, "write_timeout": rt}
+    try:
+        import inspect
+
+        if "allow_public_key_retrieval" in inspect.signature(pymysql.connect).parameters:
+            extra["allow_public_key_retrieval"] = True
+    except Exception:
+        pass
+    return extra
 
 
 def _connect_server():
@@ -2722,8 +2730,11 @@ def get_stroke_item_row_by_signer_kind(signer_id: str, locale: str, kind: str) -
 
         if (not row.get("png")) and row.get("ftp_path"):
             row["png"] = download_bytes(row["ftp_path"])
-    except Exception:
-        pass
+    except Exception as e:
+        print(
+            f"[sign] get_stroke_item_row_by_signer_kind FTP download failed "
+            f"signer_id={signer_id} ftp_path={row.get('ftp_path')!r}: {e}"
+        )
     return row
 
 
@@ -2840,8 +2851,17 @@ def get_stroke_item_row(item_id: str) -> Optional[dict]:
 
         if (not row.get("png")) and row.get("ftp_path"):
             row["png"] = download_bytes(row["ftp_path"])
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            from ftp_store import _cfg_brief
+
+            extra = _cfg_brief()
+        except Exception:
+            extra = ""
+        print(
+            f"[sign] get_stroke_item_row FTP download failed id={item_id} "
+            f"ftp_path={row.get('ftp_path')!r} {extra}: {e}"
+        )
     return row
 
 
